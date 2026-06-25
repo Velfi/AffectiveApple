@@ -1,0 +1,751 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXContainerItemProxy section */
+		34384E822FEBEC9900868E97 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 34384E6A2FEBEC9900868E97 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 34384E712FEBEC9900868E97;
+			remoteInfo = Affective;
+		};
+		34384E8C2FEBEC9900868E97 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 34384E6A2FEBEC9900868E97 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 34384E712FEBEC9900868E97;
+			remoteInfo = Affective;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		34384E722FEBEC9900868E97 /* Affective.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Affective.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		34384E812FEBEC9900868E97 /* AffectiveTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AffectiveTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		34384E8B2FEBEC9900868E97 /* AffectiveUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AffectiveUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		34384E742FEBEC9900868E97 /* Affective */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Affective;
+			sourceTree = "<group>";
+		};
+		34384E842FEBEC9900868E97 /* AffectiveTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = AffectiveTests;
+			sourceTree = "<group>";
+		};
+		34384E8E2FEBEC9900868E97 /* AffectiveUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = AffectiveUITests;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		34384E6F2FEBEC9900868E97 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		34384E7E2FEBEC9900868E97 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		34384E882FEBEC9900868E97 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		34384E692FEBEC9900868E97 = {
+			isa = PBXGroup;
+			children = (
+				34384E742FEBEC9900868E97 /* Affective */,
+				34384E842FEBEC9900868E97 /* AffectiveTests */,
+				34384E8E2FEBEC9900868E97 /* AffectiveUITests */,
+				34384E732FEBEC9900868E97 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		34384E732FEBEC9900868E97 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				34384E722FEBEC9900868E97 /* Affective.app */,
+				34384E812FEBEC9900868E97 /* AffectiveTests.xctest */,
+				34384E8B2FEBEC9900868E97 /* AffectiveUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		34384E712FEBEC9900868E97 /* Affective */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 34384E952FEBEC9900868E97 /* Build configuration list for PBXNativeTarget "Affective" */;
+			buildPhases = (
+				C0D3F0012FF0000000000001 /* Build AffectiveCore Core */,
+				34384E6E2FEBEC9900868E97 /* Sources */,
+				34384E6F2FEBEC9900868E97 /* Frameworks */,
+				34384E702FEBEC9900868E97 /* Resources */,
+				C0D3F0022FF0000000000002 /* Stamp Build Metadata */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				34384E742FEBEC9900868E97 /* Affective */,
+			);
+			name = Affective;
+			packageProductDependencies = (
+			);
+			productName = Affective;
+			productReference = 34384E722FEBEC9900868E97 /* Affective.app */;
+			productType = "com.apple.product-type.application";
+		};
+		34384E802FEBEC9900868E97 /* AffectiveTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 34384E982FEBEC9900868E97 /* Build configuration list for PBXNativeTarget "AffectiveTests" */;
+			buildPhases = (
+				34384E7D2FEBEC9900868E97 /* Sources */,
+				34384E7E2FEBEC9900868E97 /* Frameworks */,
+				34384E7F2FEBEC9900868E97 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				34384E832FEBEC9900868E97 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				34384E842FEBEC9900868E97 /* AffectiveTests */,
+			);
+			name = AffectiveTests;
+			packageProductDependencies = (
+			);
+			productName = AffectiveTests;
+			productReference = 34384E812FEBEC9900868E97 /* AffectiveTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		34384E8A2FEBEC9900868E97 /* AffectiveUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 34384E9B2FEBEC9900868E97 /* Build configuration list for PBXNativeTarget "AffectiveUITests" */;
+			buildPhases = (
+				34384E872FEBEC9900868E97 /* Sources */,
+				34384E882FEBEC9900868E97 /* Frameworks */,
+				34384E892FEBEC9900868E97 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				34384E8D2FEBEC9900868E97 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				34384E8E2FEBEC9900868E97 /* AffectiveUITests */,
+			);
+			name = AffectiveUITests;
+			packageProductDependencies = (
+			);
+			productName = AffectiveUITests;
+			productReference = 34384E8B2FEBEC9900868E97 /* AffectiveUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		34384E6A2FEBEC9900868E97 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2650;
+				LastUpgradeCheck = 2650;
+				TargetAttributes = {
+					34384E712FEBEC9900868E97 = {
+						CreatedOnToolsVersion = 26.5;
+						SystemCapabilities = {
+							com.apple.Sandbox = {
+								enabled = 1;
+							};
+							com.apple.iCloud = {
+								enabled = 1;
+							};
+						};
+					};
+					34384E802FEBEC9900868E97 = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = 34384E712FEBEC9900868E97;
+					};
+					34384E8A2FEBEC9900868E97 = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = 34384E712FEBEC9900868E97;
+					};
+				};
+			};
+			buildConfigurationList = 34384E6D2FEBEC9900868E97 /* Build configuration list for PBXProject "Affective" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 34384E692FEBEC9900868E97;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 34384E732FEBEC9900868E97 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				34384E712FEBEC9900868E97 /* Affective */,
+				34384E802FEBEC9900868E97 /* AffectiveTests */,
+				34384E8A2FEBEC9900868E97 /* AffectiveUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		34384E702FEBEC9900868E97 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		34384E7F2FEBEC9900868E97 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		34384E892FEBEC9900868E97 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		C0D3F0012FF0000000000001 /* Build AffectiveCore Core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build AffectiveCore Core";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/AffectiveCore/include/affective_core_embedded.h",
+				"$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)/libaffective-core-embedded.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "sh \"$SRCROOT/scripts/build_affective_core.sh\"\n";
+		};
+		C0D3F0022FF0000000000002 /* Stamp Build Metadata */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Stamp Build Metadata";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nINFO_PLIST=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\n[ -f \"${INFO_PLIST}\" ] || exit 0\nHASH=\"\"\nif command -v git >/dev/null 2>&1 && git -C \"${SRCROOT}\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n    HASH=\"$(git -C \"${SRCROOT}\" rev-parse --short=12 HEAD 2>/dev/null || true)\"\n    if [ -n \"${HASH}\" ] && ! git -C \"${SRCROOT}\" diff --quiet --ignore-submodules HEAD -- 2>/dev/null; then\n        HASH=\"${HASH}-dirty\"\n    fi\nfi\nTIMESTAMP=\"$(/bin/date -u +\"%Y-%m-%dT%H:%M:%SZ\")\"\n/usr/libexec/PlistBuddy -c \"Set :AffectiveBuildTimestamp ${TIMESTAMP}\" \"${INFO_PLIST}\" 2>/dev/null || /usr/libexec/PlistBuddy -c \"Add :AffectiveBuildTimestamp string ${TIMESTAMP}\" \"${INFO_PLIST}\"\nif [ -n \"${HASH}\" ]; then\n    /usr/libexec/PlistBuddy -c \"Set :AffectiveBuildHash ${HASH}\" \"${INFO_PLIST}\" 2>/dev/null || /usr/libexec/PlistBuddy -c \"Add :AffectiveBuildHash string ${HASH}\" \"${INFO_PLIST}\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		34384E6E2FEBEC9900868E97 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		34384E7D2FEBEC9900868E97 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		34384E872FEBEC9900868E97 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		34384E832FEBEC9900868E97 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 34384E712FEBEC9900868E97 /* Affective */;
+			targetProxy = 34384E822FEBEC9900868E97 /* PBXContainerItemProxy */;
+		};
+		34384E8D2FEBEC9900868E97 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 34384E712FEBEC9900868E97 /* Affective */;
+			targetProxy = 34384E8C2FEBEC9900868E97 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		34384E932FEBEC9900868E97 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = 2XFBA46B9D;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		34384E942FEBEC9900868E97 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = 2XFBA46B9D;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		34384E962FEBEC9900868E97 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Affective/Affective.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = Affective/Affective.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2XFBA46B9D;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
+				ENABLE_PREVIEWS = YES;
+				ENABLE_RESOURCE_ACCESS_CAMERA = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../AffectiveCore/include",
+					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
+				);
+				INFOPLIST_KEY_CFBundleDisplayName = Affective;
+				"INFOPLIST_KEY_CFBundleIconName[sdk=iphoneos*]" = AppIcon;
+				"INFOPLIST_KEY_CFBundleIconName[sdk=iphonesimulator*]" = AppIcon;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.simulation-games";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Affective uses the camera only for camera sense requests. Captured frames may be sent to your selected AI provider for visual analysis.";
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
+				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
+				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = "$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = "$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[sdk=macosx*]" = "$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)";
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"-laffective-core-embedded",
+					"-lsqlite3",
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"-laffective-core-embedded",
+					"-lsqlite3",
+				);
+				"OTHER_LDFLAGS[sdk=macosx*]" = (
+					"-laffective-core-embedded",
+					"-lsqlite3",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.zelda-built-this.AMBI.store";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Affective/AffectiveCore-Bridging-Header.h";
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				XROS_DEPLOYMENT_TARGET = 26.5;
+			};
+			name = Debug;
+		};
+		34384E972FEBEC9900868E97 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Affective/Affective.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = Affective/Affective.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2XFBA46B9D;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
+				ENABLE_PREVIEWS = YES;
+				ENABLE_RESOURCE_ACCESS_CAMERA = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../AffectiveCore/include",
+					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
+				);
+				INFOPLIST_KEY_CFBundleDisplayName = Affective;
+				"INFOPLIST_KEY_CFBundleIconName[sdk=iphoneos*]" = AppIcon;
+				"INFOPLIST_KEY_CFBundleIconName[sdk=iphonesimulator*]" = AppIcon;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.simulation-games";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Affective uses the camera only for camera sense requests. Captured frames may be sent to your selected AI provider for visual analysis.";
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
+				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
+				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = "$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = "$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[sdk=macosx*]" = "$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)";
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"-laffective-core-embedded",
+					"-lsqlite3",
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"-laffective-core-embedded",
+					"-lsqlite3",
+				);
+				"OTHER_LDFLAGS[sdk=macosx*]" = (
+					"-laffective-core-embedded",
+					"-lsqlite3",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.zelda-built-this.AMBI.store";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Affective/AffectiveCore-Bridging-Header.h";
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				XROS_DEPLOYMENT_TARGET = 26.5;
+			};
+			name = Release;
+		};
+		34384E992FEBEC9900868E97 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2XFBA46B9D;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../AffectiveCore/include",
+					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.zelda-built-this.AMBITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Affective.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Affective";
+				XROS_DEPLOYMENT_TARGET = 26.5;
+			};
+			name = Debug;
+		};
+		34384E9A2FEBEC9900868E97 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2XFBA46B9D;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../AffectiveCore/include",
+					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.zelda-built-this.AMBITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Affective.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Affective";
+				XROS_DEPLOYMENT_TARGET = 26.5;
+			};
+			name = Release;
+		};
+		34384E9C2FEBEC9900868E97 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2XFBA46B9D;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../AffectiveCore/include",
+					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.zelda-built-this.AMBIUITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_TARGET_NAME = Affective;
+				XROS_DEPLOYMENT_TARGET = 26.5;
+			};
+			name = Debug;
+		};
+		34384E9D2FEBEC9900868E97 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 2XFBA46B9D;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../AffectiveCore/include",
+					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.zelda-built-this.AMBIUITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_TARGET_NAME = Affective;
+				XROS_DEPLOYMENT_TARGET = 26.5;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		34384E6D2FEBEC9900868E97 /* Build configuration list for PBXProject "Affective" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				34384E932FEBEC9900868E97 /* Debug */,
+				34384E942FEBEC9900868E97 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		34384E952FEBEC9900868E97 /* Build configuration list for PBXNativeTarget "Affective" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				34384E962FEBEC9900868E97 /* Debug */,
+				34384E972FEBEC9900868E97 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		34384E982FEBEC9900868E97 /* Build configuration list for PBXNativeTarget "AffectiveTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				34384E992FEBEC9900868E97 /* Debug */,
+				34384E9A2FEBEC9900868E97 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		34384E9B2FEBEC9900868E97 /* Build configuration list for PBXNativeTarget "AffectiveUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				34384E9C2FEBEC9900868E97 /* Debug */,
+				34384E9D2FEBEC9900868E97 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 34384E6A2FEBEC9900868E97 /* Project object */;
+}

@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+
+# Xcode build products
+DerivedData/
+build/
+.archives/
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+
+# Swift Package Manager
+.build/
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# fastlane generated output
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
