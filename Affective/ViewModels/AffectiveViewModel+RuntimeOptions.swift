@@ -95,6 +95,7 @@ extension AffectiveViewModel {
                     metadata: toolMetadata(name: name, mirrorToChat: mirrorToChat)
                 )
                 chatEntries.append(.init(kind: .brain, title: title, body: displayText, metadata: response.metadata.merging(["brain": brain.id]) { current, _ in current }))
+                markAwaitingSocialResponse()
             }
             if response.shouldSpeak
                 && !eventResult.didRequestSpeech
@@ -203,7 +204,12 @@ extension AffectiveViewModel {
             appendCommand(kind: .result, title: title, body: displayText, metadata: response.metadata.merging(metadata) { current, _ in current })
             appendMigrationFallbackWarningIfNeeded(response.metadata, title: title)
             if !eventResult.didAppendBrainChat && !responseText.isEmpty {
-                appendCommand(kind: .state, title: "stimulus result", body: noChatEventBody, metadata: metadata)
+                appendCommand(
+                    kind: .state,
+                    title: "stimulus result",
+                    body: noChatEventBody,
+                    metadata: ignoredStimulusMetadata(response: response, stimulusMetadata: metadata)
+                )
             }
             refreshDreamReports()
         } catch {
@@ -232,10 +238,12 @@ extension AffectiveViewModel {
         mirrorChatMessages: Bool,
         speak: Bool,
         handleHostRequests: Bool = true
-    ) async -> (didAppendBrainChat: Bool, didRequestSpeech: Bool, didApplyActivityStatus: Bool) {
+    ) async -> (didAppendBrainChat: Bool, didRequestSpeech: Bool, didApplyActivityStatus: Bool, didRecordBrainTurn: Bool) {
         var didAppendBrainChat = false
         var speechText: String?
         var didApplyActivityStatus = false
+        var didRecordBrainTurn = false
+        var didEmitSocialSignal = false
 
         for event in normalizedCoreEvents(events) {
             let metadata = coreEventMetadata(event)
@@ -287,13 +295,20 @@ extension AffectiveViewModel {
                 ))
                 recordConversationTurn(role: "brain", text: body, source: event.type, metadata: metadata)
                 didAppendBrainChat = true
+                didRecordBrainTurn = true
+                didEmitSocialSignal = true
             case "speech_requested":
                 if eventPresentation(for: event).mirrorsToChat,
                    let text = event.text,
                    !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     speechText = text
+                    didEmitSocialSignal = true
                 }
             case "facial_expression_requested":
+                if eventPresentation(for: event).mirrorsToChat,
+                   !facialExpressionSummary(for: event).isEmpty {
+                    didEmitSocialSignal = true
+                }
                 appendFacialExpressionAsideIfNeeded(for: event, metadata: metadata, mirrorChatMessages: mirrorChatMessages)
                 appendCommand(
                     kind: .state,
@@ -335,10 +350,21 @@ extension AffectiveViewModel {
         }
 
         if speak, let speechText {
+            if !didRecordBrainTurn {
+                recordConversationTurn(role: "brain", text: speechText, source: "speech_requested", metadata: [:])
+                didRecordBrainTurn = true
+            }
             await speakBrainResponseAndWait(speechText)
-            return (didAppendBrainChat, true, didApplyActivityStatus)
+            return (didAppendBrainChat, true, didApplyActivityStatus, didRecordBrainTurn)
         }
-        return (didAppendBrainChat, false, didApplyActivityStatus)
+        if let speechText, !didRecordBrainTurn {
+            recordConversationTurn(role: "brain", text: speechText, source: "speech_requested", metadata: [:])
+            didRecordBrainTurn = true
+        }
+        if didEmitSocialSignal {
+            markAwaitingSocialResponse()
+        }
+        return (didAppendBrainChat, false, didApplyActivityStatus, didRecordBrainTurn)
     }
 
     func normalizedCoreEvents(_ events: [BrainHostEvent]) -> [BrainHostEvent] {
@@ -617,6 +643,73 @@ extension AffectiveViewModel {
             "tool": name,
             "mirror_to_chat": String(mirrorToChat),
         ]
+    }
+
+    func ignoredStimulusMetadata(response: BrainToolResponse, stimulusMetadata: [String: String]) -> [String: String] {
+        var metadata = response.metadata.merging(stimulusMetadata) { current, _ in current }
+        let existingReason = metadata["ignored_because"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if existingReason?.isEmpty == false {
+            metadata["ignored_because"] = existingReason
+        } else if let synthesizedReason = synthesizedIgnoredStimulusReason(response: response, metadata: metadata) {
+            metadata["ignored_because"] = synthesizedReason
+        } else {
+            metadata.removeValue(forKey: "ignored_because")
+        }
+        return metadata
+    }
+
+    func synthesizedIgnoredStimulusReason(response: BrainToolResponse, metadata: [String: String]) -> String? {
+        let evidence = [
+            response.text,
+            response.rawText,
+            metadata["observation"],
+            metadata["event_types"],
+        ]
+            .compactMap { $0 }
+            .joined(separator: "\n")
+            .lowercased()
+
+        guard !evidence.isEmpty else { return nil }
+        if evidence.contains("attention_hint=acknowledge_without_lookup") {
+            return "acknowledge_without_lookup"
+        }
+        if evidence.contains("attention_hint=defer_visual_lookup") {
+            return "defer_visual_lookup"
+        }
+        if evidence.contains("recent visual evidence is fresh enough") {
+            return "recent_visual_evidence_fresh"
+        }
+        if evidence.contains("recent known speaker evidence makes lookup low priority") {
+            return "recent_known_speaker_low_priority"
+        }
+        if evidence.contains("touch conflicts with cached no-person evidence") {
+            return "touch_conflicts_with_cached_no_person_evidence"
+        }
+        if evidence.contains("repeated low-risk signal is habituating") {
+            return "repeated_low_risk_signal_habituating"
+        }
+        if evidence.contains("autonomy paused: human input active") {
+            return "human_input_active"
+        }
+        if evidence.contains("energy exhausted") {
+            return "energy_exhausted"
+        }
+        if evidence.contains("insufficient energy for planner") {
+            return "insufficient_energy_for_planner"
+        }
+        if evidence.contains("autonomous speech suppressed: salience below high") {
+            return "speech_salience_below_high"
+        }
+        if evidence.contains("autonomous speech suppressed: quiet hours") {
+            return "quiet_hours"
+        }
+        if evidence.contains("autonomous speech suppressed: cooldown") {
+            return "speech_cooldown"
+        }
+        if evidence.contains("autonomous facial expression suppressed: cooldown") {
+            return "facial_expression_cooldown"
+        }
+        return nil
     }
 
     func appendMigrationFallbackWarningIfNeeded(_ metadata: [String: String], title: String) {

@@ -731,6 +731,76 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
+  func testIgnoredStimulusResultIncludesKnownReason() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      shortTouchResponse: Self.toolResponse(
+        toolName: "short_touch",
+        result: .object([
+          "event_type": .string("short_touch"),
+          "summary": .string("touch stimulus ignored"),
+          "raw_result": .bool(false),
+          "ignored_because": .string("low_salience"),
+        ])
+      ),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+
+    await model.callCoreTouch(name: "short_touch", title: "short_touch")
+
+    let entry = try XCTUnwrap(model.commandEntries.last { $0.title == "stimulus result" })
+    XCTAssertEqual(entry.metadata["ignored_because"], "low_salience")
+  }
+
+  @MainActor
+  func testIgnoredStimulusResultSynthesizesReasonFromCoreEvidence() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      shortTouchResponse: Self.toolResponse(
+        toolName: "short_touch",
+        result: .object([
+          "event_type": .string("short_touch"),
+          "summary": .string("touch_stimulus kind=short_touch reason=recent visual evidence is fresh enough to avoid an immediate repeat lookup attention_hint=defer_visual_lookup chosen_look=false"),
+          "raw_result": .bool(false),
+        ])
+      ),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+
+    await model.callCoreTouch(name: "short_touch", title: "short_touch")
+
+    let entry = try XCTUnwrap(model.commandEntries.last { $0.title == "stimulus result" })
+    XCTAssertEqual(entry.metadata["ignored_because"], "defer_visual_lookup")
+  }
+
+  @MainActor
+  func testIgnoredStimulusResultDoesNotInventUnknownReason() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      shortTouchResponse: Self.toolResponse(
+        toolName: "short_touch",
+        result: .object([
+          "event_type": .string("short_touch"),
+          "summary": .string("touch stimulus ignored"),
+          "raw_result": .bool(false),
+        ])
+      ),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+
+    await model.callCoreTouch(name: "short_touch", title: "short_touch")
+
+    let entry = try XCTUnwrap(model.commandEntries.last { $0.title == "stimulus result" })
+    XCTAssertNil(entry.metadata["ignored_because"])
+  }
+
+  @MainActor
   func testCameraSenseRecordsRecentStimulus() async throws {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "unused"),
@@ -1132,6 +1202,22 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
+  func testSpeechOnlyBrainEventRecordsConversationTurnOnce() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+
+    let result = await model.applyCoreEvents([
+      speechRequestedEvent(text: "Speech-only hello.")
+    ], mirrorChatMessages: true, speak: false)
+
+    let turns = model.conversationContextSnapshot().recentTurns
+    XCTAssertFalse(result.didAppendBrainChat)
+    XCTAssertTrue(result.didRecordBrainTurn)
+    XCTAssertEqual(turns.last?.role, "brain")
+    XCTAssertEqual(turns.last?.source, "speech_requested")
+    XCTAssertEqual(turns.filter { $0.text == "Speech-only hello." }.count, 1)
+  }
+
+  @MainActor
   func testConversationTurnsRollIntoSummaryAfterLimit() throws {
     let model = AffectiveViewModel(brain: try makeBrain())
 
@@ -1442,6 +1528,44 @@ final class AffectiveTests: XCTestCase {
     XCTAssertTrue(text.contains("Stay patient"))
     XCTAssertEqual(context.kind, "boredom")
     XCTAssertEqual(context.receivedDuring, "idle")
+  }
+
+  @MainActor
+  func testSocialResponseWindowAppearsInStimulusContextAndClearsOnInput() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    let now = Date()
+
+    model.markAwaitingSocialResponse(now: now)
+
+    let awaitingContext = model.currentStimulusContext(kind: "user_message", now: now.addingTimeInterval(1))
+    XCTAssertEqual(awaitingContext.receivedDuring, "awaiting_social_response")
+    XCTAssertTrue(awaitingContext.awaitingSocialResponse)
+    XCTAssertGreaterThan(awaitingContext.socialTurnResponseWindowRemainingSeconds, 0)
+
+    model.recordConversationTurn(role: "user", text: "I'm still here.", source: "typed_text", metadata: [:])
+
+    let clearedContext = model.currentStimulusContext(kind: "user_message", now: now.addingTimeInterval(2))
+    XCTAssertEqual(clearedContext.receivedDuring, "idle")
+    XCTAssertFalse(clearedContext.awaitingSocialResponse)
+  }
+
+  @MainActor
+  func testTypingActivityMarksCounterpartActiveWithoutSubmittedTurn() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    let now = Date()
+
+    model.markCounterpartActive(now: now)
+
+    let activeContext = model.currentStimulusContext(kind: "user_message", now: now.addingTimeInterval(1))
+    XCTAssertTrue(activeContext.counterpartActive)
+    XCTAssertGreaterThan(activeContext.counterpartActivityWindowRemainingSeconds, 0)
+    XCTAssertTrue(activeContext.conversationContext.recentTurns.isEmpty)
+
+    let expiredContext = model.currentStimulusContext(
+      kind: "user_message",
+      now: now.addingTimeInterval(AffectiveViewModel.counterpartActivityWindowSeconds + 1)
+    )
+    XCTAssertFalse(expiredContext.counterpartActive)
   }
 
   @MainActor
@@ -3545,6 +3669,7 @@ final class AffectiveTests: XCTestCase {
   private static func toolResponse(
     toolName: String,
     events: [BrainHostEvent] = [],
+    result: JSONValue? = nil,
     requestID: String = UUID().uuidString
   ) -> BrainToolResponse {
     let envelope = BrainDispatchEnvelope(
@@ -3552,7 +3677,7 @@ final class AffectiveTests: XCTestCase {
       requestID: requestID,
       ok: true,
       events: events,
-      result: nil,
+      result: result,
       error: nil,
       rawText: ""
     )

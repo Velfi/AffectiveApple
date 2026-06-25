@@ -19,6 +19,8 @@ final class AffectiveViewModel: ObservableObject {
     static let automaticCameraDeviceID = "automatic"
     static let recentStimulusLimit = 10
     static let recentStimulusRetentionSeconds: TimeInterval = 90
+    static let socialTurnResponseWindowSeconds: TimeInterval = 8
+    static let counterpartActivityWindowSeconds: TimeInterval = 12
     static let conversationRecentTurnLimit = 16
     static let conversationStopWords: Set<String> = [
         "about", "after", "again", "also", "because", "been", "being", "could", "from",
@@ -44,6 +46,8 @@ final class AffectiveViewModel: ObservableObject {
     var boredomSenseTask: Task<Void, Never>?
     var boredomSenseGeneration = 0
     var lastHostStimulusAt = Date()
+    var awaitingSocialResponseUntil: Date?
+    var counterpartActiveUntil: Date?
     let brain: BrainDescriptor
     @Published var isBrainConnected = false
     @Published var isToolRunning = false
@@ -542,6 +546,10 @@ nonisolated struct StimulusContext: Equatable {
     let hostHold: String?
     let queuedActionCount: Int
     let speechOutputActive: Bool
+    let awaitingSocialResponse: Bool
+    let socialTurnResponseWindowRemainingSeconds: Double
+    let counterpartActive: Bool
+    let counterpartActivityWindowRemainingSeconds: Double
     let recentStimuli: [RecentStimulusSnapshot]
     let senseInventory: [StimulusInventorySnapshot]
     let localTime: Date
@@ -553,6 +561,10 @@ nonisolated struct StimulusContext: Equatable {
             "received_during": .string(receivedDuring),
             "queued_action_count": .number(Double(queuedActionCount)),
             "speech_output_active": .bool(speechOutputActive),
+            "awaiting_social_response": .bool(awaitingSocialResponse),
+            "social_turn_response_window_remaining_seconds": .number(socialTurnResponseWindowRemainingSeconds),
+            "counterpart_active": .bool(counterpartActive),
+            "counterpart_activity_window_remaining_seconds": .number(counterpartActivityWindowRemainingSeconds),
             "local_time_unix_ms": .number((localTime.timeIntervalSince1970 * 1000).rounded()),
             "local_time_iso8601": .string(Self.localTimeFormatter.string(from: localTime)),
             "conversation_context": .object(conversationContext.eventArguments),

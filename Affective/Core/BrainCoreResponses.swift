@@ -371,6 +371,12 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
       values["budget_dropped_event_count"] = "\(budget.droppedEventCount)"
       values["budget_raw_refs"] = budget.rawRefs.joined(separator: ",")
     }
+    if let ignoredBecauseValue = result?.objectValue?["ignored_because"]?.stringValue {
+      let ignoredBecause = ignoredBecauseValue.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !ignoredBecause.isEmpty {
+        values["ignored_because"] = ignoredBecause
+      }
+    }
     return values
   }
 }

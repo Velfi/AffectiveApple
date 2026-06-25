@@ -353,6 +353,7 @@ extension AffectiveViewModel {
         let trimmed = messageText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let context = currentStimulusContext(kind: interrupt ? "user_interrupt_message" : "user_message")
+        clearSocialTurnResponseWindow()
         chatEntries.append(.init(kind: .user, title: "You", body: trimmed, metadata: ["source": "typed text"]))
         recordConversationTurn(role: "user", text: trimmed, source: "typed_text", metadata: ["source": "typed text"])
         appendCommand(kind: .sent, title: "text", body: trimmed)
@@ -365,6 +366,7 @@ extension AffectiveViewModel {
     }
 
     func markInputActivity() {
+        markCounterpartActive()
         let nextStatus = "Typing"
         guard statusText != nextStatus else { return }
         statusText = nextStatus
@@ -573,7 +575,10 @@ extension AffectiveViewModel {
                     metadata: response.metadata
                 ))
                 if chatKind == .brain {
-                    recordConversationTurn(role: "brain", text: displayText, source: "fallback_chat", metadata: response.metadata)
+                    markAwaitingSocialResponse()
+                    if !eventResult.didRecordBrainTurn {
+                        recordConversationTurn(role: "brain", text: displayText, source: "fallback_chat", metadata: response.metadata)
+                    }
                 }
             }
             if responseText.isEmpty {
@@ -602,13 +607,19 @@ extension AffectiveViewModel {
         let ongoingAction = currentHostPipelineAction?.stimulusDescription
         let hold = hostPipelineHold.stimulusDescription
         let isOngoing = isHostPipelineRunning || hold != nil || isAwaitingChatResponse || speechSpeaker.isSpeaking
+        let socialTurnRemaining = socialTurnResponseWindowRemainingSeconds(now: now)
+        let counterpartActivityRemaining = counterpartActivityWindowRemainingSeconds(now: now)
         return StimulusContext(
             kind: kind,
-            receivedDuring: isOngoing ? "ongoing_action" : "idle",
+            receivedDuring: isOngoing ? "ongoing_action" : (socialTurnRemaining > 0 ? "awaiting_social_response" : "idle"),
             ongoingAction: ongoingAction,
             hostHold: hold,
             queuedActionCount: hostPipelineQueue.count,
             speechOutputActive: speechSpeaker.isSpeaking,
+            awaitingSocialResponse: socialTurnRemaining > 0,
+            socialTurnResponseWindowRemainingSeconds: socialTurnRemaining,
+            counterpartActive: counterpartActivityRemaining > 0,
+            counterpartActivityWindowRemainingSeconds: counterpartActivityRemaining,
             recentStimuli: recentStimulusSnapshots(now: now),
             senseInventory: stimulusInventorySnapshots(now: now),
             localTime: now,
@@ -625,6 +636,10 @@ extension AffectiveViewModel {
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        if role == "user" {
+            markCounterpartActive(now: now)
+            clearSocialTurnResponseWindow()
+        }
         conversationWorkingState.recentTurns.append(.init(
             role: role,
             text: trimmed,
@@ -794,6 +809,8 @@ extension AffectiveViewModel {
         metadata: [String: String],
         now: Date = Date()
     ) {
+        markCounterpartActive(now: now)
+        clearSocialTurnResponseWindow()
         pruneRecentStimuli(now: now)
         let id = nextStimulusSequence
         nextStimulusSequence += 1
@@ -869,6 +886,38 @@ extension AffectiveViewModel {
             return 0.5
         }
         return min(max(value, 0), 1)
+    }
+
+    func markAwaitingSocialResponse(now: Date = Date()) {
+        awaitingSocialResponseUntil = now.addingTimeInterval(Self.socialTurnResponseWindowSeconds)
+    }
+
+    func clearSocialTurnResponseWindow() {
+        awaitingSocialResponseUntil = nil
+    }
+
+    func socialTurnResponseWindowRemainingSeconds(now: Date = Date()) -> Double {
+        guard let until = awaitingSocialResponseUntil else { return 0 }
+        let remaining = until.timeIntervalSince(now)
+        if remaining <= 0 {
+            awaitingSocialResponseUntil = nil
+            return 0
+        }
+        return remaining
+    }
+
+    func markCounterpartActive(now: Date = Date()) {
+        counterpartActiveUntil = now.addingTimeInterval(Self.counterpartActivityWindowSeconds)
+    }
+
+    func counterpartActivityWindowRemainingSeconds(now: Date = Date()) -> Double {
+        guard let until = counterpartActiveUntil else { return 0 }
+        let remaining = until.timeIntervalSince(now)
+        if remaining <= 0 {
+            counterpartActiveUntil = nil
+            return 0
+        }
+        return remaining
     }
 
     func pokeStimulusSummary(_ pulses: [PokePulse]) -> String {

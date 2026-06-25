@@ -83,6 +83,7 @@ extension AffectiveViewModel {
         appendCommand(kind: .state, title: "speech output", body: "apple_speech=true", metadata: ["voice": preferredVoice ?? "system"])
         speechSpeaker.speak(text, preferredVoiceName: preferredVoice) { [weak self] in
             guard let self else { return }
+            self.markAwaitingSocialResponse()
             self.canSend = true
             self.statusText = "Ready"
         }
@@ -106,6 +107,7 @@ extension AffectiveViewModel {
                     return
                 }
                 self.setHostPipelineHold(.none)
+                self.markAwaitingSocialResponse()
                 self.canSend = self.hostPipelineQueue.isEmpty
                 continuation.resume()
             }
