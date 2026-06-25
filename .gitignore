@@ -17,6 +17,24 @@ build/
 # Swift Package Manager
 .build/
 
+# Locally downloaded models
+Models/
+models/
+ModelArtifacts/
+model-artifacts/
+DownloadedModels/
+downloaded-models/
+*.mlmodel
+*.mlmodelc/
+*.gguf
+*.onnx
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.tflite
+*.bin
+
 # Playgrounds
 timeline.xctimeline
 playground.xcworkspace
