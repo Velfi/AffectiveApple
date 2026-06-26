@@ -42,7 +42,7 @@ struct APIKeyWelcomeView: View {
                     .background(AppTheme.sidebarBackground)
 
                     Divider()
-                        .overlay(.white.opacity(0.06))
+                        .overlay(AppTheme.softSeparator)
 
                     credentialForm
                 }
@@ -65,7 +65,7 @@ struct APIKeyWelcomeView: View {
                 .background(AppTheme.sidebarBackground)
 
             Divider()
-                .overlay(.white.opacity(0.06))
+                .overlay(AppTheme.softSeparator)
 
             credentialForm
         }
@@ -285,7 +285,7 @@ struct ProviderCredentialEntryRow: View {
         .background(AppTheme.panelBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.08))
+                .stroke(AppTheme.separator)
         )
     }
 

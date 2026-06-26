@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		C0D3F1002FF0000000000001 /* Affective/ThirdParty/opencv2.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0D3F1012FF0000000000001 /* Affective/ThirdParty/opencv2.xcframework */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		34384E822FEBEC9900868E97 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -27,11 +31,25 @@
 		34384E722FEBEC9900868E97 /* Affective.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Affective.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		34384E812FEBEC9900868E97 /* AffectiveTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AffectiveTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		34384E8B2FEBEC9900868E97 /* AffectiveUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AffectiveUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		C0D3F1012FF0000000000001 /* Affective/ThirdParty/opencv2.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = Affective/ThirdParty/opencv2.xcframework; sourceTree = "<group>"; };
 /* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		34EBDDEE2FEF05BE0006FF5A /* Exceptions for "Affective" folder in "Affective" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 34384E712FEBEC9900868E97 /* Affective */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		34384E742FEBEC9900868E97 /* Affective */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				34EBDDEE2FEF05BE0006FF5A /* Exceptions for "Affective" folder in "Affective" target */,
+			);
 			path = Affective;
 			sourceTree = "<group>";
 		};
@@ -52,6 +70,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C0D3F1002FF0000000000001 /* Affective/ThirdParty/opencv2.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -78,6 +97,7 @@
 				34384E742FEBEC9900868E97 /* Affective */,
 				34384E842FEBEC9900868E97 /* AffectiveTests */,
 				34384E8E2FEBEC9900868E97 /* AffectiveUITests */,
+				C0D3F1012FF0000000000001 /* Affective/ThirdParty/opencv2.xcframework */,
 				34384E732FEBEC9900868E97 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -456,16 +476,22 @@
 				ENABLE_RESOURCE_ACCESS_CAMERA = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/Affective/ThirdParty",
+				);
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/../AffectiveCore/include",
 					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
 				);
+				INFOPLIST_FILE = Affective/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Affective;
 				"INFOPLIST_KEY_CFBundleIconName[sdk=iphoneos*]" = AppIcon;
 				"INFOPLIST_KEY_CFBundleIconName[sdk=iphonesimulator*]" = AppIcon;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.simulation-games";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Affective uses the camera only for camera sense requests. Captured frames may be sent to your selected AI provider for visual analysis.";
+				INFOPLIST_KEY_NSMotionUsageDescription = "Affective uses device motion only to detect local gesture events and one-time orientation sense requests.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -487,14 +513,22 @@
 				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
 					"-laffective-core-embedded",
 					"-lsqlite3",
+					"-framework",
+					Accelerate,
 				);
 				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
 					"-laffective-core-embedded",
 					"-lsqlite3",
+					"-framework",
+					Accelerate,
 				);
 				"OTHER_LDFLAGS[sdk=macosx*]" = (
 					"-laffective-core-embedded",
 					"-lsqlite3",
+					"-framework",
+					Accelerate,
+					"-framework",
+					OpenCL,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = "com.zelda-built-this.AMBI.store";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -531,16 +565,22 @@
 				ENABLE_RESOURCE_ACCESS_CAMERA = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/Affective/ThirdParty",
+				);
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/../AffectiveCore/include",
 					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
 				);
+				INFOPLIST_FILE = Affective/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Affective;
 				"INFOPLIST_KEY_CFBundleIconName[sdk=iphoneos*]" = AppIcon;
 				"INFOPLIST_KEY_CFBundleIconName[sdk=iphonesimulator*]" = AppIcon;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.simulation-games";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Affective uses the camera only for camera sense requests. Captured frames may be sent to your selected AI provider for visual analysis.";
+				INFOPLIST_KEY_NSMotionUsageDescription = "Affective uses device motion only to detect local gesture events and one-time orientation sense requests.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -562,14 +602,22 @@
 				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
 					"-laffective-core-embedded",
 					"-lsqlite3",
+					"-framework",
+					Accelerate,
 				);
 				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
 					"-laffective-core-embedded",
 					"-lsqlite3",
+					"-framework",
+					Accelerate,
 				);
 				"OTHER_LDFLAGS[sdk=macosx*]" = (
 					"-laffective-core-embedded",
 					"-lsqlite3",
+					"-framework",
+					Accelerate,
+					"-framework",
+					OpenCL,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = "com.zelda-built-this.AMBI.store";
 				PRODUCT_NAME = "$(TARGET_NAME)";

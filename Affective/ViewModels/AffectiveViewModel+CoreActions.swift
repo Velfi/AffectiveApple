@@ -81,12 +81,14 @@ extension AffectiveViewModel {
             await sendTextToBrain(text, source: .typedText, stimulusContext: stimulusContext, speakResponse: brainVoiceEnabled)
         case .imageText(let prompt, let attachment, let stimulusContext):
             await sendTextToBrain(prompt, source: .typedText, attachments: [attachment], stimulusContext: stimulusContext, speakResponse: brainVoiceEnabled)
-        case .coreTool(let name, let title, let arguments, let mirrorToChat):
-            await callCoreTool(name: name, title: title, arguments: arguments, mirrorToChat: mirrorToChat)
+        case .coreTool(let name, let title, let arguments, let mirrorToChat, let requiresCamera):
+            await callCoreTool(name: name, title: title, arguments: arguments, mirrorToChat: mirrorToChat, requiresCamera: requiresCamera)
         case .coreTouch(let name, let title):
             await callCoreTouch(name: name, title: title)
         case .pokeSequence(let pulses):
             await callCorePokeSequence(pulses)
+        case .pushedMotionGesture(let observation):
+            await sendPushedMotionGestureObservation(observation)
         case .refreshBrainState:
             await performRefreshBrainState()
         }
@@ -122,18 +124,57 @@ extension AffectiveViewModel {
             }
 
             await enterDreamOnLoadIfNeeded()
+            if motionGestureOptionEnabled {
+                startMotionGestureMonitoringIfAvailable()
+            }
         } catch {
             isBrainConnected = false
             stopBoredomSense()
+            stopMotionGestureMonitoring()
             statusText = "Core unavailable"
             appendCommand(kind: .error, title: "core connect failed", body: error.localizedDescription)
-            chatEntries.append(.init(kind: .error, title: "Affective core", body: error.localizedDescription, metadata: ["brain": brain.id]))
         }
     }
 
     func shortTapWake() {
         statusText = "Wake tap"
         enqueueHostPipelineAction(.coreTouch(name: "short_touch", title: "short_touch"))
+    }
+
+    func startMotionGestureMonitoringIfAvailable() {
+        guard motionGestureOptionEnabled else { return }
+        guard MotionGestureMonitor.isAvailable(), motionGestureMonitor == nil else { return }
+        let monitor = MotionGestureMonitor { [weak self] observation in
+            self?.handleMotionGestureObservation(observation)
+        }
+        motionGestureMonitor = monitor
+        monitor.start()
+        appendCommand(
+            kind: .state,
+            title: "motion gestures",
+            body: "Accelerometer gesture monitoring is active.",
+            metadata: [
+                "capability": "motion_gesture",
+                "sense_direction": "push",
+                "source": "host_accelerometer",
+            ]
+        )
+    }
+
+    func stopMotionGestureMonitoring() {
+        motionGestureMonitor?.stop()
+        motionGestureMonitor = nil
+    }
+
+    func handleMotionGestureObservation(_ observation: MotionGestureObservation) {
+        let metadata = motionGestureMetadata(observation)
+        appendCommand(kind: .sent, title: "motion gesture", body: observation.summary, metadata: metadata)
+        recordRecentStimulus(
+            kind: "motion_gesture",
+            summary: observation.summary,
+            metadata: metadata
+        )
+        enqueueHostPipelineAction(.pushedMotionGesture(observation))
     }
 
     func beginPoke() {
@@ -252,12 +293,22 @@ extension AffectiveViewModel {
     }
 
     func runCoreAction(_ action: CoreToolAction) {
-        if action.toolName == "__host_forget_today" {
-            forgetTodaysExperience()
-            return
-        }
+        enqueueHostPipelineAction(.coreTool(
+            name: action.toolName,
+            title: action.title,
+            arguments: action.arguments,
+            mirrorToChat: action.mirrorToChat,
+            requiresCamera: action.requiresCamera
+        ))
+    }
 
-        enqueueHostPipelineAction(.coreTool(name: action.toolName, title: action.title, arguments: action.arguments, mirrorToChat: action.mirrorToChat))
+    func refreshDeveloperTools() {
+        developerToolActions = []
+        appendCommand(
+            kind: .state,
+            title: "developer tools disabled",
+            body: "Raw admin tool discovery is unavailable in the typed brain event contract."
+        )
     }
 
     func forgetTodaysExperience(now: Date = Date(), calendar: Calendar = .current) {
@@ -354,8 +405,8 @@ extension AffectiveViewModel {
         guard !trimmed.isEmpty else { return }
         let context = currentStimulusContext(kind: interrupt ? "user_interrupt_message" : "user_message")
         clearSocialTurnResponseWindow()
-        chatEntries.append(.init(kind: .user, title: "You", body: trimmed, metadata: ["source": "typed text"]))
-        recordConversationTurn(role: "user", text: trimmed, source: "typed_text", metadata: ["source": "typed text"])
+        chatEntries.append(.init(kind: .user, title: "Other", body: trimmed, metadata: ["source": "typed text"]))
+        recordConversationTurn(role: "other", text: trimmed, source: "experience", metadata: ["source": "typed text"])
         appendCommand(kind: .sent, title: "text", body: trimmed)
         messageText = ""
         if interrupt, canInterruptUserMessage {
@@ -393,8 +444,8 @@ extension AffectiveViewModel {
                 "source": "photo picker",
             ]
             let context = currentStimulusContext(kind: "user_media_message")
-            chatEntries.append(.init(kind: .user, title: "You", body: body, metadata: metadata))
-            recordConversationTurn(role: "user", text: body, source: "image", metadata: metadata)
+            chatEntries.append(.init(kind: .user, title: "Other", body: body, metadata: metadata))
+            recordConversationTurn(role: "other", text: body, source: "image", metadata: metadata)
             appendCommand(kind: .sent, title: "image attachment", body: storedImage.url.path, metadata: metadata)
 
             let prompt = caption.isEmpty
@@ -529,8 +580,7 @@ extension AffectiveViewModel {
         stimulusContext: StimulusContext? = nil,
         mirrorChatMessages: Bool = true,
         speakResponse: Bool = true,
-        handleHostRequests: Bool = true,
-        appendFallbackChat: Bool = true
+        handleHostRequests: Bool = true
     ) async {
         do {
             if !isBrainConnected {
@@ -543,9 +593,7 @@ extension AffectiveViewModel {
                 stimulusContext: stimulusContext
             )
             let responseText = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let displayText = isFrontendCaptureDiagnosticText(responseText)
-                ? "Camera sense requested."
-                : responseText.isEmpty
+            let displayText = responseText.isEmpty
                 ? "The core accepted the turn, but returned no spoken response."
                 : response.text
             let eventResult = await applyCoreEvents(
@@ -558,33 +606,14 @@ extension AffectiveViewModel {
                 statusText = responseText.isEmpty ? "Core returned no reply" : "Zig core responded"
             }
             appendCommand(kind: .result, title: response.toolName, body: displayText, metadata: response.metadata)
-            appendMigrationFallbackWarningIfNeeded(response.metadata, title: response.toolName)
             appendCommand(
                 kind: .state,
                 title: "chat display",
                 body: conversationDisplaySummary(responseText: responseText, metadata: response.metadata),
                 metadata: response.metadata
             )
-            if appendFallbackChat && !eventResult.didAppendBrainChat && !isFrontendCaptureDiagnosticText(responseText) {
-                let chatKind: LogKind = responseText.isEmpty ? .error : .brain
-                let chatTitle = responseText.isEmpty ? "Affective core" : brainSenderName
-                chatEntries.append(.init(
-                    kind: chatKind,
-                    title: chatTitle,
-                    body: displayText,
-                    metadata: response.metadata
-                ))
-                if chatKind == .brain {
-                    markAwaitingSocialResponse()
-                    if !eventResult.didRecordBrainTurn {
-                        recordConversationTurn(role: "brain", text: displayText, source: "fallback_chat", metadata: response.metadata)
-                    }
-                }
-            }
             if responseText.isEmpty {
                 canSend = true
-            } else if speakResponse && !eventResult.didRequestSpeech && !isFrontendCaptureDiagnosticText(responseText) {
-                await speakBrainResponseAndWait(displayText)
             }
         } catch {
             isBrainConnected = false
@@ -592,14 +621,6 @@ extension AffectiveViewModel {
             canSend = true
             statusText = "Core error"
             appendCommand(kind: .error, title: "text send failed", body: error.localizedDescription)
-            if appendFallbackChat {
-                chatEntries.append(.init(
-                    kind: .error,
-                    title: "Affective core",
-                    body: error.localizedDescription,
-                    metadata: ["brain": brain.id]
-                ))
-            }
         }
     }
 
@@ -636,16 +657,18 @@ extension AffectiveViewModel {
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        if role == "user" {
+        let speaker = conversationSpeaker(role: role, metadata: metadata)
+        if speaker.role == "other" {
             markCounterpartActive(now: now)
             clearSocialTurnResponseWindow()
         }
         conversationWorkingState.recentTurns.append(.init(
-            role: role,
+            speakerRole: speaker.role,
+            speakerName: speaker.name,
             text: trimmed,
             occurredAt: now,
             source: source,
-            salience: conversationSalience(role: role, text: trimmed, metadata: metadata),
+            salience: conversationSalience(speakerRole: speaker.role, text: trimmed, metadata: metadata),
             metadata: metadata
         ))
         compactConversationTurnsIfNeeded()
@@ -660,7 +683,8 @@ extension AffectiveViewModel {
             unresolvedQuestions: conversationWorkingState.unresolvedQuestions,
             recentTurns: conversationWorkingState.recentTurns.map { turn in
                 ConversationTurnSnapshot(
-                    role: turn.role,
+                    speakerRole: turn.speakerRole,
+                    speakerName: turn.speakerName,
                     text: turn.text,
                     occurredAtUnixMS: (turn.occurredAt.timeIntervalSince1970 * 1000).rounded(),
                     ageSeconds: max(0, now.timeIntervalSince(turn.occurredAt)),
@@ -678,7 +702,8 @@ extension AffectiveViewModel {
         let compactedTurns = Array(conversationWorkingState.recentTurns.prefix(overflow))
         conversationWorkingState.recentTurns.removeFirst(overflow)
         let additions = compactedTurns.map { turn in
-            "\(turn.role): \(turn.text)"
+            let speaker = turn.speakerName ?? turn.speakerRole
+            return "\(speaker): \(turn.text)"
         }
         let summaryParts = ([conversationWorkingState.rollingSummary] + additions)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -701,7 +726,7 @@ extension AffectiveViewModel {
     func derivedUnresolvedQuestions() -> [String] {
         let questions = conversationWorkingState.recentTurns
             .suffix(8)
-            .filter { $0.role == "user" && $0.text.contains("?") }
+            .filter { $0.speakerRole == "other" && $0.text.contains("?") }
             .map(\.text)
         return Array(questions.suffix(3))
     }
@@ -716,14 +741,38 @@ extension AffectiveViewModel {
         return Array(NSOrderedSet(array: words).compactMap { $0 as? String }.prefix(4))
     }
 
-    func conversationSalience(role: String, text: String, metadata: [String: String]) -> Double {
+    func conversationSalience(speakerRole: String, text: String, metadata: [String: String]) -> Double {
         if let rawValue = metadata["salience"], let value = Double(rawValue) {
             return min(max(value, 0), 1)
         }
         if metadata["media_kind"] != nil { return 0.8 }
         if text.contains("?") { return 0.7 }
-        if role == "user" { return 0.65 }
+        if speakerRole == "other" { return 0.65 }
         return 0.55
+    }
+
+    func conversationSpeaker(role rawRole: String, metadata: [String: String]) -> (role: String, name: String?) {
+        let role = rawRole.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let explicitName = conversationSpeakerName(from: metadata)
+        switch role {
+        case "self", "brain", "bot", "assistant", "agent":
+            return ("self", explicitName ?? brainSenderName)
+        case "other", "user", "human", "person", "counterpart", "speaker":
+            return ("other", explicitName)
+        default:
+            let fallbackName = rawRole.trimmingCharacters(in: .whitespacesAndNewlines)
+            return ("other", explicitName ?? (fallbackName.isEmpty ? nil : fallbackName))
+        }
+    }
+
+    func conversationSpeakerName(from metadata: [String: String]) -> String? {
+        for key in ["speaker_name", "person_name", "display_name", "name"] {
+            if let value = metadata[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !value.isEmpty {
+                return value
+            }
+        }
+        return nil
     }
 
     func noteQueuedChatResponses(_ count: Int) {
@@ -1004,9 +1053,9 @@ private extension HostPipelineAction {
             return true
         case .interrupt:
             return false
-        case .coreTool(_, _, _, let mirrorToChat):
+        case .coreTool(_, _, _, let mirrorToChat, _):
             return mirrorToChat
-        case .coreTouch, .pokeSequence:
+        case .coreTouch, .pokeSequence, .pushedMotionGesture:
             return false
         case .refreshBrainState:
             return false
@@ -1018,18 +1067,148 @@ private extension HostPipelineAction {
         case .interrupt:
             return "interrupt"
         case .typedText:
-            return "typed_text"
+            return "experience:user_message"
         case .imageText:
             return "image_text"
-        case .coreTool(let name, _, _, _):
-            return "tool_call:\(name)"
+        case .coreTool(let name, _, _, _, _):
+            return "admin_tool:\(name)"
         case .coreTouch(let name, _):
             return name
         case .pokeSequence:
-            return "poke_sequence"
+            return "experience:poke_sequence"
+        case .pushedMotionGesture(let observation):
+            return "pushed_motion_gesture:\(observation.gesture)"
         case .refreshBrainState:
             return "refresh_brain_state"
         }
+    }
+}
+
+private extension AffectiveViewModel {
+    static func decodeDeveloperToolCatalog(from response: BrainToolResponse) throws -> DeveloperToolCatalog {
+        let payloads = developerToolCatalogPayloads(from: response)
+        var failures: [DeveloperToolCatalogDecodeFailure] = []
+
+        for payload in payloads {
+            do {
+                return try JSONDecoder().decode(DeveloperToolCatalog.self, from: payload.data)
+            } catch {
+                failures.append(.init(source: payload.source, text: payload.previewText, error: error))
+            }
+        }
+
+        throw DeveloperToolCatalogError(failures: failures)
+    }
+
+    static func developerToolCatalogPayloads(from response: BrainToolResponse) -> [DeveloperToolCatalogPayload] {
+        var payloads: [DeveloperToolCatalogPayload] = []
+        var seen = Set<String>()
+
+        func append(_ source: String, _ text: String) {
+            let data = Data(text.utf8)
+            append(source, data, previewText: text)
+        }
+
+        func append(_ source: String, _ data: Data, previewText: String? = nil) {
+            let key = "\(source):\(data.base64EncodedString())"
+            guard !seen.contains(key) else { return }
+            seen.insert(key)
+            payloads.append(.init(source: source, data: data, previewText: previewText ?? String(decoding: data, as: UTF8.self)))
+        }
+
+        if let envelope = try? BrainDispatchEnvelope.decode(from: response.rawText),
+           let result = envelope.result,
+           let data = try? result.encodedData() {
+            if envelope.resultRawResult == true,
+               let summary = envelope.resultSummary {
+                append("dispatch result.summary", summary)
+            }
+
+            append("dispatch result", data)
+
+            if let object = result.objectValue {
+                for key in ["catalog", "developer_tools", "tool_catalog"] {
+                    if let nested = object[key], let nestedData = try? nested.encodedData() {
+                        append("dispatch result.\(key)", nestedData)
+                    }
+                }
+            }
+        }
+
+        append("response text", response.text)
+        append("raw dispatch response", response.rawText)
+        return payloads
+    }
+}
+
+private struct DeveloperToolCatalogPayload {
+    let source: String
+    let data: Data
+    let previewText: String
+}
+
+private struct DeveloperToolCatalogDecodeFailure {
+    let source: String
+    let text: String
+    let error: Error
+}
+
+private struct DeveloperToolCatalogError: LocalizedError {
+    let failures: [DeveloperToolCatalogDecodeFailure]
+
+    var errorDescription: String? {
+        guard let first = failures.first else {
+            return "developer_tools returned no payload to decode. Expected JSON shaped like { \"tools\": [...] }."
+        }
+
+        var lines = [
+            "Could not decode developer_tools catalog from \(first.source).",
+            Self.describe(first.error),
+        ]
+
+        let preview = Self.preview(first.text)
+        if !preview.isEmpty {
+            lines.append("Payload preview: \(preview)")
+        }
+
+        if failures.count > 1 {
+            let sources = failures.dropFirst().map(\.source).joined(separator: ", ")
+            lines.append("Also tried: \(sources).")
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private static func describe(_ error: Error) -> String {
+        switch error {
+        case DecodingError.keyNotFound(let key, let context):
+            return "Missing key '\(key.stringValue)' at \(path(context.codingPath)). \(context.debugDescription)"
+        case DecodingError.typeMismatch(let type, let context):
+            return "Type mismatch for \(type) at \(path(context.codingPath)). \(context.debugDescription)"
+        case DecodingError.valueNotFound(let type, let context):
+            return "Missing value for \(type) at \(path(context.codingPath)). \(context.debugDescription)"
+        case DecodingError.dataCorrupted(let context):
+            return "Invalid JSON at \(path(context.codingPath)). \(context.debugDescription)"
+        default:
+            return error.localizedDescription
+        }
+    }
+
+    private static func path(_ codingPath: [CodingKey]) -> String {
+        guard !codingPath.isEmpty else { return "$" }
+        return "$." + codingPath.map(\.stringValue).joined(separator: ".")
+    }
+
+    private static func preview(_ text: String) -> String {
+        let normalized = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return "<empty>" }
+        if normalized.count <= 500 {
+            return normalized
+        }
+        return "\(normalized.prefix(500))..."
     }
 }
 

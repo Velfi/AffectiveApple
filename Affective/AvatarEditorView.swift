@@ -31,7 +31,6 @@ struct AvatarEditorWindow: View {
                 .foregroundStyle(AppTheme.primaryText)
             }
         }
-        .preferredColorScheme(.dark)
     }
 
     private var brain: BrainDescriptor? {
@@ -54,6 +53,7 @@ struct AvatarEditorView: View {
     init(brain: BrainDescriptor, library: BrainLibrary) {
         self.brain = brain
         self.library = library
+        AppTheme.applyTheme(for: brain)
         _model = StateObject(wrappedValue: AvatarEditorModel(brain: brain))
     }
 
@@ -63,7 +63,7 @@ struct AvatarEditorView: View {
                 .frame(width: model.editorSection.sidebarWidth)
 
             Divider()
-                .overlay(.white.opacity(0.06))
+                .overlay(AppTheme.softSeparator)
 
             canvasPane
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -92,7 +92,7 @@ struct AvatarEditorView: View {
             )
 
             Divider()
-                .overlay(.white.opacity(0.06))
+                .overlay(AppTheme.softSeparator)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
@@ -198,7 +198,7 @@ struct AvatarEditorView: View {
                             .padding(.horizontal, 8)
                             .padding(.vertical, 5)
                             .background(AppTheme.accent.opacity(0.92), in: Capsule())
-                            .foregroundStyle(.black.opacity(0.86))
+                            .foregroundStyle(AppTheme.textOnAccent)
                             .position(
                                 x: clipX * scale + 52,
                                 y: clipY * scale + 22
@@ -209,7 +209,7 @@ struct AvatarEditorView: View {
                 .background(.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(.white.opacity(0.10))
+                        .stroke(AppTheme.separator)
                 )
                 .gesture(
                     DragGesture()
@@ -383,7 +383,7 @@ struct AvatarEditorView: View {
         .background(AppTheme.panelBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.08))
+                .stroke(AppTheme.separator)
         )
     }
 
@@ -471,7 +471,7 @@ struct AvatarEditorView: View {
         .background(AppTheme.panelBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.08))
+                .stroke(AppTheme.separator)
         )
     }
 
@@ -542,7 +542,7 @@ struct AvatarEditorView: View {
         .background(AppTheme.panelBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.08))
+                .stroke(AppTheme.separator)
         )
     }
 
@@ -615,7 +615,7 @@ struct AvatarEditorView: View {
         .background(AppTheme.panelBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.08))
+                .stroke(AppTheme.separator)
         )
     }
 

@@ -26,7 +26,7 @@ struct LiveCorePanel: View {
             PanelHeader(title: "Core", subtitle: "Send live tool calls to the selected Zig brain.")
 
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), spacing: 10)], spacing: 10) {
-                ForEach(CoreToolAction.primary) { action in
+                ForEach(model.developerToolActions) { action in
                     Button {
                         model.runCoreAction(action)
                     } label: {
@@ -39,6 +39,9 @@ struct LiveCorePanel: View {
             }
         }
         .panelStyle()
+        .onAppear {
+            model.refreshDeveloperTools()
+        }
     }
 }
 
@@ -150,7 +153,7 @@ struct ReminderToolsPanel: View {
     var scheduleField: some View {
         TextField("in 10 minutes", text: $model.reminderSchedule)
             .textFieldStyle(.plain)
-            .optionFieldStyle(isDirty: true)
+            .optionFieldStyle(isDirty: !model.reminderSchedule.isEmpty)
     }
 
     var reminderTextField: some View {
@@ -181,60 +184,9 @@ struct AutonomyOptionsPanel: View {
     var isCompact = false
 
     var body: some View {
-        HStack(spacing: isCompact ? 8 : 12) {
-            Button {
-                model.setAutonomyMode(model.autonomyMode == "on" ? "off" : "on")
-            } label: {
-                Image(systemName: model.autonomyMode == "on" ? "bolt.circle.fill" : "bolt.slash.circle")
-                    .font(.system(size: isCompact ? 14 : 16, weight: .semibold))
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(model.autonomyMode == "on" ? AppTheme.accent : AppTheme.secondaryText)
-                    .frame(width: isCompact ? 26 : 30, height: isCompact ? 26 : 30)
-                    .background(AppTheme.editorBackground, in: Circle())
-                    .overlay(Circle().stroke(model.autonomyMode == "on" ? AppTheme.accent.opacity(0.36) : .white.opacity(0.08)))
-            }
-            .buttonStyle(.plain)
-            .help(model.autonomyMode == "on" ? "Disable autonomy" : "Enable autonomy")
-            .accessibilityLabel("Autonomy")
-            .accessibilityValue(model.autonomyMode == "on" ? "On" : "Off")
-
-            Text("Autonomy")
-                .font(isCompact ? .subheadline.weight(.semibold) : .headline)
-                .lineLimit(1)
-
-            Text(summaryText)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(AppTheme.secondaryText)
-                .lineLimit(1)
-                .minimumScaleFactor(0.82)
-
-            Spacer(minLength: 8)
-
-            if let boredomInterval = model.runtimeOptionIntValue(for: AffectiveViewModel.boredomIntervalOptionKey) {
-                Label("\(boredomInterval)s", systemImage: "clock")
-                    .font(.caption.weight(.semibold))
-                    .labelStyle(.titleAndIcon)
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.82)
-                    .accessibilityLabel("Idle check every \(boredomInterval) seconds")
-            }
-
-            if model.autonomyMode == "on" {
-                budgetCounter
-
-                Button {
-                    model.addAutonomyActionBudget()
-                } label: {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.system(size: isCompact ? 17 : 18, weight: .semibold))
-                        .frame(width: isCompact ? 26 : 28, height: isCompact ? 26 : 28)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(AppTheme.accent)
-                .help("Add 1 autonomy action")
-                .accessibilityLabel("Add one autonomy action")
-            }
+        ViewThatFits(in: .horizontal) {
+            singleRow
+            stackedRows
         }
         .padding(.horizontal, isCompact ? 11 : 15)
         .padding(.vertical, isCompact ? 9 : 11)
@@ -243,6 +195,94 @@ struct AutonomyOptionsPanel: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(model.autonomyMode == "on" ? AppTheme.accent.opacity(0.45) : .white.opacity(0.08))
         )
+    }
+
+    var singleRow: some View {
+        HStack(spacing: isCompact ? 8 : 12) {
+            leadingCluster
+            Spacer(minLength: 8)
+            trailingCluster
+        }
+    }
+
+    var stackedRows: some View {
+        VStack(alignment: .leading, spacing: isCompact ? 8 : 10) {
+            HStack(spacing: isCompact ? 8 : 12) {
+                leadingCluster
+                Spacer(minLength: 8)
+            }
+            HStack(spacing: isCompact ? 8 : 12) {
+                trailingCluster
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    @ViewBuilder
+    var leadingCluster: some View {
+        toggleButton
+
+        Text("Autonomy")
+            .font(isCompact ? .subheadline.weight(.semibold) : .headline)
+            .lineLimit(1)
+
+        Text(summaryText)
+            .font(.caption.weight(.medium))
+            .foregroundStyle(AppTheme.secondaryText)
+            .lineLimit(1)
+            .minimumScaleFactor(0.82)
+    }
+
+    @ViewBuilder
+    var trailingCluster: some View {
+        if let boredomInterval = model.runtimeOptionIntValue(for: AffectiveViewModel.boredomIntervalOptionKey) {
+            Label("\(boredomInterval)s", systemImage: "clock")
+                .font(.caption.weight(.semibold))
+                .labelStyle(.titleAndIcon)
+                .foregroundStyle(AppTheme.secondaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.82)
+                .accessibilityLabel("Idle check every \(boredomInterval) seconds")
+        }
+
+        if model.autonomyMode == "on" {
+            budgetCounter
+            addActionButton
+        }
+    }
+
+    var toggleButton: some View {
+        Button {
+            model.setAutonomyMode(model.autonomyMode == "on" ? "off" : "on")
+        } label: {
+            Image(systemName: model.autonomyMode == "on" ? "bolt.circle.fill" : "bolt.slash.circle")
+                .font(.system(size: isCompact ? 14 : 16, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(model.autonomyMode == "on" ? AppTheme.accent : AppTheme.secondaryText)
+                .frame(width: isCompact ? 26 : 30, height: isCompact ? 26 : 30)
+                .background(AppTheme.editorBackground, in: Circle())
+                .overlay(Circle().stroke(model.autonomyMode == "on" ? AppTheme.accent.opacity(0.36) : .white.opacity(0.08)))
+                .hitTarget()
+        }
+        .buttonStyle(.plain)
+        .help(model.autonomyMode == "on" ? "Disable autonomy" : "Enable autonomy")
+        .accessibilityLabel("Autonomy")
+        .accessibilityValue(model.autonomyMode == "on" ? "On" : "Off")
+    }
+
+    var addActionButton: some View {
+        Button {
+            model.addAutonomyActionBudget()
+        } label: {
+            Image(systemName: "plus.circle.fill")
+                .font(.system(size: isCompact ? 17 : 18, weight: .semibold))
+                .foregroundStyle(AppTheme.accent)
+                .frame(width: isCompact ? 26 : 28, height: isCompact ? 26 : 28)
+                .hitTarget()
+        }
+        .buttonStyle(.plain)
+        .help("Add 1 autonomy action")
+        .accessibilityLabel("Add one autonomy action")
     }
 
     var summaryText: String {
@@ -263,7 +303,7 @@ struct AutonomyOptionsPanel: View {
         .background(AppTheme.editorBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.08))
+                .stroke(AppTheme.separator)
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Autonomy budget \(model.autonomyActionBudget) actions")
@@ -282,7 +322,7 @@ struct ChatControlsStrip: View {
         .padding(.horizontal, isCompact ? 8 : 10)
         .padding(.vertical, isCompact ? 6 : 8)
         .background(AppTheme.panelBackground.opacity(0.72), in: Capsule())
-        .overlay(Capsule().stroke(.white.opacity(0.08)))
+        .overlay(Capsule().stroke(AppTheme.separator))
     }
 
     func controlLayout(showStatus: Bool) -> some View {
@@ -301,14 +341,15 @@ struct ChatControlsStrip: View {
             } label: {
                 Image(systemName: "plus.circle.fill")
                     .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
                     .frame(width: 30, height: 30)
+                    .hitTarget()
             }
             .buttonStyle(.plain)
-            .foregroundStyle(AppTheme.accent)
             .accessibilityLabel("Add one autonomy action")
             .opacity(model.autonomyMode == "on" ? 1 : 0)
             .disabled(model.autonomyMode != "on")
-            .frame(width: model.autonomyMode == "on" ? 30 : 0)
+            .frame(width: model.autonomyMode == "on" ? 44 : 0)
             .clipped()
             .accessibilityHidden(model.autonomyMode != "on")
         }
@@ -325,12 +366,13 @@ struct AutonomyToggleButton: View {
             Image(systemName: model.autonomyMode == "on" ? "bolt.circle.fill" : "bolt.slash.circle")
                 .font(.system(size: 16, weight: .semibold))
                 .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(model.autonomyMode == "on" ? AppTheme.accent : AppTheme.secondaryText)
                 .frame(width: 30, height: 30)
+                .background(AppTheme.editorBackground, in: Circle())
+                .overlay(Circle().stroke(model.autonomyMode == "on" ? AppTheme.accent.opacity(0.36) : .white.opacity(0.08)))
+                .hitTarget()
         }
         .buttonStyle(.plain)
-        .foregroundStyle(model.autonomyMode == "on" ? AppTheme.accent : AppTheme.secondaryText)
-        .background(AppTheme.editorBackground, in: Circle())
-        .overlay(Circle().stroke(model.autonomyMode == "on" ? AppTheme.accent.opacity(0.36) : .white.opacity(0.08)))
         .help(model.autonomyMode == "on" ? "Disable autonomy" : "Enable autonomy")
         .accessibilityLabel("Autonomy")
         .accessibilityValue(model.autonomyMode == "on" ? "On" : "Off")
@@ -347,12 +389,13 @@ struct BrainVoiceToggleButton: View {
             Image(systemName: model.brainVoiceEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
                 .font(.system(size: 16, weight: .semibold))
                 .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(model.brainVoiceEnabled ? AppTheme.accent : AppTheme.secondaryText)
                 .frame(width: 30, height: 30)
+                .background(AppTheme.editorBackground, in: Circle())
+                .overlay(Circle().stroke(model.brainVoiceEnabled ? AppTheme.accent.opacity(0.36) : .white.opacity(0.08)))
+                .hitTarget()
         }
         .buttonStyle(.plain)
-        .foregroundStyle(model.brainVoiceEnabled ? AppTheme.accent : AppTheme.secondaryText)
-        .background(AppTheme.editorBackground, in: Circle())
-        .overlay(Circle().stroke(model.brainVoiceEnabled ? AppTheme.accent.opacity(0.36) : .white.opacity(0.08)))
         .help(model.brainVoiceEnabled ? "Disable brain voice" : "Enable brain voice")
         .accessibilityLabel("Brain voice")
         .accessibilityValue(model.brainVoiceEnabled ? "On" : "Off")
@@ -391,7 +434,7 @@ struct HeaderStrip: View {
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 14, weight: .semibold))
-                    .frame(width: 30, height: 26)
+                    .frame(width: 44, height: 34)
             }
             .buttonStyle(.bordered)
             .tint(AppTheme.accent)
@@ -403,7 +446,17 @@ struct HeaderStrip: View {
     }
 
     var connectionDetail: String {
-        "macOS host - \(model.coreStatusText)"
+        "\(Self.hostName) - \(model.coreStatusText)"
+    }
+
+    static var hostName: String {
+        #if os(macOS)
+        return "macOS host"
+        #elseif canImport(UIKit)
+        return UIDevice.current.userInterfaceIdiom == .pad ? "iPad host" : "iPhone host"
+        #else
+        return "host"
+        #endif
     }
 
     var statusSymbolName: String {
@@ -437,13 +490,6 @@ struct PrimaryHoldButton: View {
             }
 
             Spacer()
-
-            Image(systemName: "space")
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(AppTheme.secondaryText)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         }
         .padding(22)
         .frame(maxWidth: .infinity, minHeight: 112)

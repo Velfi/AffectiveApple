@@ -56,11 +56,18 @@ struct ContentView: View {
         #else
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         #endif
-        .preferredColorScheme(.dark)
         .onAppear {
             if AffectiveViewModel.hasAnyProviderCredential() {
                 didCompleteCredentialWelcome = true
             }
+            #if DEBUG
+            if let uiTestBrain = AffectiveUITestHarness.brainToOpenIfNeeded(from: library.recencySortedBrains) {
+                didCompleteCredentialWelcome = true
+                library.markOpened(uiTestBrain)
+                selectedBrain = uiTestBrain
+                return
+            }
+            #endif
             syncManager.syncOnAppStart(brains: library.recencySortedBrains)
             openPendingAppIntentBrain()
         }
@@ -132,14 +139,23 @@ private struct AffectiveShellView: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     init(brain: BrainDescriptor) {
+        AppTheme.applyTheme(for: brain)
+        #if DEBUG
+        let viewModel = AffectiveViewModel(
+            brain: brain,
+            brainCore: AffectiveUITestHarness.brainCoreIfNeeded()
+        )
+        AffectiveUITestHarness.configure(viewModel)
+        _model = StateObject(wrappedValue: viewModel)
+        #else
         _model = StateObject(wrappedValue: AffectiveViewModel(brain: brain))
+        #endif
     }
 
     var body: some View {
         shell
             .background(AppTheme.background)
             .foregroundStyle(AppTheme.primaryText)
-            .preferredColorScheme(.dark)
             .alert(item: $model.orientationPermissionPrompt) { prompt in
                 Alert(
                     title: Text("Allow Orientation Sense?"),
@@ -166,7 +182,7 @@ private struct AffectiveShellView: View {
 
                 if !composerFocused {
                     Divider()
-                        .overlay(.white.opacity(0.06))
+                        .overlay(AppTheme.softSeparator)
 
                     CompactWorkspaceBar(model: model)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -178,7 +194,7 @@ private struct AffectiveShellView: View {
                 CompactWorkspaceRail(model: model)
 
                 Divider()
-                    .overlay(.white.opacity(0.06))
+                    .overlay(AppTheme.softSeparator)
 
                 WorkspaceDetail(model: model, composerFocused: $composerFocused)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -194,7 +210,7 @@ private struct AffectiveShellView: View {
                 .frame(width: 260)
 
             Divider()
-                .overlay(.white.opacity(0.05))
+                .overlay(AppTheme.softSeparator)
 
             WorkspaceDetail(model: model, composerFocused: $composerFocused)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -221,7 +237,7 @@ private struct CompactWorkspaceRail: View {
                         if section == .mailbox && model.unreadDreamReportCount > 0 {
                             Text("\(model.unreadDreamReportCount)")
                                 .font(.system(size: 9, weight: .bold, design: .rounded))
-                                .foregroundStyle(.black.opacity(0.86))
+                                .foregroundStyle(AppTheme.textOnAccent)
                                 .padding(.horizontal, 5)
                                 .padding(.vertical, 2)
                                 .background(AppTheme.accent, in: Capsule())
@@ -230,6 +246,7 @@ private struct CompactWorkspaceRail: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(section.rawValue)
+                .accessibilityAddTraits(model.selectedSection == section ? .isSelected : [])
             }
 
             Spacer(minLength: 0)
@@ -265,7 +282,7 @@ private struct CompactWorkspaceBar: View {
                         if section == .mailbox && model.unreadDreamReportCount > 0 {
                             Text("\(model.unreadDreamReportCount)")
                                 .font(.system(size: 9, weight: .bold, design: .rounded))
-                                .foregroundStyle(.black.opacity(0.86))
+                                .foregroundStyle(AppTheme.textOnAccent)
                                 .padding(.horizontal, 5)
                                 .padding(.vertical, 2)
                                 .background(AppTheme.accent, in: Capsule())
@@ -276,6 +293,7 @@ private struct CompactWorkspaceBar: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(section.rawValue)
+                .accessibilityAddTraits(model.selectedSection == section ? .isSelected : [])
             }
         }
         .padding(.horizontal, 4)

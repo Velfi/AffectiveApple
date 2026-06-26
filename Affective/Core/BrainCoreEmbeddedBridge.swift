@@ -23,9 +23,98 @@ import Foundation
   }
 
   nonisolated final class EmbeddedHostServices {
+    typealias CredentialProvider = HostProviderRouter.CredentialProvider
+    typealias ProviderPicker = HostProviderRouter.ProviderPicker
+    typealias JSONLoader = HostLLMCompletionClient.JSONLoader
+    typealias TextRoutePicker = HostLLMCompletionClient.RoutePicker
+
     private struct Header: Decodable {
       let name: String
       let value: String
+    }
+
+    private struct HostLLMCompletionPayload: Decodable {
+      let systemPrompt: String
+      let userPrompt: String
+      let responseFormat: String
+      let maxTokens: Int?
+      let jsonSchema: String?
+
+      enum CodingKeys: String, CodingKey {
+        case systemPrompt = "system_prompt"
+        case userPrompt = "user_prompt"
+        case responseFormat = "response_format"
+        case maxTokens = "max_tokens"
+        case jsonSchema = "json_schema"
+      }
+    }
+
+    private struct HostImageGenerationPayload: Decodable {
+      let prompt: String
+      let outputDirectory: String
+
+      enum CodingKeys: String, CodingKey {
+        case prompt
+        case outputDirectory = "output_dir"
+      }
+    }
+
+    private struct HostVisionCompletionPayload: Decodable {
+      let prompt: String
+      let imagePaths: [String]
+      let responseFormat: String
+      let maxTokens: Int?
+      let temperature: Double?
+      let jsonSchema: String?
+
+      enum CodingKeys: String, CodingKey {
+        case prompt
+        case imagePaths = "image_paths"
+        case responseFormat = "response_format"
+        case maxTokens = "max_tokens"
+        case temperature
+        case jsonSchema = "json_schema"
+      }
+    }
+
+    private struct HostImageGenerationResponse: Encodable {
+      let path: String
+      let mimeType: String
+
+      enum CodingKeys: String, CodingKey {
+        case path
+        case mimeType = "mime_type"
+      }
+    }
+
+    private static let hostLLMCompletionURL = "affective-host://llm/complete"
+    private static let hostImageGenerationURL = "affective-host://image/generate"
+    private static let hostVisionCompletionURL = "affective-host://vision/complete"
+    private static let hostRecognizeIdentifyURL = "affective-host://recognize/identify"
+    private static let hostRecognizeEnrollURL = "affective-host://recognize/enroll"
+
+    private let providerRouter: HostProviderRouter
+    private let textProviderPreference: HostTextProviderPreference
+    private let textRoutePicker: TextRoutePicker
+    private let jsonLoader: JSONLoader?
+    private let faceRecognizer: FaceRecognizing
+
+    init(
+      credentialProvider: @escaping CredentialProvider = CoreConfigStorage.providerCredentials,
+      providerPicker: @escaping ProviderPicker = { $0.randomElement() },
+      textProviderPreference: HostTextProviderPreference = .random,
+      textRoutePicker: @escaping TextRoutePicker = { $0.randomElement() },
+      jsonLoader: JSONLoader? = nil,
+      faceRecognizer: FaceRecognizing = FaceRecognitionService()
+    ) {
+      self.providerRouter = HostProviderRouter(
+        credentialProvider: credentialProvider,
+        providerPicker: providerPicker
+      )
+      self.textProviderPreference = textProviderPreference
+      self.textRoutePicker = textRoutePicker
+      self.jsonLoader = jsonLoader
+      self.faceRecognizer = faceRecognizer
     }
 
     func withHostServices<Result>(_ body: (AffectiveCoreEmbeddedHostServices) -> Result)
@@ -56,14 +145,21 @@ import Foundation
         Self.copy(Data(), to: outError)
         return 0
       } catch {
-        Self.copy(Data(String(describing: error).utf8), to: outError)
+        Self.copy(
+          Data(Self.httpErrorDescription(error, url: url, body: body).utf8),
+          to: outError
+        )
         Self.copy(Data(), to: outData)
         return 1
       }
     }
 
-    private func performPostJSON(url urlString: String, headersJSON: String, body: Data)
-      throws -> Data
+    func postJSON(url urlString: String, headersJSON: String, body: Data) throws -> Data {
+      try performPostJSON(url: urlString, headersJSON: headersJSON, body: body)
+    }
+
+    func requestForPostJSON(url urlString: String, headersJSON: String, body: Data)
+      throws -> URLRequest
     {
       guard let url = URL(string: urlString) else {
         throw HostHTTPError.invalidURL(urlString)
@@ -77,6 +173,30 @@ import Foundation
       for header in headers {
         request.setValue(header.value, forHTTPHeaderField: header.name)
       }
+      try providerRouter.authorizeProviderRequest(&request)
+      return request
+    }
+
+    private func performPostJSON(url urlString: String, headersJSON: String, body: Data)
+      throws -> Data
+    {
+      if urlString == Self.hostLLMCompletionURL {
+        return try performHostLLMCompletion(body: body)
+      }
+      if urlString == Self.hostImageGenerationURL {
+        return try performHostImageGeneration(body: body)
+      }
+      if urlString == Self.hostVisionCompletionURL {
+        return try performHostVisionCompletion(body: body)
+      }
+      if urlString == Self.hostRecognizeIdentifyURL {
+        return try performHostRecognizeIdentify(body: body)
+      }
+      if urlString == Self.hostRecognizeEnrollURL {
+        return try performHostRecognizeEnroll(body: body)
+      }
+
+      let request = try requestForPostJSON(url: urlString, headersJSON: headersJSON, body: body)
 
       let semaphore = DispatchSemaphore(value: 0)
       var result: Result<(Data, URLResponse), Error>?
@@ -108,6 +228,125 @@ import Foundation
       return data
     }
 
+    private func performHostLLMCompletion(body: Data) throws -> Data {
+      let payload = try JSONDecoder().decode(HostLLMCompletionPayload.self, from: body)
+      let prompt = Self.prompt(for: payload)
+      let client = HostLLMCompletionClient(
+        providerRouter: providerRouter,
+        textProviderPreference: textProviderPreference,
+        routePicker: textRoutePicker,
+        jsonLoader: jsonLoader
+      )
+      let semaphore = DispatchSemaphore(value: 0)
+      var result: Result<HostLLMCompletionResponse, Error>?
+      Task {
+        do {
+          let responseFormat = HostResponseFormat(rawValue: payload.responseFormat) ?? .text
+          result = .success(try await client.complete(HostLLMCompletionRequest(
+            prompt: prompt,
+            maxTokens: payload.maxTokens ?? 512,
+            responseFormat: responseFormat,
+            jsonSchema: payload.jsonSchema ?? "{}"
+          )))
+        } catch {
+          result = .failure(error)
+        }
+        semaphore.signal()
+      }
+      guard semaphore.wait(timeout: .now() + 65) == .success else {
+        throw HostHTTPError.timeout
+      }
+      let completion = try result?.get() ?? {
+        throw HostHTTPError.missingResponse
+      }()
+      return Data(completion.text.utf8)
+    }
+
+    private func performHostRecognizeIdentify(body: Data) throws -> Data {
+      let payload = try JSONDecoder().decode(FaceRecognitionIdentifyRequest.self, from: body)
+      let result = try faceRecognizer.identify(payload)
+      return try JSONEncoder().encode(result)
+    }
+
+    private func performHostRecognizeEnroll(body: Data) throws -> Data {
+      let payload = try JSONDecoder().decode(FaceRecognitionEnrollRequest.self, from: body)
+      let result = try faceRecognizer.enroll(payload)
+      return try JSONEncoder().encode(result)
+    }
+
+    private func performHostImageGeneration(body: Data) throws -> Data {
+      let payload = try JSONDecoder().decode(HostImageGenerationPayload.self, from: body)
+      let client = HostImageGenerationClient(providerRouter: providerRouter, jsonLoader: jsonLoader)
+      let semaphore = DispatchSemaphore(value: 0)
+      var result: Result<HostGeneratedImage, Error>?
+      Task {
+        do {
+          result = .success(try await client.generate(HostImageGenerationRequest(
+            prompt: payload.prompt,
+            outputDirectory: URL(fileURLWithPath: payload.outputDirectory)
+          )))
+        } catch {
+          result = .failure(error)
+        }
+        semaphore.signal()
+      }
+      guard semaphore.wait(timeout: .now() + 65) == .success else {
+        throw HostHTTPError.timeout
+      }
+      let generated = try result?.get() ?? {
+        throw HostHTTPError.missingResponse
+      }()
+      return try JSONEncoder().encode(HostImageGenerationResponse(
+        path: generated.path,
+        mimeType: generated.mimeType
+      ))
+    }
+
+    private func performHostVisionCompletion(body: Data) throws -> Data {
+      let payload = try JSONDecoder().decode(HostVisionCompletionPayload.self, from: body)
+      let responseFormat = HostResponseFormat(rawValue: payload.responseFormat) ?? .text
+      let client = HostVisionCompletionClient(providerRouter: providerRouter, jsonLoader: jsonLoader)
+      let semaphore = DispatchSemaphore(value: 0)
+      var result: Result<HostVisionCompletionResponse, Error>?
+      Task {
+        do {
+          result = .success(try await client.complete(HostVisionCompletionRequest(
+            prompt: payload.prompt,
+            imagePaths: payload.imagePaths,
+            responseFormat: responseFormat,
+            maxTokens: payload.maxTokens ?? 800,
+            temperature: payload.temperature ?? 0.2,
+            jsonSchema: payload.jsonSchema ?? "{}"
+          )))
+        } catch {
+          result = .failure(error)
+        }
+        semaphore.signal()
+      }
+      guard semaphore.wait(timeout: .now() + 65) == .success else {
+        throw HostHTTPError.timeout
+      }
+      let completion = try result?.get() ?? {
+        throw HostHTTPError.missingResponse
+      }()
+      return Data(completion.text.utf8)
+    }
+
+    private static func prompt(for payload: HostLLMCompletionPayload) -> String {
+      var sections = [
+        "System:\n\(payload.systemPrompt)",
+        "User:\n\(payload.userPrompt)",
+      ]
+      if payload.responseFormat == "json_object" {
+        var jsonInstruction = "Return only a valid JSON object."
+        if let schema = payload.jsonSchema?.trimmingCharacters(in: .whitespacesAndNewlines), !schema.isEmpty {
+          jsonInstruction += "\nJSON schema:\n\(schema)"
+        }
+        sections.append(jsonInstruction)
+      }
+      return sections.joined(separator: "\n\n")
+    }
+
     private static func requiredString(_ value: AffectiveCoreEmbeddedString, label: String)
       throws -> String
     {
@@ -124,6 +363,24 @@ import Foundation
         return Data()
       }
       return Data(bytes: ptr, count: value.len)
+    }
+
+    private static func httpErrorDescription(
+      _ error: Error,
+      url: AffectiveCoreEmbeddedString,
+      body: AffectiveCoreEmbeddedString
+    ) -> String {
+      let endpoint = (try? requiredString(url, label: "url")).flatMap { value in
+        value.isEmpty ? nil : value
+      } ?? "unknown endpoint"
+      let bodyBytes = body.len
+      let message: String
+      if let error = error as? CustomStringConvertible {
+        message = error.description
+      } else {
+        message = error.localizedDescription
+      }
+      return "host HTTP POST JSON failed for \(endpoint) (\(bodyBytes) request bytes): \(message)"
     }
 
     static func copy(
@@ -203,9 +460,6 @@ import Foundation
     let conversationReasoningEffort: [UInt8]
     let imageGenerationModel: [UInt8]
     let imageGenerationOutputDir: [UInt8]
-    let openAIAPIKey: [UInt8]
-    let anthropicAPIKey: [UInt8]
-    let googleAPIKey: [UInt8]
     let memoryPath: [UInt8]
     let graphPath: [UInt8]
     let schedulePath: [UInt8]
@@ -216,30 +470,38 @@ import Foundation
 
     init(
       brain: BrainDescriptor,
-      providerCredentials explicitProviderCredentials: [ProviderCredentialKey: String]? = nil
+      providerCredentials explicitProviderCredentials: [ProviderCredentialKey: String]? = nil,
+      appleFoundationModelsStatus: AppleFoundationModelsAvailability = AppleFoundationModelsTextClient.currentAvailability(),
+      textProviderPreference: HostTextProviderPreference? = nil
     ) {
       let providerCredentials = explicitProviderCredentials ?? Self.providerCredentials()
+      let resolvedTextProviderPreference = textProviderPreference ?? Self.textProviderPreference(brain: brain)
       brainID = Array(brain.id.utf8)
       brainRoot = Array(brain.rootURL.path.utf8)
-      conversationModels = Array(Self.conversationModels(for: providerCredentials).utf8)
+      conversationModels = Array(Self.conversationModels(
+        for: providerCredentials,
+        appleFoundationModelsStatus: appleFoundationModelsStatus,
+        textProviderPreference: resolvedTextProviderPreference
+      ).utf8)
       conversationReasoningEffort = Array("auto".utf8)
       imageGenerationModel = Array("gemini-3.1-flash-image".utf8)
       imageGenerationOutputDir = Array(
         brain.rootURL.appendingPathComponent("generated/images", isDirectory: true).path.utf8)
-      openAIAPIKey = Array((providerCredentials[.openAI] ?? "").utf8)
-      anthropicAPIKey = Array((providerCredentials[.anthropic] ?? "").utf8)
-      googleAPIKey = Array((providerCredentials[.google] ?? "").utf8)
       memoryPath = Array(brain.memoryDatabaseURL.path.utf8)
       graphPath = Array(brain.graphDatabaseURL.path.utf8)
       schedulePath = Array(brain.scheduleURL.path.utf8)
       eventsPath = Array(brain.eventsURL.path.utf8)
       maintenanceStatePath = Array(brain.maintenanceStateURL.path.utf8)
       faceEmbeddingsDir = Array(brain.faceEmbeddingsURL.path.utf8)
-      hostManifestJSON = Array(Self.hostManifestJSON(
-        hasProvider: !providerCredentials.isEmpty,
+      hostManifestJSON = Array(EmbeddedHostCapabilityManifest.current(
+        providerCredentials: providerCredentials,
+        appleFoundationModelsStatus: appleFoundationModelsStatus,
+        textProviderPreference: resolvedTextProviderPreference,
         cameraStatus: Self.currentCameraCapabilityStatus(),
-        orientationStatus: Self.currentOrientationCapabilityStatus()
-      ).utf8)
+        orientationStatus: Self.currentOrientationCapabilityStatus(),
+        motionGestureStatus: Self.currentMotionGestureCapabilityStatus(brain: brain),
+        biometricPolicy: BiometricDataPolicy.load(for: brain)
+      ).jsonString().utf8)
     }
 
     func withConfig<Result>(_ body: (AffectiveCoreEmbeddedConfig) -> Result) -> Result {
@@ -249,41 +511,32 @@ import Foundation
             conversationReasoningEffort.withUnsafeBufferPointer { conversationReasoningEffort in
               imageGenerationModel.withUnsafeBufferPointer { imageGenerationModel in
                 imageGenerationOutputDir.withUnsafeBufferPointer { imageGenerationOutputDir in
-                  openAIAPIKey.withUnsafeBufferPointer { openAIAPIKey in
-                    anthropicAPIKey.withUnsafeBufferPointer { anthropicAPIKey in
-                      googleAPIKey.withUnsafeBufferPointer { googleAPIKey in
-                        memoryPath.withUnsafeBufferPointer { memoryPath in
-                          graphPath.withUnsafeBufferPointer { graphPath in
-                            schedulePath.withUnsafeBufferPointer { schedulePath in
-                              eventsPath.withUnsafeBufferPointer { eventsPath in
-                                maintenanceStatePath.withUnsafeBufferPointer {
-                                  maintenanceStatePath in
-                                  faceEmbeddingsDir.withUnsafeBufferPointer { faceEmbeddingsDir in
-                                    hostManifestJSON.withUnsafeBufferPointer { hostManifestJSON in
-                                      body(
-                                        AffectiveCoreEmbeddedConfig(
-                                          brain_id: Self.string(brainID),
-                                          brain_root: Self.string(brainRoot),
-                                          conversation_models: Self.string(conversationModels),
-                                          conversation_reasoning_effort: Self.string(
-                                            conversationReasoningEffort),
-                                          image_generation_model: Self.string(imageGenerationModel),
-                                          image_generation_output_dir: Self.string(
-                                            imageGenerationOutputDir),
-                                          openai_api_key: Self.string(openAIAPIKey),
-                                          anthropic_api_key: Self.string(anthropicAPIKey),
-                                          google_api_key: Self.string(googleAPIKey),
-                                          memory_path: Self.string(memoryPath),
-                                          graph_path: Self.string(graphPath),
-                                          schedule_path: Self.string(schedulePath),
-                                          events_path: Self.string(eventsPath),
-                                          maintenance_state_path: Self.string(maintenanceStatePath),
-                                          face_embeddings_dir: Self.string(faceEmbeddingsDir),
-                                          host_manifest_json: Self.string(hostManifestJSON)
-                                        ))
-                                    }
-                                  }
-                                }
+                  memoryPath.withUnsafeBufferPointer { memoryPath in
+                    graphPath.withUnsafeBufferPointer { graphPath in
+                      schedulePath.withUnsafeBufferPointer { schedulePath in
+                        eventsPath.withUnsafeBufferPointer { eventsPath in
+                          maintenanceStatePath.withUnsafeBufferPointer {
+                            maintenanceStatePath in
+                            faceEmbeddingsDir.withUnsafeBufferPointer { faceEmbeddingsDir in
+                              hostManifestJSON.withUnsafeBufferPointer { hostManifestJSON in
+                                body(
+                                  AffectiveCoreEmbeddedConfig(
+                                    brain_id: Self.string(brainID),
+                                    brain_root: Self.string(brainRoot),
+                                    conversation_models: Self.string(conversationModels),
+                                    conversation_reasoning_effort: Self.string(
+                                      conversationReasoningEffort),
+                                    image_generation_model: Self.string(imageGenerationModel),
+                                    image_generation_output_dir: Self.string(
+                                      imageGenerationOutputDir),
+                                    memory_path: Self.string(memoryPath),
+                                    graph_path: Self.string(graphPath),
+                                    schedule_path: Self.string(schedulePath),
+                                    events_path: Self.string(eventsPath),
+                                    maintenance_state_path: Self.string(maintenanceStatePath),
+                                    face_embeddings_dir: Self.string(faceEmbeddingsDir),
+                                    host_manifest_json: Self.string(hostManifestJSON)
+                                  ))
                               }
                             }
                           }
@@ -316,65 +569,68 @@ import Foundation
       }
     }
 
-    static func conversationModels(for credentials: [ProviderCredentialKey: String])
+    static func conversationModels(
+      for credentials: [ProviderCredentialKey: String],
+      appleFoundationModelsStatus: AppleFoundationModelsAvailability = .unsupportedPlatform,
+      textProviderPreference: HostTextProviderPreference = .random
+    )
       -> String
     {
       var models: [String] = []
-      if credentials[.openAI] != nil {
+      let shouldIncludeLocal = appleFoundationModelsStatus.isAvailable
+        && (textProviderPreference == .random || textProviderPreference == .local)
+      if shouldIncludeLocal {
         models.append("openai:gpt-4.1-nano")
       }
-      if credentials[.anthropic] != nil {
+      if credentials[.openAI] != nil
+          && (textProviderPreference == .random || textProviderPreference == .openAI)
+          && !models.contains("openai:gpt-4.1-nano") {
+        models.append("openai:gpt-4.1-nano")
+      }
+      if credentials[.anthropic] != nil
+          && (textProviderPreference == .random || textProviderPreference == .anthropic) {
         models.append("anthropic:claude-haiku-4-5-20251001")
       }
-      if credentials[.google] != nil {
+      if credentials[.google] != nil
+          && (textProviderPreference == .random || textProviderPreference == .google) {
         models.append("google:gemini-3.1-flash-lite")
       }
       return models.joined(separator: ",")
     }
 
-    static func hostManifestJSON(
-      hasProvider: Bool,
-      cameraStatus: String = "prompt_required",
-      orientationStatus: String = "prompt_required"
-    ) -> String {
-      #if os(macOS)
-        let platform = "macos"
-      #elseif os(iOS)
-        let platform = "ios"
-      #else
-        let platform = "unknown"
-      #endif
-      var capabilities = EmbeddedProtocolContract.baseHostCapabilities.map(JSONValue.string)
-      if Self.shouldAdvertiseOrientationQuery(orientationStatus: orientationStatus) {
-        capabilities.append(.string("orientation_query"))
-        capabilities.append(.string("sense_observation"))
+    static func textProviderPreference(brain: BrainDescriptor?) -> HostTextProviderPreference {
+      guard let brain,
+            let data = try? Data(contentsOf: brain.runtimeOptionsURL),
+            !data.isEmpty,
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let rawValue = object[AffectiveViewModel.textProviderPreferenceOptionKey] as? String
+      else {
+        return .random
       }
-      if hasProvider {
-        capabilities.append(contentsOf: EmbeddedProtocolContract.providerHostCapabilities(excludingCamera: !Self.shouldAdvertiseLiveCamera(cameraStatus: cameraStatus)).map(JSONValue.string))
-      }
-      let manifest: JSONValue = .object([
-        "api_version": .number(Double(EmbeddedProtocolContract.apiVersion)),
-        "platform": .string(platform),
-        "storage_provider": .string("file_backed_migration"),
-        "capabilities": .array(capabilities),
-        "capability_status": .object([
-          "camera": .string(cameraStatus),
-          "orientation": .string(orientationStatus),
-        ]),
-        "feature_flags": .object([
-          "streaming_events": .bool(true),
-          "logical_store": .bool(false),
-        ]),
-        "max_envelope_bytes": .number(16 * 1024),
-        "max_event_count": .number(12),
-        "max_event_text_bytes": .number(768),
-        "raw_ref_ttl_seconds": .number(24 * 60 * 60),
-      ])
-      let data = (try? manifest.encodedData()) ?? Data("{}".utf8)
-      return String(data: data, encoding: .utf8) ?? "{}"
+      return HostTextProviderPreference(rawValue: rawValue) ?? .random
     }
 
-    static func shouldAdvertiseLiveCamera(cameraStatus: String) -> Bool {
+    static func hostManifestJSON(
+      hasProvider: Bool,
+      appleFoundationModelsStatus: AppleFoundationModelsAvailability = .unsupportedPlatform,
+      textProviderPreference: HostTextProviderPreference = .random,
+      cameraStatus: String = "prompt_required",
+      orientationStatus: String = "prompt_required",
+      motionGestureStatus: String = currentMotionGestureCapabilityStatus(),
+      biometricPolicy: BiometricDataPolicy = .disabledDefault
+    ) -> String {
+      EmbeddedHostCapabilityManifest(
+        configuredProviders: hasProvider ? Set(ProviderCredentialKey.allCases) : [],
+        appleFoundationModelsStatus: appleFoundationModelsStatus,
+        textProviderPreference: textProviderPreference,
+        cameraStatus: cameraStatus,
+        orientationStatus: orientationStatus,
+        motionGestureStatus: motionGestureStatus,
+        biometricPolicy: biometricPolicy
+      ).jsonString()
+    }
+
+    static func shouldAdvertiseCameraSense(cameraStatus: String) -> Bool {
       cameraStatus == "available" || cameraStatus == "prompt_required"
     }
 
@@ -413,61 +669,267 @@ import Foundation
         return HostOrientationPermissionStatus.unavailable.rawValue
       #endif
     }
+
+    static func currentMotionGestureCapabilityStatus(brain: BrainDescriptor? = nil) -> String {
+      guard motionGestureEnabled(brain: brain) else {
+        return "disabled"
+      }
+      #if os(iOS) && canImport(CoreMotion) && !targetEnvironment(simulator)
+        return "prompt_required"
+      #else
+        return "unavailable"
+      #endif
+    }
+
+    static func motionGestureEnabled(brain: BrainDescriptor?) -> Bool {
+      guard let brain,
+            let data = try? Data(contentsOf: brain.runtimeOptionsURL),
+            !data.isEmpty,
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let rawValue = object[AffectiveViewModel.motionGestureEnabledOptionKey] as? String
+      else {
+        return false
+      }
+      return rawValue == "on"
+    }
+  }
+
+  nonisolated struct EmbeddedHostCapabilityManifest {
+    let configuredProviders: Set<ProviderCredentialKey>
+    let appleFoundationModelsStatus: AppleFoundationModelsAvailability
+    let textProviderPreference: HostTextProviderPreference
+    let cameraStatus: String
+    let orientationStatus: String
+    let motionGestureStatus: String
+    let biometricPolicy: BiometricDataPolicy
+
+    init(
+      configuredProviders: Set<ProviderCredentialKey>,
+      appleFoundationModelsStatus: AppleFoundationModelsAvailability,
+      textProviderPreference: HostTextProviderPreference,
+      cameraStatus: String,
+      orientationStatus: String,
+      motionGestureStatus: String = "unavailable",
+      biometricPolicy: BiometricDataPolicy = .disabledDefault
+    ) {
+      self.configuredProviders = configuredProviders
+      self.appleFoundationModelsStatus = appleFoundationModelsStatus
+      self.textProviderPreference = textProviderPreference
+      self.cameraStatus = cameraStatus
+      self.orientationStatus = orientationStatus
+      self.motionGestureStatus = motionGestureStatus
+      self.biometricPolicy = biometricPolicy
+    }
+
+    static func current(
+      providerCredentials: [ProviderCredentialKey: String],
+      appleFoundationModelsStatus: AppleFoundationModelsAvailability,
+      textProviderPreference: HostTextProviderPreference,
+      cameraStatus: String,
+      orientationStatus: String,
+      motionGestureStatus: String = CoreConfigStorage.currentMotionGestureCapabilityStatus(),
+      biometricPolicy: BiometricDataPolicy = .disabledDefault
+    ) -> EmbeddedHostCapabilityManifest {
+      EmbeddedHostCapabilityManifest(
+        configuredProviders: Set(providerCredentials.keys),
+        appleFoundationModelsStatus: appleFoundationModelsStatus,
+        textProviderPreference: textProviderPreference,
+        cameraStatus: cameraStatus,
+        orientationStatus: orientationStatus,
+        motionGestureStatus: motionGestureStatus,
+        biometricPolicy: biometricPolicy
+      )
+    }
+
+    var hasTextRouting: Bool {
+      !selectedTextProviderNames.isEmpty
+    }
+
+    var hasNetworkProviderRouting: Bool {
+      !configuredProviders.isEmpty
+    }
+
+    var sortedConfiguredProviderNames: [String] {
+      var names = ProviderCredentialKey.allCases
+        .filter { configuredProviders.contains($0) }
+        .map(\.displayName)
+      if appleFoundationModelsStatus.isAvailable {
+        names.insert("Apple Foundation Models", at: 0)
+      }
+      return names
+    }
+
+    var selectedTextProviderNames: [String] {
+      switch textProviderPreference {
+      case .random:
+        return sortedConfiguredProviderNames
+      case .local:
+        return appleFoundationModelsStatus.isAvailable ? ["Apple Foundation Models"] : []
+      case .openAI, .anthropic, .google:
+        guard let provider = textProviderPreference.credentialProvider,
+              configuredProviders.contains(provider) else {
+          return []
+        }
+        return [provider.displayName]
+      }
+    }
+
+    var platform: String {
+      #if os(macOS)
+        return "macos"
+      #elseif os(iOS)
+        return "ios"
+      #else
+        return "unknown"
+      #endif
+    }
+
+    var capabilities: [String] {
+      let recognitionModelsAvailable = FaceRecognitionService.bundledModelsAvailable
+      var values = EmbeddedProtocolContract.baseHostCapabilities.filter { capability in
+        switch capability {
+        case "face_identification":
+          return biometricPolicy.canRecognize && recognitionModelsAvailable
+        case "face_enrollment":
+          return biometricPolicy.canEnroll && recognitionModelsAvailable
+        default:
+          return true
+        }
+      }
+      if hasNetworkProviderRouting {
+        values.append(contentsOf: EmbeddedProtocolContract.providerHostCapabilities)
+      }
+      return values.reduce(into: []) { uniqueValues, value in
+        if !uniqueValues.contains(value) {
+          uniqueValues.append(value)
+        }
+      }
+    }
+
+    var senseCatalog: [PullSenseDescriptor] {
+      [
+        PullSenseDescriptor(
+          senseID: "camera",
+          direction: .pull,
+          availability: cameraStatus == "available" ? "available" : cameraStatus,
+          permissionState: cameraStatus,
+          statusReason: "Host camera permission and hardware status."
+        ),
+        PullSenseDescriptor(
+          senseID: "orientation",
+          direction: .pull,
+          availability: orientationStatus == "available" ? "available" : orientationStatus,
+          permissionState: orientationStatus,
+          statusReason: "Host orientation permission and Core Motion status."
+        ),
+        PullSenseDescriptor(
+          senseID: "motion_gesture",
+          direction: .push,
+          availability: motionGestureStatus,
+          permissionState: motionGestureStatus,
+          statusReason: "Host accelerometer gesture monitor status."
+        ),
+      ]
+    }
+
+    func jsonString() -> String {
+      let recognitionModelsAvailable = FaceRecognitionService.bundledModelsAvailable
+      let identityRecognitionStatus = !biometricPolicy.canRecognize
+        ? "disabled_by_policy"
+        : (recognitionModelsAvailable ? "available" : "unavailable")
+      let facePictureUpdateStatus = !biometricPolicy.canEnroll
+        ? "disabled_by_policy"
+        : (recognitionModelsAvailable ? "available" : "unavailable")
+      let manifest: JSONValue = .object([
+        "platform": .string(platform),
+        "storage_provider": .string("file_backed_migration"),
+        "capabilities": .array(capabilities.map(JSONValue.string)),
+        "capability_status": .object([
+          "camera": .string(cameraStatus),
+          "orientation": .string(orientationStatus),
+          "motion_gesture": .string(motionGestureStatus),
+          "face_identification": .string(identityRecognitionStatus),
+          "face_enrollment": .string(facePictureUpdateStatus),
+          "provider_routing": .string(hasTextRouting ? "available" : "unavailable"),
+          "apple_foundation_models": .string(appleFoundationModelsStatus.rawValue),
+        ]),
+        "biometric_policy": .object([
+          "owner_managed": .bool(true),
+          "recognition_enabled": .bool(biometricPolicy.recognitionEnabled),
+          "policy_acknowledged": .bool(biometricPolicy.policyAcknowledged),
+          "enrollment_allowed": .bool(biometricPolicy.enrollmentAllowed),
+          "retention_period": .string(biometricPolicy.retentionPeriod),
+          "export_included": .bool(biometricPolicy.exportIncluded),
+          "auto_delete_unconfirmed": .bool(biometricPolicy.autoDeleteUnconfirmed),
+        ]),
+        "sense_catalog": .array(senseCatalog.map(\.jsonValue)),
+        "host_provider_routing": .object([
+          "owner": .string("host"),
+          "mode": .string(textProviderPreference.rawValue),
+          "configured_providers": .array(sortedConfiguredProviderNames.map(JSONValue.string)),
+        ]),
+        "feature_flags": .object([
+          "streaming_events": .bool(true),
+          "logical_store": .bool(false),
+        ]),
+        "max_envelope_bytes": .number(16 * 1024),
+        "max_event_count": .number(12),
+        "max_event_text_bytes": .number(768),
+        "raw_ref_ttl_seconds": .number(24 * 60 * 60),
+      ])
+      let data = (try? manifest.encodedData()) ?? Data("{}".utf8)
+      return String(data: data, encoding: .utf8) ?? "{}"
+    }
   }
 
   nonisolated enum EmbeddedProtocolContract {
-    static let apiVersion = 2
-
     static let baseHostCapabilities: [String] = [
-      "typed_text",
-      "poke_sequence",
-      "short_touch",
-      "long_touch",
-      "tool_call",
+      "text_input",
+      "speech_input",
       "speech_output",
+      "camera_capture",
+      "microphone_capture",
+      "orientation_read",
+      "motion_gesture_read",
+      "memory_read",
+      "memory_write",
+      "reminder_read",
+      "reminder_write",
+      "notification_schedule",
       "uploaded_media_read",
-      "stored_memory_read",
-      "stored_memory_write",
       "stored_image_read",
-      "identity_recognition",
+      "face_identification",
       "introspection",
       "time_lookup",
       "power_status",
       "storage_fullness",
       "database_stats",
-      "reminder_io",
-      "image_generation",
-      "face_picture_update",
+      "face_enrollment",
       "local_process_io",
-      "facial_expression_output",
+      "file_import",
+      "file_export",
     ]
 
     static let providerHostCapabilities: [String] = [
-      "visual_description",
-      "visual_comparison",
+      "provider_image_generation",
+      "provider_vision_completion",
+      "provider_text_completion",
     ]
-
-    static func providerHostCapabilities(excludingCamera: Bool) -> [String] {
-      excludingCamera ? providerHostCapabilities : ["live_camera"] + providerHostCapabilities
-    }
 
     static let wrapperDispatchEventTypes: [String] = [
-      "typed_text",
-      "short_touch",
-      "long_touch",
-      "poke_sequence",
-      "tool_call",
+      "experience",
       "sense_observation",
+      "sense_request",
+      "capability_manifest",
+      "capability_status",
+      "action_request",
+      "action_result",
+      "memory_request",
+      "memory_result",
+      "memory_mutation",
     ]
 
-    static let eventTypesRequiringHostCapability: [String] = [
-      "typed_text",
-      "short_touch",
-      "long_touch",
-      "poke_sequence",
-      "tool_call",
-      "sense_observation",
-    ]
+    static let eventTypesRequiringHostCapability: [String] = []
 
   }
 #endif

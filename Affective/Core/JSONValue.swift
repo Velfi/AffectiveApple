@@ -5,7 +5,7 @@
 
 import Foundation
 
-nonisolated enum JSONValue: Codable, Equatable {
+nonisolated enum JSONValue: Codable, Equatable, Sendable {
   case null
   case bool(Bool)
   case number(Double)
@@ -84,7 +84,7 @@ nonisolated struct PokePulse: Equatable {
 }
 
 nonisolated enum LanguageInputSource: String {
-  case typedText = "typed_text"
+  case typedText = "user_message"
 
   var eventType: String {
     rawValue

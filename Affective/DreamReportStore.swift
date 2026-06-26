@@ -109,144 +109,66 @@ nonisolated protocol DreamReportSummaryProviding {
 }
 
 nonisolated struct DreamReportProviderSummarizer: DreamReportSummaryProviding {
-    let credentialStore: KeychainCredentialStore
-    let session: URLSession
+    typealias CredentialProvider = HostProviderRouter.CredentialProvider
+    typealias ProviderPicker = HostProviderRouter.ProviderPicker
+    typealias TextRoutePicker = HostLLMCompletionClient.RoutePicker
+    typealias JSONLoader = HostLLMCompletionClient.JSONLoader
+
+    let completionClient: HostLLMCompletionClient
 
     init(
         credentialStore: KeychainCredentialStore = KeychainCredentialStore(),
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        credentialProvider: CredentialProvider? = nil,
+        providerPicker: @escaping ProviderPicker = { $0.randomElement() },
+        textProviderPreference: HostTextProviderPreference = .random,
+        textRoutePicker: @escaping TextRoutePicker = { $0.randomElement() },
+        jsonLoader: JSONLoader? = nil
     ) {
-        self.credentialStore = credentialStore
-        self.session = session
+        let resolvedCredentialProvider = credentialProvider ?? {
+            #if os(iOS) || os(macOS)
+            CoreConfigStorage.providerCredentials()
+            #else
+            var credentials: [ProviderCredentialKey: String] = [:]
+            for key in ProviderCredentialKey.allCases {
+                let value = try credentialStore.credential(for: key)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let value, !value.isEmpty {
+                    credentials[key] = value
+                }
+            }
+            return credentials
+            #endif
+        }
+        let providerRouter = HostProviderRouter(
+            credentialProvider: resolvedCredentialProvider,
+            providerPicker: providerPicker
+        )
+        self.completionClient = HostLLMCompletionClient(
+            providerRouter: providerRouter,
+            textProviderPreference: textProviderPreference,
+            routePicker: textRoutePicker,
+            session: session,
+            jsonLoader: jsonLoader
+        )
     }
 
     func summarize(_ draft: DreamReportDraft) async throws -> DreamReportSummaryResult {
-        let credentials = try providerCredentials()
-        if let credential = credentials[.openAI] {
-            return try await summarizeWithOpenAI(draft, credential: credential)
-        }
-        if let credential = credentials[.anthropic] {
-            return try await summarizeWithAnthropic(draft, credential: credential)
-        }
-        if let credential = credentials[.google] {
-            return try await summarizeWithGoogle(draft, credential: credential)
-        }
-        throw DreamReportSummaryError.missingProviderCredential
-    }
-
-    private func providerCredentials() throws -> [ProviderCredentialKey: String] {
-        var credentials: [ProviderCredentialKey: String] = [:]
-        for key in ProviderCredentialKey.allCases {
-            let value = try credentialStore.credential(for: key)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if let value, !value.isEmpty {
-                credentials[key] = value
-            }
-        }
-        return credentials
-    }
-
-    private func summarizeWithOpenAI(_ draft: DreamReportDraft, credential: String) async throws -> DreamReportSummaryResult {
-        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/responses")!)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 25
-        let body: [String: Any] = [
-            "model": "gpt-4.1-nano",
-            "input": summaryPrompt(for: draft),
-            "max_output_tokens": 120,
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let object = try await jsonObject(for: request)
-        if let text = object["output_text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return .init(text: cleanSummary(text), source: "openai")
-        }
-        if let output = object["output"] as? [[String: Any]] {
-            for item in output {
-                guard let content = item["content"] as? [[String: Any]] else { continue }
-                for part in content {
-                    if let text = part["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        return .init(text: cleanSummary(text), source: "openai")
-                    }
-                }
-            }
-        }
-        throw DreamReportSummaryError.invalidProviderResponse
-    }
-
-    private func summarizeWithAnthropic(_ draft: DreamReportDraft, credential: String) async throws -> DreamReportSummaryResult {
-        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
-        request.httpMethod = "POST"
-        request.setValue(credential, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 25
-        let body: [String: Any] = [
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 120,
-            "messages": [
-                ["role": "user", "content": summaryPrompt(for: draft)]
-            ],
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let object = try await jsonObject(for: request)
-        guard let content = object["content"] as? [[String: Any]] else {
-            throw DreamReportSummaryError.invalidProviderResponse
-        }
-        for part in content {
-            if let text = part["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return .init(text: cleanSummary(text), source: "anthropic")
-            }
-        }
-        throw DreamReportSummaryError.invalidProviderResponse
-    }
-
-    private func summarizeWithGoogle(_ draft: DreamReportDraft, credential: String) async throws -> DreamReportSummaryResult {
-        var components = URLComponents(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent")!
-        components.queryItems = [URLQueryItem(name: "key", value: credential)]
-        var request = URLRequest(url: components.url!)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 25
-        let body: [String: Any] = [
-            "contents": [
-                [
-                    "role": "user",
-                    "parts": [
-                        ["text": summaryPrompt(for: draft)]
-                    ],
-                ]
-            ]
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let object = try await jsonObject(for: request)
-        guard let candidates = object["candidates"] as? [[String: Any]] else {
-            throw DreamReportSummaryError.invalidProviderResponse
-        }
-        for candidate in candidates {
-            guard
-                let content = candidate["content"] as? [String: Any],
-                let parts = content["parts"] as? [[String: Any]]
-            else { continue }
-            for part in parts {
-                if let text = part["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return .init(text: cleanSummary(text), source: "google")
-                }
-            }
-        }
-        throw DreamReportSummaryError.invalidProviderResponse
-    }
-
-    private func jsonObject(for request: URLRequest) async throws -> [String: Any] {
-        let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse, 200..<300 ~= httpResponse.statusCode else {
+        do {
+            let completion = try await completionClient.complete(HostLLMCompletionRequest(
+                prompt: summaryPrompt(for: draft),
+                maxTokens: 120
+            ))
+            return DreamReportSummaryResult(text: completion.text, source: completion.source)
+        } catch HostLLMCompletionError.missingProviderCredential {
+            throw DreamReportSummaryError.missingProviderCredential
+        } catch HostLLMCompletionError.unavailableProvider {
+            throw DreamReportSummaryError.missingProviderCredential
+        } catch HostLLMCompletionError.providerRejected {
             throw DreamReportSummaryError.providerRejected
-        }
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        } catch HostLLMCompletionError.invalidProviderResponse {
             throw DreamReportSummaryError.invalidProviderResponse
         }
-        return object
     }
 
     private func summaryPrompt(for draft: DreamReportDraft) -> String {
@@ -261,11 +183,6 @@ nonisolated struct DreamReportProviderSummarizer: DreamReportSummaryProviding {
         Source trace count: \(draft.sourceTraceIDs.count)
         Image prompt: \(draft.imagePrompt ?? "unknown")
         """
-    }
-
-    private func cleanSummary(_ text: String) -> String {
-        text.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
     }
 }
 

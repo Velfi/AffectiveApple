@@ -16,6 +16,8 @@ final class AffectiveViewModel: ObservableObject {
     static let makeUpLostDreamTimeOptionKey = "make_up_lost_dream_time"
     static let speechVoiceOptionKey = "speech_voice"
     static let cameraDeviceIDOptionKey = "camera_device_id"
+    static let textProviderPreferenceOptionKey = "text_provider_preference"
+    static let motionGestureEnabledOptionKey = "motion_gesture_enabled"
     static let automaticCameraDeviceID = "automatic"
     static let recentStimulusLimit = 10
     static let recentStimulusRetentionSeconds: TimeInterval = 90
@@ -28,8 +30,8 @@ final class AffectiveViewModel: ObservableObject {
         "that", "their", "them", "then", "there", "these", "they", "this", "through",
         "what", "when", "where", "which", "with", "would", "your",
     ]
-    static let brainVoiceEnabledKey = "Affective.brainVoiceEnabled"
-    static let orientationPermissionStatusKey = "Affective.orientationPermissionStatus"
+    nonisolated static let brainVoiceEnabledKey = "Affective.brainVoiceEnabled"
+    nonisolated static let orientationPermissionStatusKey = "Affective.orientationPermissionStatus"
     static let credentialStore = KeychainCredentialStore()
     static let secretOptionKeys = Set(ProviderCredentialKey.allCases.map(\.rawValue))
     static let lastOpenedBrainIDKey = "Affective.lastOpenedBrainID"
@@ -88,17 +90,23 @@ final class AffectiveViewModel: ObservableObject {
     @Published var brainRecentMemoriesText = ""
     @Published var autonomyMode = "off"
     @Published var optionGroups: [RuntimeOptionGroup]
+    @Published var developerToolActions: [CoreToolAction] = []
     @Published var credentialTestResults: [ProviderCredentialKey: CredentialTestStatus] = [:]
     private var canWriteBrainStats = true
     private var didCheckDreamOnLoad = false
     var cameraPermissionRequestTask: Task<HostCameraPermissionStatus, Never>?
     var pendingCameraRequestID: String?
     var didLogCoalescedCameraRequest = false
+    var pendingOrientationRequestID: String?
     var cameraPhotoCaptureOverride: (() async throws -> Data)?
     var orientationObservationOverride: (() async throws -> OrientationObservation)?
     var hostCapabilityPendingSince: [String: Date] = [:]
+    var closedPullSenseRequestIDs: Set<String> = []
+    var terminalPullSenseRequestIDs: Set<String> = []
     var orientationPermissionStatusOverride: HostOrientationPermissionStatus?
+    var orientationCapabilityStatusOverride: HostOrientationPermissionStatus?
     var orientationPermissionContinuation: CheckedContinuation<HostOrientationPermissionStatus, Never>?
+    var motionGestureMonitor: MotionGestureMonitor?
     @Published var orientationPermissionPrompt: OrientationPermissionPrompt?
 
     init(brain: BrainDescriptor, brainCore: (any BrainCoreClient)? = nil) {
@@ -124,6 +132,7 @@ final class AffectiveViewModel: ObservableObject {
 
     deinit {
         boredomSenseTask?.cancel()
+        motionGestureMonitor?.stop()
     }
 
     var coreStatusText: String {
@@ -419,9 +428,10 @@ enum HostPipelineAction {
     case interrupt(userText: String, reason: String, interruptedAction: String?, canceledQueuedActionCount: Int)
     case typedText(text: String, stimulusContext: StimulusContext)
     case imageText(prompt: String, attachment: [String: JSONValue], stimulusContext: StimulusContext)
-    case coreTool(name: String, title: String, arguments: [String: JSONValue], mirrorToChat: Bool)
+    case coreTool(name: String, title: String, arguments: [String: JSONValue], mirrorToChat: Bool, requiresCamera: Bool = false)
     case coreTouch(name: String, title: String)
     case pokeSequence([PokePulse])
+    case pushedMotionGesture(MotionGestureObservation)
     case refreshBrainState
 }
 
@@ -483,7 +493,8 @@ nonisolated struct StimulusInventorySnapshot: Equatable {
 }
 
 nonisolated struct ConversationTurnRecord: Equatable {
-    let role: String
+    let speakerRole: String
+    let speakerName: String?
     let text: String
     let occurredAt: Date
     let source: String
@@ -492,7 +503,8 @@ nonisolated struct ConversationTurnRecord: Equatable {
 }
 
 nonisolated struct ConversationTurnSnapshot: Equatable {
-    let role: String
+    let speakerRole: String
+    let speakerName: String?
     let text: String
     let occurredAtUnixMS: Double
     let ageSeconds: Double
@@ -501,8 +513,9 @@ nonisolated struct ConversationTurnSnapshot: Equatable {
     let metadata: [String: String]
 
     var eventArguments: [String: JSONValue] {
-        [
-            "role": .string(role),
+        var arguments: [String: JSONValue] = [
+            "role": .string(speakerRole),
+            "speaker_role": .string(speakerRole),
             "text": .string(text),
             "occurred_at_unix_ms": .number(occurredAtUnixMS),
             "age_seconds": .number(ageSeconds),
@@ -510,6 +523,10 @@ nonisolated struct ConversationTurnSnapshot: Equatable {
             "salience": .number(salience),
             "metadata": .object(metadata.mapValues { .string($0) }),
         ]
+        if let speakerName {
+            arguments["speaker_name"] = .string(speakerName)
+        }
+        return arguments
     }
 }
 

@@ -110,7 +110,7 @@ struct OptionFieldModifier: ViewModifier {
             .background(AppTheme.editorBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(isDirty ? AppTheme.accent.opacity(0.72) : .white.opacity(0.07))
+                    .stroke(isDirty ? AppTheme.accent.opacity(0.72) : AppTheme.separator)
             )
     }
 }
@@ -127,7 +127,7 @@ struct CompactStatusPill: View {
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .background(AppTheme.panelBackground.opacity(0.82), in: Capsule())
-            .overlay(Capsule().stroke(.white.opacity(0.08)))
+            .overlay(Capsule().stroke(AppTheme.separator))
     }
 }
 
@@ -144,7 +144,7 @@ struct CompactIconStatusPill: View {
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .background(AppTheme.panelBackground.opacity(0.82), in: Capsule())
-            .overlay(Capsule().stroke(.white.opacity(0.08)))
+            .overlay(Capsule().stroke(AppTheme.separator))
     }
 }
 
@@ -198,7 +198,7 @@ struct SegmentedControl<Value: Hashable>: View {
         .background(AppTheme.panelBackground.opacity(0.72), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.07))
+                .stroke(AppTheme.separator)
         )
     }
 }
@@ -258,7 +258,7 @@ struct EmptyStateCard: View {
         .background(AppTheme.panelBackground.opacity(0.74), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.08))
+                .stroke(AppTheme.separator)
         )
     }
 }
@@ -298,8 +298,16 @@ extension View {
             .background(AppTheme.panelBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(.white.opacity(0.08))
+                    .stroke(AppTheme.separator)
             )
+    }
+
+    /// Expands the tappable area to at least `size`pt (Apple HIG recommends ≥44) without
+    /// enlarging the visible content. Apply as the outermost modifier of a Button's label so the
+    /// hit region — not just the icon — meets the minimum.
+    func hitTarget(_ size: CGFloat = 44) -> some View {
+        frame(minWidth: size, minHeight: size)
+            .contentShape(Rectangle())
     }
 }
 
@@ -338,44 +346,245 @@ extension LogKind {
 
     var badgeForeground: Color {
         switch self {
-        case .state: AppTheme.background
-        default: .black.opacity(0.86)
+        case .state: AppTheme.inverseText
+        default: AppTheme.textOnAccent
         }
     }
 
     var entryBackground: Color {
         switch self {
-        case .user, .sent: Color(red: 0.11, green: 0.22, blue: 0.17)
-        case .brain, .result: Color(red: 0.11, green: 0.15, blue: 0.23)
-        case .state: Color(red: 0.18, green: 0.17, blue: 0.13)
-        case .error: Color(red: 0.24, green: 0.10, blue: 0.10)
+        case .user, .sent: AppTheme.logUserBackground
+        case .brain, .result: AppTheme.logBrainBackground
+        case .state: AppTheme.logStateBackground
+        case .error: AppTheme.logErrorBackground
         }
     }
 }
 
 enum AppTheme {
-    static let background = Color(red: 0.058, green: 0.067, blue: 0.061)
-    static let sidebarBackground = Color(red: 0.090, green: 0.104, blue: 0.096)
+    private static let accentRedKey = "Affective.activeThemeColor.red"
+    private static let accentGreenKey = "Affective.activeThemeColor.green"
+    private static let accentBlueKey = "Affective.activeThemeColor.blue"
+    private static let defaultAccent = AdaptiveColorComponents(red: 0.070, green: 0.560, blue: 0.250)
+
+    static func applyTheme(for brain: BrainDescriptor) {
+        guard let favoriteColor = brain.favoriteThemeColor else {
+            clearBrainThemeColor()
+            return
+        }
+        UserDefaults.standard.set(favoriteColor.red, forKey: accentRedKey)
+        UserDefaults.standard.set(favoriteColor.green, forKey: accentGreenKey)
+        UserDefaults.standard.set(favoriteColor.blue, forKey: accentBlueKey)
+    }
+
+    static func clearBrainThemeColor() {
+        UserDefaults.standard.removeObject(forKey: accentRedKey)
+        UserDefaults.standard.removeObject(forKey: accentGreenKey)
+        UserDefaults.standard.removeObject(forKey: accentBlueKey)
+    }
+
+    static let background = Color(
+        light: .init(red: 0.965, green: 0.965, blue: 0.950),
+        dark: .init(red: 0.058, green: 0.067, blue: 0.061)
+    )
+    static let sidebarBackground = Color(
+        light: .init(red: 0.925, green: 0.935, blue: 0.910),
+        dark: .init(red: 0.090, green: 0.104, blue: 0.096)
+    )
     static let controlBackground = LinearGradient(
         colors: [
-            Color(red: 0.105, green: 0.126, blue: 0.115),
-            Color(red: 0.058, green: 0.067, blue: 0.061),
+            Color(
+                light: .init(red: 0.990, green: 0.990, blue: 0.975),
+                dark: .init(red: 0.105, green: 0.126, blue: 0.115)
+            ),
+            background,
         ],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )
-    static let panelBackground = Color(red: 0.145, green: 0.162, blue: 0.150)
-    static let activePanelBackground = Color(red: 0.12, green: 0.27, blue: 0.19)
-    static let editorBackground = Color(red: 0.078, green: 0.090, blue: 0.082)
-    static let composerBackground = Color(red: 0.102, green: 0.116, blue: 0.108)
-    static let messageIncoming = Color(red: 0.160, green: 0.176, blue: 0.166)
-    static let messageOutgoing = Color(red: 0.10, green: 0.38, blue: 0.22)
-    static let messageError = Color(red: 0.28, green: 0.12, blue: 0.12)
-    static let primaryText = Color(red: 0.95, green: 0.92, blue: 0.82)
-    static let secondaryText = Color(red: 0.72, green: 0.68, blue: 0.56)
-    static let accent = Color(red: 0.28, green: 0.82, blue: 0.42)
-    static let danger = Color(red: 0.92, green: 0.24, blue: 0.20)
+    static let panelBackground = Color(
+        light: .init(red: 1.000, green: 1.000, blue: 0.985),
+        dark: .init(red: 0.145, green: 0.162, blue: 0.150)
+    )
+    static var activePanelBackground: Color {
+        accentWash(lightOpacity: 0.18, darkOpacity: 0.30)
+    }
+    static let editorBackground = Color(
+        light: .init(red: 0.900, green: 0.915, blue: 0.885),
+        dark: .init(red: 0.078, green: 0.090, blue: 0.082)
+    )
+    static let composerBackground = Color(
+        light: .init(red: 0.985, green: 0.985, blue: 0.970),
+        dark: .init(red: 0.102, green: 0.116, blue: 0.108)
+    )
+    static let messageIncoming = Color(
+        light: .init(red: 0.920, green: 0.930, blue: 0.905),
+        dark: .init(red: 0.160, green: 0.176, blue: 0.166)
+    )
+    static var messageOutgoing: Color { accent }
+    static let messageError = Color(
+        light: .init(red: 1.000, green: 0.870, blue: 0.850),
+        dark: .init(red: 0.280, green: 0.120, blue: 0.120)
+    )
+    static var logUserBackground: Color {
+        accentWash(lightOpacity: 0.16, darkOpacity: 0.25)
+    }
+    static let logBrainBackground = Color(
+        light: .init(red: 0.890, green: 0.925, blue: 0.990),
+        dark: .init(red: 0.110, green: 0.150, blue: 0.230)
+    )
+    static let logStateBackground = Color(
+        light: .init(red: 0.955, green: 0.935, blue: 0.860),
+        dark: .init(red: 0.180, green: 0.170, blue: 0.130)
+    )
+    static let logErrorBackground = Color(
+        light: .init(red: 1.000, green: 0.885, blue: 0.875),
+        dark: .init(red: 0.240, green: 0.100, blue: 0.100)
+    )
+    static let primaryText = Color.primary
+    static let secondaryText = Color.secondary
+    static let inverseText = Color(
+        light: .init(red: 1.000, green: 1.000, blue: 1.000),
+        dark: .init(red: 0.058, green: 0.067, blue: 0.061)
+    )
+    static var textOnAccent: Color {
+        activeAccentComponents.perceivedLuminance > 0.58 ? .black.opacity(0.86) : .white
+    }
+    static var accent: Color {
+        Color(light: activeAccentComponents, dark: activeAccentComponents.darkAppearanceAccent)
+    }
+    static let danger = Color(
+        light: .init(red: 0.820, green: 0.145, blue: 0.120),
+        dark: .init(red: 0.920, green: 0.240, blue: 0.200)
+    )
+    static let separator = Color(
+        light: .init(red: 0.000, green: 0.000, blue: 0.000, opacity: 0.120),
+        dark: .init(red: 1.000, green: 1.000, blue: 1.000, opacity: 0.095)
+    )
+    static let softSeparator = Color(
+        light: .init(red: 0.000, green: 0.000, blue: 0.000, opacity: 0.070),
+        dark: .init(red: 1.000, green: 1.000, blue: 1.000, opacity: 0.060)
+    )
+    static let ambientShadow = Color(
+        light: .init(red: 0.000, green: 0.000, blue: 0.000, opacity: 0.100),
+        dark: .init(red: 0.000, green: 0.000, blue: 0.000, opacity: 0.260)
+    )
+
+    private static var activeAccentComponents: AdaptiveColorComponents {
+        let defaults = UserDefaults.standard
+        guard
+            defaults.object(forKey: accentRedKey) != nil,
+            defaults.object(forKey: accentGreenKey) != nil,
+            defaults.object(forKey: accentBlueKey) != nil
+        else {
+            return defaultAccent
+        }
+        return AdaptiveColorComponents(
+            red: CGFloat(defaults.double(forKey: accentRedKey)),
+            green: CGFloat(defaults.double(forKey: accentGreenKey)),
+            blue: CGFloat(defaults.double(forKey: accentBlueKey))
+        ).clamped
+    }
+
+    private static func accentWash(lightOpacity: CGFloat, darkOpacity: CGFloat) -> Color {
+        let accent = activeAccentComponents
+        return Color(
+            light: accent.mixed(with: .white, amount: 1 - lightOpacity),
+            dark: accent.darkAppearanceAccent.mixed(with: .black, amount: 1 - darkOpacity)
+        )
+    }
 }
+
+private struct AdaptiveColorComponents {
+    let red: CGFloat
+    let green: CGFloat
+    let blue: CGFloat
+    let opacity: CGFloat
+
+    init(red: CGFloat, green: CGFloat, blue: CGFloat, opacity: CGFloat = 1) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+        self.opacity = opacity
+    }
+
+    static let white = AdaptiveColorComponents(red: 1, green: 1, blue: 1)
+    static let black = AdaptiveColorComponents(red: 0, green: 0, blue: 0)
+
+    var clamped: AdaptiveColorComponents {
+        AdaptiveColorComponents(
+            red: min(max(red, 0), 1),
+            green: min(max(green, 0), 1),
+            blue: min(max(blue, 0), 1),
+            opacity: min(max(opacity, 0), 1)
+        )
+    }
+
+    var perceivedLuminance: CGFloat {
+        0.299 * red + 0.587 * green + 0.114 * blue
+    }
+
+    var darkAppearanceAccent: AdaptiveColorComponents {
+        perceivedLuminance < 0.42 ? mixed(with: .white, amount: 0.28) : self
+    }
+
+    func mixed(with other: AdaptiveColorComponents, amount: CGFloat) -> AdaptiveColorComponents {
+        let amount = min(max(amount, 0), 1)
+        let retainedAmount = 1 - amount
+        return AdaptiveColorComponents(
+            red: red * retainedAmount + other.red * amount,
+            green: green * retainedAmount + other.green * amount,
+            blue: blue * retainedAmount + other.blue * amount,
+            opacity: opacity
+        )
+    }
+}
+
+private extension Color {
+    init(light: AdaptiveColorComponents, dark: AdaptiveColorComponents) {
+        #if os(macOS)
+        self = Color(nsColor: NSColor(name: nil) { appearance in
+            let match = appearance.bestMatch(from: [.aqua, .darkAqua])
+            return NSColor(themeComponents: match == .darkAqua ? dark : light)
+        } ?? NSColor(themeComponents: light))
+        #elseif canImport(UIKit)
+        self = Color(uiColor: UIColor { traits in
+            UIColor(themeComponents: traits.userInterfaceStyle == .dark ? dark : light)
+        })
+        #else
+        self = Color(
+            red: Double(light.red),
+            green: Double(light.green),
+            blue: Double(light.blue),
+            opacity: Double(light.opacity)
+        )
+        #endif
+    }
+}
+
+#if os(macOS)
+private extension NSColor {
+    convenience init(themeComponents components: AdaptiveColorComponents) {
+        self.init(
+            srgbRed: components.red,
+            green: components.green,
+            blue: components.blue,
+            alpha: components.opacity
+        )
+    }
+}
+#elseif canImport(UIKit)
+private extension UIColor {
+    convenience init(themeComponents components: AdaptiveColorComponents) {
+        self.init(
+            red: components.red,
+            green: components.green,
+            blue: components.blue,
+            alpha: components.opacity
+        )
+    }
+}
+#endif
 
 struct BuildBadgeView: View {
     private let text = BuildBadge.text

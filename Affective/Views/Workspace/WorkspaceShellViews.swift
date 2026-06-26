@@ -26,12 +26,12 @@ struct WorkspaceSidebar: View {
             LogHeader(model: model)
 
             Divider()
-                .overlay(.white.opacity(0.05))
+                .overlay(AppTheme.softSeparator)
 
             SidebarBrainPanel(model: model)
 
             Divider()
-                .overlay(.white.opacity(0.05))
+                .overlay(AppTheme.softSeparator)
 
             VStack(spacing: 6) {
                 ForEach(WorkspaceSection.allCases) { section in
@@ -90,6 +90,7 @@ struct WorkspaceSidebarButton: View {
             )
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 
@@ -161,7 +162,7 @@ struct ChatWorkspace: View {
                 }
 
                 Divider()
-                    .overlay(.white.opacity(0.05))
+                    .overlay(AppTheme.softSeparator)
             }
 
             ChatTranscriptView(
@@ -169,9 +170,11 @@ struct ChatWorkspace: View {
                 brainRootURL: model.brain.rootURL,
                 isResponding: model.isAwaitingChatResponse
             )
+            .frame(maxHeight: .infinity)
+            .layoutPriority(1)
 
             Divider()
-                .overlay(.white.opacity(0.05))
+                .overlay(AppTheme.softSeparator)
 
             if horizontalSizeClass == .compact {
                 VStack(spacing: composerFocused.wrappedValue ? 6 : 8) {
@@ -214,7 +217,7 @@ struct ChatWorkspace: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             Divider()
-                .overlay(.white.opacity(0.05))
+                .overlay(AppTheme.softSeparator)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -239,27 +242,45 @@ struct DreamMailboxWorkspace: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     var body: some View {
-        if verticalSizeClass == .compact {
+        if horizontalSizeClass == .compact {
+            if verticalSizeClass == .compact {
+                HStack(spacing: 0) {
+                    mailboxList
+                        .frame(width: 310)
+                        .frame(maxHeight: .infinity)
+
+                    Divider()
+                        .overlay(AppTheme.softSeparator)
+
+                    mailboxDetail
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            } else {
+                GeometryReader { proxy in
+                    VStack(spacing: 0) {
+                        mailboxList
+                            .frame(maxHeight: compactMailboxListHeight(for: proxy.size.height))
+
+                        Divider()
+                            .overlay(AppTheme.softSeparator)
+
+                        mailboxDetail
+                            .frame(maxHeight: .infinity)
+                            .layoutPriority(1)
+                    }
+                }
+            }
+        } else if verticalSizeClass == .compact {
             HStack(spacing: 0) {
                 mailboxList
                     .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
 
                 Divider()
-                    .overlay(.white.opacity(0.05))
+                    .overlay(AppTheme.softSeparator)
 
                 mailboxDetail
                     .frame(width: 360)
                     .background(AppTheme.sidebarBackground.opacity(0.52))
-            }
-        } else if horizontalSizeClass == .compact {
-            VStack(spacing: 0) {
-                mailboxList
-                    .frame(maxHeight: 300)
-
-                Divider()
-                    .overlay(.white.opacity(0.05))
-
-                mailboxDetail
             }
         } else {
             HStack(spacing: 0) {
@@ -267,12 +288,16 @@ struct DreamMailboxWorkspace: View {
                     .frame(width: 390)
 
                 Divider()
-                    .overlay(.white.opacity(0.05))
+                    .overlay(AppTheme.softSeparator)
 
                 mailboxDetail
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+    }
+
+    func compactMailboxListHeight(for availableHeight: CGFloat) -> CGFloat {
+        min(300, max(220, availableHeight * 0.38))
     }
 
     var mailboxList: some View {
@@ -301,7 +326,7 @@ struct DreamMailboxWorkspace: View {
             .padding(.bottom, 14)
 
             Divider()
-                .overlay(.white.opacity(0.05))
+                .overlay(AppTheme.softSeparator)
 
             ScrollView {
                 LazyVStack(spacing: 10) {
@@ -389,7 +414,7 @@ struct DreamReportRow: View {
                         if !report.isRead {
                             Text("UNREAD")
                                 .font(.system(size: 9, weight: .bold, design: .rounded))
-                                .foregroundStyle(.black.opacity(0.86))
+                                .foregroundStyle(AppTheme.textOnAccent)
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 3)
                                 .background(AppTheme.accent, in: Capsule())
@@ -526,7 +551,7 @@ struct DreamReportChip: View {
             .padding(.horizontal, 7)
             .padding(.vertical, 4)
             .background(AppTheme.editorBackground, in: Capsule())
-            .overlay(Capsule().stroke(.white.opacity(0.08)))
+            .overlay(Capsule().stroke(AppTheme.separator))
     }
 }
 
@@ -550,7 +575,7 @@ struct DreamReportSection: View {
         .background(AppTheme.panelBackground.opacity(0.78), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.08))
+                .stroke(AppTheme.separator)
         )
     }
 }
@@ -587,7 +612,7 @@ struct DreamReportImage: View {
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.10))
+                .stroke(AppTheme.separator)
         )
         .accessibilityLabel("Dream image")
     }
@@ -758,12 +783,25 @@ struct DeveloperWorkspace: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     var body: some View {
-        if verticalSizeClass == .compact {
+        if horizontalSizeClass == .compact {
+            GeometryReader { proxy in
+                VStack(spacing: 0) {
+                    compactDeveloperMain(horizontalPadding: 14, topPadding: 14)
+                        .frame(maxHeight: .infinity)
+                        .layoutPriority(1)
+
+                    Divider()
+                        .overlay(AppTheme.softSeparator)
+
+                    compactDeveloperTools(maxHeight: compactToolsHeight(for: proxy.size.height))
+                }
+            }
+        } else if verticalSizeClass == .compact {
             HStack(spacing: 0) {
                 compactDeveloperMain(horizontalPadding: 16, topPadding: 12)
 
                 Divider()
-                    .overlay(.white.opacity(0.05))
+                    .overlay(AppTheme.softSeparator)
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
@@ -777,33 +815,12 @@ struct DeveloperWorkspace: View {
                 .frame(width: 300)
                 .background(AppTheme.sidebarBackground.opacity(0.6))
             }
-        } else if horizontalSizeClass == .compact {
-            VStack(spacing: 0) {
-                compactDeveloperMain(horizontalPadding: 14, topPadding: 14)
-
-                Divider()
-                    .overlay(.white.opacity(0.05))
-
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(alignment: .top, spacing: 12) {
-                        HeaderStrip(model: model)
-                            .frame(width: 260)
-                            .panelStyle()
-                        LiveCorePanel(model: model)
-                            .frame(width: 280)
-                        ReminderToolsPanel(model: model)
-                            .frame(width: 280)
-                    }
-                    .padding(14)
-                }
-                .background(AppTheme.sidebarBackground.opacity(0.6))
-            }
         } else {
             HStack(spacing: 0) {
                 developerMain(horizontalPadding: 32, topPadding: 28)
 
                 Divider()
-                    .overlay(.white.opacity(0.05))
+                    .overlay(AppTheme.softSeparator)
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
@@ -817,6 +834,37 @@ struct DeveloperWorkspace: View {
                 .background(AppTheme.sidebarBackground.opacity(0.6))
             }
         }
+    }
+
+    func compactToolsHeight(for availableHeight: CGFloat) -> CGFloat {
+        min(240, max(168, availableHeight * 0.26))
+    }
+
+    func compactDeveloperTools(maxHeight: CGFloat) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: 12) {
+                compactToolPanel(maxHeight: maxHeight) {
+                    LiveCorePanel(model: model)
+                }
+                compactToolPanel(maxHeight: maxHeight) {
+                    ReminderToolsPanel(model: model)
+                }
+            }
+            .padding(14)
+        }
+        .frame(height: maxHeight)
+        .background(AppTheme.sidebarBackground.opacity(0.6))
+    }
+
+    func compactToolPanel<Content: View>(
+        maxHeight: CGFloat,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            content()
+                .frame(width: 340)
+        }
+        .frame(width: 340, height: max(maxHeight - 28, 1), alignment: .top)
     }
 
     func compactDeveloperMain(horizontalPadding: CGFloat, topPadding: CGFloat) -> some View {
@@ -843,7 +891,7 @@ struct DeveloperWorkspace: View {
             .padding(.bottom, 12)
 
             Divider()
-                .overlay(.white.opacity(0.05))
+                .overlay(AppTheme.softSeparator)
 
             DeveloperConsoleList(
                 entries: model.filteredCommandEntries,
@@ -868,7 +916,7 @@ struct DeveloperWorkspace: View {
                 .padding(.bottom, 16)
 
             Divider()
-                .overlay(.white.opacity(0.05))
+                .overlay(AppTheme.softSeparator)
 
             EntriesList(
                 entries: model.filteredCommandEntries,
@@ -886,12 +934,25 @@ struct KnowledgeWorkspace: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     var body: some View {
-        if verticalSizeClass == .compact {
+        if horizontalSizeClass == .compact {
+            GeometryReader { proxy in
+                VStack(spacing: 0) {
+                    compactKnowledgeMain(horizontalPadding: 14, topPadding: 14)
+                        .frame(maxHeight: .infinity)
+                        .layoutPriority(1)
+
+                    Divider()
+                        .overlay(AppTheme.softSeparator)
+
+                    compactKnowledgeTools(maxHeight: compactToolsHeight(for: proxy.size.height))
+                }
+            }
+        } else if verticalSizeClass == .compact {
             HStack(spacing: 0) {
                 compactKnowledgeMain(horizontalPadding: 16, topPadding: 12)
 
                 Divider()
-                    .overlay(.white.opacity(0.05))
+                    .overlay(AppTheme.softSeparator)
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
@@ -903,30 +964,12 @@ struct KnowledgeWorkspace: View {
                 .frame(width: 300)
                 .background(AppTheme.sidebarBackground.opacity(0.6))
             }
-        } else if horizontalSizeClass == .compact {
-            VStack(spacing: 0) {
-                compactKnowledgeMain(horizontalPadding: 14, topPadding: 14)
-
-                Divider()
-                    .overlay(.white.opacity(0.05))
-
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(alignment: .top, spacing: 12) {
-                        MemoryToolsPanel(model: model)
-                            .frame(width: 290)
-                        ReminderToolsPanel(model: model)
-                            .frame(width: 280)
-                    }
-                    .padding(14)
-                }
-                .background(AppTheme.sidebarBackground.opacity(0.6))
-            }
         } else {
             HStack(spacing: 0) {
                 knowledgeMain(horizontalPadding: 32, topPadding: 28)
 
                 Divider()
-                    .overlay(.white.opacity(0.05))
+                    .overlay(AppTheme.softSeparator)
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
@@ -939,6 +982,38 @@ struct KnowledgeWorkspace: View {
                 .background(AppTheme.sidebarBackground.opacity(0.6))
             }
         }
+    }
+
+    func compactToolsHeight(for availableHeight: CGFloat) -> CGFloat {
+        min(240, max(168, availableHeight * 0.26))
+    }
+
+    func compactKnowledgeTools(maxHeight: CGFloat) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: 12) {
+                compactToolPanel(maxHeight: maxHeight) {
+                    MemoryToolsPanel(model: model)
+                }
+                compactToolPanel(maxHeight: maxHeight) {
+                    ReminderToolsPanel(model: model)
+                }
+            }
+            .padding(14)
+        }
+        .frame(height: maxHeight)
+        .background(AppTheme.sidebarBackground.opacity(0.6))
+    }
+
+    func compactToolPanel<Content: View>(
+        maxHeight: CGFloat,
+        width: CGFloat = 340,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            content()
+                .frame(width: width)
+        }
+        .frame(width: width, height: max(maxHeight - 28, 1), alignment: .top)
     }
 
     func compactKnowledgeMain(horizontalPadding: CGFloat, topPadding: CGFloat) -> some View {
@@ -965,7 +1040,7 @@ struct KnowledgeWorkspace: View {
             .padding(.bottom, 12)
 
             Divider()
-                .overlay(.white.opacity(0.05))
+                .overlay(AppTheme.softSeparator)
 
             CompactActivityList(
                 entries: model.filteredKnowledgeEntries,
@@ -991,7 +1066,7 @@ struct KnowledgeWorkspace: View {
                 .padding(.bottom, 16)
 
             Divider()
-                .overlay(.white.opacity(0.05))
+                .overlay(AppTheme.softSeparator)
 
             EntriesList(
                 entries: model.filteredKnowledgeEntries,
@@ -1008,12 +1083,25 @@ struct BrainStatsWorkspace: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     var body: some View {
-        if verticalSizeClass == .compact {
+        if horizontalSizeClass == .compact {
+            GeometryReader { proxy in
+                VStack(spacing: 0) {
+                    statsMain(horizontalPadding: 14, topPadding: 14, isCompact: true)
+                        .frame(maxHeight: .infinity)
+                        .layoutPriority(1)
+
+                    Divider()
+                        .overlay(AppTheme.softSeparator)
+
+                    compactStatsTools(maxHeight: compactToolsHeight(for: proxy.size.height))
+                }
+            }
+        } else if verticalSizeClass == .compact {
             HStack(spacing: 0) {
                 statsMain(horizontalPadding: 16, topPadding: 12, isCompact: true)
 
                 Divider()
-                    .overlay(.white.opacity(0.05))
+                    .overlay(AppTheme.softSeparator)
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
@@ -1025,30 +1113,12 @@ struct BrainStatsWorkspace: View {
                 .frame(width: 320)
                 .background(AppTheme.sidebarBackground.opacity(0.6))
             }
-        } else if horizontalSizeClass == .compact {
-            VStack(spacing: 0) {
-                statsMain(horizontalPadding: 14, topPadding: 14, isCompact: true)
-
-                Divider()
-                    .overlay(.white.opacity(0.05))
-
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(alignment: .top, spacing: 12) {
-                        BrainNoteComposer(model: model)
-                            .frame(width: 290)
-                        BrainProfileSnapshotComposer(model: model)
-                            .frame(width: 320)
-                    }
-                    .padding(14)
-                }
-                .background(AppTheme.sidebarBackground.opacity(0.6))
-            }
         } else {
             HStack(spacing: 0) {
                 statsMain(horizontalPadding: 32, topPadding: 28, isCompact: false)
 
                 Divider()
-                    .overlay(.white.opacity(0.05))
+                    .overlay(AppTheme.softSeparator)
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
@@ -1061,6 +1131,38 @@ struct BrainStatsWorkspace: View {
                 .background(AppTheme.sidebarBackground.opacity(0.6))
             }
         }
+    }
+
+    func compactToolsHeight(for availableHeight: CGFloat) -> CGFloat {
+        min(240, max(168, availableHeight * 0.26))
+    }
+
+    func compactStatsTools(maxHeight: CGFloat) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: 12) {
+                compactToolPanel(maxHeight: maxHeight, width: 290) {
+                    BrainNoteComposer(model: model)
+                }
+                compactToolPanel(maxHeight: maxHeight, width: 320) {
+                    BrainProfileSnapshotComposer(model: model)
+                }
+            }
+            .padding(14)
+        }
+        .frame(height: maxHeight)
+        .background(AppTheme.sidebarBackground.opacity(0.6))
+    }
+
+    func compactToolPanel<Content: View>(
+        maxHeight: CGFloat,
+        width: CGFloat,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            content()
+                .frame(width: width)
+        }
+        .frame(width: width, height: max(maxHeight - 28, 1), alignment: .top)
     }
 
     func statsMain(horizontalPadding: CGFloat, topPadding: CGFloat, isCompact: Bool) -> some View {
@@ -1096,7 +1198,7 @@ struct BrainStatsWorkspace: View {
             }
 
             Divider()
-                .overlay(.white.opacity(0.05))
+                .overlay(AppTheme.softSeparator)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
@@ -1179,7 +1281,7 @@ struct BrainSizeMetricCard: View {
         .background(AppTheme.editorBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.08))
+                .stroke(AppTheme.separator)
         )
     }
 }
@@ -1431,13 +1533,23 @@ struct ResizableChatAvatar: View {
             BrainAvatar(brain: brain, size: displaySize)
 
             resizeHandle
-                .opacity(isHovering || isDragging ? 1 : 0)
-                .animation(.smooth(duration: 0.16), value: isHovering || isDragging)
+                .opacity(handleVisible ? 1 : 0)
+                .animation(.smooth(duration: 0.16), value: handleVisible)
         }
         .frame(width: avatarWidth, height: displaySize, alignment: .topTrailing)
         .onHover { isHovering = $0 }
         .onAppear(perform: loadSavedSize)
         .onChange(of: brain.id) { _, _ in loadSavedSize() }
+    }
+
+    /// On macOS the handle reveals on hover; touch devices have no hover, so it stays visible
+    /// — otherwise the grip is undiscoverable until a drag that can't be started.
+    var handleVisible: Bool {
+        #if os(macOS)
+        isHovering || isDragging
+        #else
+        true
+        #endif
     }
 
     var displaySize: CGFloat {

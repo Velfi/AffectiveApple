@@ -5,17 +5,27 @@
 
 import Foundation
 import Combine
+import SQLite3
 
 final class BrainLibrary: ObservableObject {
-    static let persistentRootURL: URL = {
+    #if DEBUG
+    static var storageRootURLOverride: URL?
+    #endif
+
+    static var persistentRootURL: URL {
+        #if DEBUG
+        if let storageRootURLOverride {
+            return storageRootURLOverride
+        }
+        #endif
         let fileManager = FileManager.default
         let applicationSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? fileManager.temporaryDirectory
         return applicationSupport.appendingPathComponent("AffectiveCore", isDirectory: true)
-    }()
+    }
 
-    static let brainsRootURL = persistentRootURL.appendingPathComponent("brains", isDirectory: true)
-    static let profilesRootURL = persistentRootURL.appendingPathComponent("profiles", isDirectory: true)
+    static var brainsRootURL: URL { persistentRootURL.appendingPathComponent("brains", isDirectory: true) }
+    static var profilesRootURL: URL { persistentRootURL.appendingPathComponent("profiles", isDirectory: true) }
 
     private static let recentBrainIDsKey = "Affective.recentBrainIDs"
 
@@ -156,10 +166,14 @@ final class BrainLibrary: ObservableObject {
             throw CocoaError(.fileReadUnknown)
         }
         markOpened(imported)
+        if Self.exportManifestContainsBiometricData(in: imported.rootURL) {
+            statusText = "Imported \(imported.displayName). This export contains biometric data; review Biometric Privacy before using recognition."
+        }
         return imported
     }
 
     func exportBrainZip(_ brain: BrainDescriptor, to destinationURL: URL) throws -> URL {
+        let policy = BiometricDataPolicy.load(for: brain)
         let destination = destinationURL.pathExtension.localizedCaseInsensitiveCompare("zip") == .orderedSame
             ? destinationURL
             : destinationURL.appendingPathExtension("zip")
@@ -171,7 +185,8 @@ final class BrainLibrary: ObservableObject {
             for: brain,
             schemaVersion: 1,
             deviceID: "export",
-            revision: 1
+            revision: 1,
+            includeBiometricData: policy.shouldIncludeInExport
         )
         defer { try? fileManager.removeItem(at: checkpoint.archiveURL.deletingLastPathComponent()) }
         try fileManager.copyItem(at: checkpoint.archiveURL, to: destination)
@@ -180,14 +195,50 @@ final class BrainLibrary: ObservableObject {
     }
 
     func exportBrainFolder(_ brain: BrainDescriptor, to destinationDirectory: URL) throws -> URL {
+        let policy = BiometricDataPolicy.load(for: brain)
         let exportName = "\(brain.id).affectivebrain"
         let destination = destinationDirectory.appendingPathComponent(exportName, isDirectory: true)
         if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.removeItem(at: destination)
         }
-        try FileManager.default.copyItem(at: brain.rootURL, to: destination)
+        try Self.copyBrain(
+            from: brain.rootURL,
+            to: destination,
+            includeBiometricData: policy.shouldIncludeInExport,
+            fileManager: .default
+        )
         statusText = "Exported \(brain.displayName)."
         return destination
+    }
+
+    func deleteBiometricData(for brain: BrainDescriptor) throws {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: brain.faceEmbeddingsURL.path) {
+            try fileManager.removeItem(at: brain.faceEmbeddingsURL)
+        }
+        try fileManager.createDirectory(at: brain.faceEmbeddingsURL, withIntermediateDirectories: true)
+        try BiometricCognitiveMemoryScrubber.scrubInPlace(at: brain.memoryDatabaseURL, fileManager: fileManager)
+        if fileManager.fileExists(atPath: brain.biometricMetadataURL.path) {
+            try fileManager.removeItem(at: brain.biometricMetadataURL)
+        }
+        let receiptsURL = brain.rootURL
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("biometric_policy_receipts", isDirectory: true)
+        if fileManager.fileExists(atPath: receiptsURL.path) {
+            try fileManager.removeItem(at: receiptsURL)
+        }
+        statusText = "Deleted biometric data for \(brain.displayName)."
+    }
+
+    func disableRecognitionAndDeleteBiometricData(for brain: BrainDescriptor) throws {
+        try deleteBiometricData(for: brain)
+        var runtimeOptions = (try? AffectiveViewModel.loadRuntimeOptionsObject(brain: brain)) ?? [:]
+        runtimeOptions[BiometricPolicyKeys.recognitionEnabled] = false
+        runtimeOptions[BiometricPolicyKeys.enrollmentAllowed] = false
+        runtimeOptions[BiometricPolicyKeys.exportIncluded] = false
+        let data = try JSONSerialization.data(withJSONObject: runtimeOptions, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: brain.runtimeOptionsURL, options: .atomic)
+        statusText = "Disabled recognition and deleted biometric data for \(brain.displayName)."
     }
 
     func setAvatar(for brain: BrainDescriptor, from sourceURL: URL) throws -> BrainDescriptor {
@@ -257,6 +308,7 @@ final class BrainLibrary: ObservableObject {
     }
 
     func deleteBrain(_ brain: BrainDescriptor) throws {
+        try deleteBiometricData(for: brain)
         try FileManager.default.removeItem(at: brain.rootURL)
         Self.removeRecentBrainID(brain.id)
         refresh()
@@ -402,6 +454,87 @@ final class BrainLibrary: ObservableObject {
         }
     }
 
+    private static func copyBrain(
+        from sourceRoot: URL,
+        to destinationRoot: URL,
+        includeBiometricData: Bool,
+        fileManager: FileManager
+    ) throws {
+        try fileManager.createDirectory(at: destinationRoot, withIntermediateDirectories: true)
+        guard let enumerator = fileManager.enumerator(
+            at: sourceRoot,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            try writeBiometricExportManifest(at: destinationRoot, containsBiometricData: includeBiometricData)
+            return
+        }
+
+        for case let sourceURL as URL in enumerator {
+            let relativePath = String(sourceURL.standardizedFileURL.path.dropFirst(sourceRoot.standardizedFileURL.path.count + 1))
+            if shouldExcludeFromExport(relativePath: relativePath, includeBiometricData: includeBiometricData) {
+                if (try? sourceURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
+
+            let destinationURL = destinationRoot.appendingPathComponent(relativePath)
+            let values = try sourceURL.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
+            if values.isDirectory == true {
+                try fileManager.createDirectory(at: destinationURL, withIntermediateDirectories: true)
+            } else if values.isRegularFile == true {
+                try fileManager.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if !includeBiometricData,
+                   relativePath == "memory/people.sqlite",
+                   let scrubbedData = try BiometricCognitiveMemoryScrubber.scrubbedDatabaseData(from: sourceURL, fileManager: fileManager) {
+                    try scrubbedData.write(to: destinationURL, options: .atomic)
+                } else {
+                    try fileManager.copyItem(at: sourceURL, to: destinationURL)
+                }
+            }
+        }
+        try writeBiometricExportManifest(at: destinationRoot, containsBiometricData: includeBiometricData)
+    }
+
+    nonisolated static func shouldExcludeFromExport(relativePath: String, includeBiometricData: Bool) -> Bool {
+        guard !includeBiometricData else { return false }
+        return relativePath == "memory/face_embeddings"
+            || relativePath.hasPrefix("memory/face_embeddings/")
+            || relativePath == "memory/biometric_identities.json"
+            || relativePath == "memory/biometric_policy_receipts"
+            || relativePath.hasPrefix("memory/biometric_policy_receipts/")
+            || relativePath == "memory/people.sqlite-wal"
+            || relativePath == "memory/people.sqlite-shm"
+    }
+
+    nonisolated static func biometricExportManifestData(containsBiometricData: Bool) throws -> Data {
+        let manifest: [String: Any] = [
+            "contains_biometric_data": containsBiometricData,
+            "biometric_data_policy": [
+                "storage": "local_device",
+                "sharing": "user_export_only",
+                "owner_managed": true,
+            ],
+        ]
+        return try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func writeBiometricExportManifest(at rootURL: URL, containsBiometricData: Bool) throws {
+        let data = try biometricExportManifestData(containsBiometricData: containsBiometricData)
+        try data.write(to: rootURL.appendingPathComponent("export_manifest.json"), options: .atomic)
+    }
+
+    private static func exportManifestContainsBiometricData(in rootURL: URL) -> Bool {
+        let manifestURL = rootURL.appendingPathComponent("export_manifest.json")
+        guard let data = try? Data(contentsOf: manifestURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let containsBiometricData = object["contains_biometric_data"] as? Bool else {
+            return false
+        }
+        return containsBiometricData
+    }
+
     private static func availableUUIDDestination() -> URL {
         while true {
             let candidate = brainsRootURL.appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
@@ -514,4 +647,147 @@ final class BrainLibrary: ObservableObject {
     }
 
     private static let directAvatarFileNames = ["avatar.png", "avatar.jpg", "avatar.jpeg", "portrait.png", "portrait.jpg", "icon.png", "icon.jpg"]
+}
+
+nonisolated enum BrainLibraryError: LocalizedError {
+    case biometricDatabaseReadFailed
+    case biometricDatabaseWriteFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .biometricDatabaseReadFailed:
+            "Could not read local biometric records."
+        case .biometricDatabaseWriteFailed:
+            "Could not update local biometric records."
+        }
+    }
+}
+
+nonisolated enum BiometricCognitiveMemoryScrubber {
+    private static let biometricSubjectKeys: Set<String> = [
+        "embeddings",
+        "biometric_records",
+        "representative_image_path",
+        "representative_quality_score",
+    ]
+
+    static func scrubInPlace(at databaseURL: URL, fileManager: FileManager = .default) throws {
+        guard fileManager.fileExists(atPath: databaseURL.path),
+              let object = try readCognitiveObject(from: databaseURL) else {
+            return
+        }
+        try writeCognitiveObject(scrubbedCognitiveObject(object), to: databaseURL)
+    }
+
+    static func scrubbedDatabaseData(from databaseURL: URL, fileManager: FileManager = .default) throws -> Data? {
+        guard fileManager.fileExists(atPath: databaseURL.path) else { return nil }
+        guard let object = try readCognitiveObject(from: databaseURL) else {
+            return try Data(contentsOf: databaseURL)
+        }
+
+        let scrubbedURL = fileManager.temporaryDirectory
+            .appendingPathComponent("AffectiveScrubbedPeople-\(UUID().uuidString).sqlite")
+        defer { try? fileManager.removeItem(at: scrubbedURL) }
+
+        try createCognitiveDatabase(at: scrubbedURL)
+        try writeCognitiveObject(scrubbedCognitiveObject(object), to: scrubbedURL)
+        return try Data(contentsOf: scrubbedURL)
+    }
+
+    private static func scrubbedCognitiveObject(_ object: [String: Any]) -> [String: Any] {
+        var output = object
+        if let subjects = object["subjects"] as? [[String: Any]] {
+            output["subjects"] = subjects.map { subject in
+                var scrubbed = subject
+                for key in biometricSubjectKeys {
+                    scrubbed.removeValue(forKey: key)
+                }
+                return scrubbed
+            }
+        }
+        return output
+    }
+
+    private static func readCognitiveObject(from databaseURL: URL) throws -> [String: Any]? {
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            defer { sqlite3_close(database) }
+            throw BrainLibraryError.biometricDatabaseReadFailed
+        }
+        defer { sqlite3_close(database) }
+
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "SELECT data_json FROM cognitive_memory WHERE id = 1", -1, &statement, nil) == SQLITE_OK else {
+            sqlite3_finalize(statement)
+            return nil
+        }
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_step(statement) == SQLITE_ROW,
+              let textPointer = sqlite3_column_text(statement, 0) else {
+            return nil
+        }
+
+        let data = Data(String(cString: textPointer).utf8)
+        let object = try JSONSerialization.jsonObject(with: data)
+        guard let dictionary = object as? [String: Any] else {
+            throw BrainLibraryError.biometricDatabaseReadFailed
+        }
+        return dictionary
+    }
+
+    private static func createCognitiveDatabase(at databaseURL: URL) throws {
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK else {
+            defer { sqlite3_close(database) }
+            throw BrainLibraryError.biometricDatabaseWriteFailed
+        }
+        defer { sqlite3_close(database) }
+
+        let sql = """
+        PRAGMA user_version = 2;
+        CREATE TABLE IF NOT EXISTS cognitive_memory (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            schema_version INTEGER NOT NULL,
+            data_json TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO cognitive_memory (id, schema_version, data_json)
+        VALUES (1, 2, '{}');
+        """
+        guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
+            throw BrainLibraryError.biometricDatabaseWriteFailed
+        }
+    }
+
+    private static func writeCognitiveObject(_ object: [String: Any], to databaseURL: URL) throws {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        let text = String(data: data, encoding: .utf8) ?? "{}"
+
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
+            defer { sqlite3_close(database) }
+            throw BrainLibraryError.biometricDatabaseWriteFailed
+        }
+        defer { sqlite3_close(database) }
+
+        var statement: OpaquePointer?
+        let sql = """
+        INSERT INTO cognitive_memory (id, schema_version, data_json)
+        VALUES (1, 2, ?)
+        ON CONFLICT(id) DO UPDATE SET schema_version = excluded.schema_version, data_json = excluded.data_json
+        """
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            sqlite3_finalize(statement)
+            throw BrainLibraryError.biometricDatabaseWriteFailed
+        }
+        defer { sqlite3_finalize(statement) }
+
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let bindStatus = text.withCString { pointer in
+            sqlite3_bind_text(statement, 1, pointer, -1, transient)
+        }
+        guard bindStatus == SQLITE_OK, sqlite3_step(statement) == SQLITE_DONE else {
+            throw BrainLibraryError.biometricDatabaseWriteFailed
+        }
+    }
 }

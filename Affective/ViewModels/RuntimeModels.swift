@@ -95,15 +95,41 @@ struct CoreToolAction: Identifiable, Equatable {
     let symbolName: String
     let arguments: [String: JSONValue]
     let mirrorToChat: Bool
+    let requiresCamera: Bool
+}
 
-    static let primary: [CoreToolAction] = [
-        .init(id: "brain-inspect", title: "Inspect", toolName: "brain_inspect", symbolName: "brain.head.profile", arguments: [:], mirrorToChat: false),
-        .init(id: "memory-index", title: "Memory Index", toolName: "memory_index", symbolName: "archivebox", arguments: [:], mirrorToChat: false),
-        .init(id: "attention", title: "Attention", toolName: "choose_attention", symbolName: "scope", arguments: [:], mirrorToChat: true),
-        .init(id: "consolidate", title: "Consolidate", toolName: "consolidate_memory", symbolName: "square.stack.3d.up", arguments: [:], mirrorToChat: false),
-        .init(id: "dream", title: "Dream", toolName: "dream", symbolName: "moon.stars", arguments: [:], mirrorToChat: true),
-        .init(id: "forget-today", title: "Forget Today", toolName: "__host_forget_today", symbolName: "calendar.badge.minus", arguments: [:], mirrorToChat: false),
-    ]
+nonisolated struct DeveloperToolCatalog: Decodable {
+    let tools: [DeveloperToolRecord]
+}
+
+nonisolated struct DeveloperToolRecord: Decodable {
+    let id: String
+    let title: String
+    let toolName: String
+    let symbolName: String
+    let mirrorToChat: Bool
+    let requiresCamera: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case toolName = "tool_name"
+        case symbolName = "symbol_name"
+        case mirrorToChat = "mirror_to_chat"
+        case requiresCamera = "requires_camera"
+    }
+
+    var action: CoreToolAction {
+        .init(
+            id: id,
+            title: title,
+            toolName: toolName,
+            symbolName: symbolName,
+            arguments: [:],
+            mirrorToChat: mirrorToChat,
+            requiresCamera: requiresCamera
+        )
+    }
 }
 
 enum CredentialTestStatus: Equatable {
@@ -122,7 +148,7 @@ enum CredentialTestStatus: Equatable {
 enum CredentialTestError: LocalizedError {
     case missingCredential(String)
     case invalidResponse(String)
-    case rejected(String, Int)
+    case rejected(String, Int, String?)
 
     var errorDescription: String? {
         switch self {
@@ -130,8 +156,9 @@ enum CredentialTestError: LocalizedError {
             return "Add or store a \(provider) key before testing."
         case .invalidResponse(let provider):
             return "\(provider) returned an unreadable validation response."
-        case .rejected(let provider, let statusCode):
-            return "\(provider) rejected the key with HTTP \(statusCode)."
+        case .rejected(let provider, let statusCode, let message):
+            let detail = message.map { ": \($0)" } ?? "."
+            return "\(provider) rejected the key with HTTP \(statusCode)\(detail)"
         }
     }
 }
@@ -141,13 +168,41 @@ enum ProviderCredentialTester {
         var request = request(for: key, credential: credential)
         request.timeoutInterval = 20
 
-        let (_, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw CredentialTestError.invalidResponse(key.displayName)
         }
         guard 200..<300 ~= httpResponse.statusCode else {
-            throw CredentialTestError.rejected(key.displayName, httpResponse.statusCode)
+            throw CredentialTestError.rejected(
+                key.displayName,
+                httpResponse.statusCode,
+                providerErrorMessage(from: data)
+            )
         }
+    }
+
+    static func providerErrorMessage(from data: Data) -> String? {
+        guard !data.isEmpty else { return nil }
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let error = object["error"] as? [String: Any],
+               let message = error["message"] as? String {
+                return normalizedErrorMessage(message)
+            }
+            if let message = object["error"] as? String {
+                return normalizedErrorMessage(message)
+            }
+            if let message = object["message"] as? String {
+                return normalizedErrorMessage(message)
+            }
+        }
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        return normalizedErrorMessage(text)
+    }
+
+    private static func normalizedErrorMessage(_ message: String) -> String? {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(240))
     }
 
     static func request(for key: ProviderCredentialKey, credential: String) -> URLRequest {
@@ -179,7 +234,6 @@ struct RuntimeOptionGroup: Identifiable, Equatable {
 
     static let defaults: [RuntimeOptionGroup] = [
         .init(title: "Quick Controls", note: "Most likely to change while Affective is running.", isExpanded: true, options: [
-            .select(key: "recognition_mode", label: "Recognition", value: "auto", choices: ["auto", "command", "descriptive"]),
             .select(key: "psyche_mode", label: "Psyche", value: "on", choices: ["off", "on"]),
             .select(key: "speech_voice", label: "Speech voice", value: defaultSpeechVoiceName, choices: speechVoiceChoices),
             .number(key: "conversation_idle_timeout_seconds", label: "Conversation idle timeout", value: "120", unit: "sec"),
@@ -194,19 +248,85 @@ struct RuntimeOptionGroup: Identifiable, Equatable {
             .number(key: "autonomy_daily_energy", label: "Daily autonomy budget", value: "20", unit: "actions"),
             .select(key: "make_up_lost_dream_time", label: "Make up for lost dream time", value: "off", choices: ["off", "on"]),
         ]),
-        .init(title: "Recognition Files", note: "Live paths used by command recognition.", isExpanded: false, options: [
-            .text(key: "recognition_command", label: "Recognition command", value: "tools/affective-face-recognizer", requiresRestart: true),
-            .text(key: "face_detector_model", label: "Face detector model", value: "models/face_detection_yunet_2023mar_int8.onnx", requiresRestart: true),
-            .text(key: "face_recognition_model", label: "Face recognition model", value: "models/face_recognition_sface_2021dec_int8.onnx", requiresRestart: true),
+        .init(title: "Biometric Privacy", note: "Local face-template controls for this brain. Owner-managed consent is required before use.", isExpanded: true, options: [
+            .select(
+                key: BiometricPolicyKeys.recognitionEnabled,
+                label: "Enable biometric recognition",
+                value: "off",
+                choices: [RuntimeOptionChoice(value: "off", label: "Off"), RuntimeOptionChoice(value: "on", label: "On")],
+                requiresRestart: true
+            ),
+            .select(
+                key: BiometricPolicyKeys.policyAcknowledged,
+                label: "Biometric policy acknowledged",
+                value: "off",
+                choices: [RuntimeOptionChoice(value: "off", label: "Not acknowledged"), RuntimeOptionChoice(value: "on", label: "Acknowledged")],
+                requiresRestart: true
+            ),
+            .select(
+                key: BiometricPolicyKeys.enrollmentAllowed,
+                label: "Allow new enrollments",
+                value: "off",
+                choices: [RuntimeOptionChoice(value: "off", label: "Off"), RuntimeOptionChoice(value: "on", label: "On")],
+                requiresRestart: true
+            ),
+            .select(
+                key: BiometricPolicyKeys.retentionPeriod,
+                label: "Retention period",
+                value: BiometricDataPolicy.defaultRetentionPeriod,
+                choices: [
+                    RuntimeOptionChoice(value: "until_deleted", label: "Until deleted"),
+                    RuntimeOptionChoice(value: "30_days", label: "30 days"),
+                    RuntimeOptionChoice(value: "1_year", label: "1 year"),
+                    RuntimeOptionChoice(value: "3_years", label: "3 years"),
+                    RuntimeOptionChoice(value: "delete_when_not_seen", label: "Delete when not seen"),
+                ]
+            ),
+            .select(
+                key: BiometricPolicyKeys.exportIncluded,
+                label: "Include biometrics in export and iCloud upload",
+                value: "off",
+                choices: [RuntimeOptionChoice(value: "off", label: "Off"), RuntimeOptionChoice(value: "on", label: "On")]
+            ),
+            .select(
+                key: BiometricPolicyKeys.exportConfirmationRequired,
+                label: "Require confirmation before export",
+                value: "on",
+                choices: [RuntimeOptionChoice(value: "on", label: "On"), RuntimeOptionChoice(value: "off", label: "Off")]
+            ),
+            .select(
+                key: BiometricPolicyKeys.autoDeleteUnconfirmed,
+                label: "Auto-delete unconfirmed templates",
+                value: "on",
+                choices: [RuntimeOptionChoice(value: "on", label: "On"), RuntimeOptionChoice(value: "off", label: "Off")]
+            ),
+        ]),
+        .init(title: "Recognition Files", note: "Host-managed biometric cache location.", isExpanded: false, options: [
             .text(key: "face_embeddings_dir", label: "Face embeddings directory", value: "~/Library/Application Support/Affective/brains/default/memory/face_embeddings", requiresRestart: true),
         ]),
         .init(title: "API Accounts", note: "Host credentials used for model calls made with the user's accounts.", scope: .host, isExpanded: true, options: [
+            .select(
+                key: AffectiveViewModel.textProviderPreferenceOptionKey,
+                label: "Text provider",
+                value: HostTextProviderPreference.random.rawValue,
+                choices: HostTextProviderPreference.allCases.map {
+                    RuntimeOptionChoice(value: $0.rawValue, label: $0.displayName)
+                },
+                requiresRestart: true
+            ),
             .text(key: "openai_api_key", label: "OpenAI API key", value: ""),
             .text(key: "anthropic_api_key", label: "Anthropic API key", value: ""),
             .text(key: "google_api_key", label: "Google API key", value: ""),
         ]),
         .init(title: "Host Senses", note: "Local devices used when the brain asks the host for sensory input.", scope: .host, isExpanded: true, options: [
             .select(key: "camera_device_id", label: "Camera input", value: "automatic", choices: ["automatic"]),
+            .select(
+                key: AffectiveViewModel.motionGestureEnabledOptionKey,
+                label: "Motion gestures",
+                value: "off",
+                choices: ["off", "on"],
+                requiresRestart: true
+            ),
         ]),
     ]
 
@@ -265,6 +385,9 @@ struct RuntimeOption: Identifiable, Equatable {
     }
 
     var jsonValue: Any {
+        if BiometricPolicyKeys.booleanOptionKeys.contains(key) {
+            return value == "on"
+        }
         switch kind {
         case .number:
             if value.contains(".") {
@@ -312,6 +435,17 @@ struct RuntimeOption: Identifiable, Equatable {
     static func select(key: String, label: String, value: String, choices: [RuntimeOptionChoice], requiresRestart: Bool = false, isReadOnly: Bool = false) -> RuntimeOption {
         .init(key: key, label: label, value: value, committedValue: value, kind: .select(choices), unit: nil, requiresRestart: requiresRestart, isReadOnly: isReadOnly, hasStoredSecret: false, shouldDeleteSecret: false)
     }
+}
+
+extension BiometricPolicyKeys {
+    static let booleanOptionKeys: Set<String> = [
+        recognitionEnabled,
+        policyAcknowledged,
+        enrollmentAllowed,
+        exportIncluded,
+        exportConfirmationRequired,
+        autoDeleteUnconfirmed,
+    ]
 }
 
 private extension Sequence where Element: Hashable {

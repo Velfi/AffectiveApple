@@ -29,6 +29,7 @@ struct WelcomeView: View {
     @State private var brainBeingRenamed: BrainDescriptor?
     @State private var brainPendingDeletion: BrainDescriptor?
     @State private var brainPendingSyncSelection: BrainDescriptor?
+    @State private var brainPendingBiometricShareExport: BrainDescriptor?
     @State private var sharedBrainExport: SharedBrainExport?
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -115,10 +116,28 @@ struct WelcomeView: View {
             }
         } message: { brain in
             if let syncedBrainID = syncManager.syncedBrainID, syncedBrainID != brain.id {
-                Text("Affective can sync one brain at a time. This will stop syncing the current brain and make \(brain.displayName) the iCloud brain.")
+                Text(syncSelectionMessage(for: brain, prefix: "Affective can sync one brain at a time. This will stop syncing the current brain and make \(brain.displayName) the iCloud brain."))
             } else {
-                Text("Affective will keep this brain's experiential record in iCloud and sync it on app start.")
+                Text(syncSelectionMessage(for: brain, prefix: "Affective will keep this brain's experiential record in iCloud and sync it on app start."))
             }
+        }
+        .confirmationDialog(
+            "Share export with biometric data?",
+            isPresented: Binding(
+                get: { brainPendingBiometricShareExport != nil },
+                set: { if !$0 { brainPendingBiometricShareExport = nil } }
+            ),
+            presenting: brainPendingBiometricShareExport
+        ) { brain in
+            Button("Share With Biometrics") {
+                brainPendingBiometricShareExport = nil
+                performShareBrainZip(brain)
+            }
+            Button("Cancel", role: .cancel) {
+                brainPendingBiometricShareExport = nil
+            }
+        } message: { brain in
+            Text("This shared export will include face templates and local biometric records for \(brain.displayName). People memory remains separate, but these records are sensitive biometric data.")
         }
         .confirmationDialog(
             "Delete \(brainPendingDeletion?.displayName ?? "Brain")?",
@@ -149,7 +168,7 @@ struct WelcomeView: View {
             .background(AppTheme.sidebarBackground)
 
             Divider()
-                .overlay(.white.opacity(0.06))
+                .overlay(AppTheme.softSeparator)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 26) {
@@ -219,7 +238,7 @@ struct WelcomeView: View {
             .background(AppTheme.sidebarBackground)
 
             Divider()
-                .overlay(.white.opacity(0.06))
+                .overlay(AppTheme.softSeparator)
 
             ScrollView {
                 BrainSection(
@@ -404,7 +423,7 @@ struct WelcomeView: View {
     }
 
     func requestSyncSelection(_ brain: BrainDescriptor) {
-        if syncManager.syncedBrainID == brain.id || syncManager.syncedBrainID == nil {
+        if syncManager.syncedBrainID == brain.id {
             syncManager.selectBrainForSync(brain)
             selectedBrainID = brain.id
         } else {
@@ -505,13 +524,14 @@ struct WelcomeView: View {
         let panel = NSOpenPanel()
         panel.title = "Export Brain"
         panel.prompt = "Export Here"
-        panel.message = "Choose a destination folder for \(brain.displayName)."
+        panel.message = exportPanelMessage(for: brain)
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
 
         guard panel.runModal() == .OK, let destination = panel.url else { return }
+        guard confirmBiometricExportIfNeeded(for: brain) else { return }
         do {
             selectedBrainID = brain.id
             let exportedURL = try library.exportBrainFolder(brain, to: destination)
@@ -529,12 +549,13 @@ struct WelcomeView: View {
         let panel = NSSavePanel()
         panel.title = "Export Brain ZIP"
         panel.prompt = "Export"
-        panel.message = "Choose where to save a zipped export of \(brain.displayName)."
+        panel.message = exportPanelMessage(for: brain)
         panel.allowedContentTypes = [.zip]
         panel.nameFieldStringValue = "\(brain.id).affectivebrain.zip"
         panel.canCreateDirectories = true
 
         guard panel.runModal() == .OK, let destination = panel.url else { return }
+        guard confirmBiometricExportIfNeeded(for: brain) else { return }
         do {
             selectedBrainID = brain.id
             let exportedURL = try library.exportBrainZip(brain, to: destination)
@@ -548,6 +569,20 @@ struct WelcomeView: View {
     }
 
     func shareBrainZip(_ brain: BrainDescriptor) {
+        #if os(macOS)
+        guard confirmBiometricExportIfNeeded(for: brain) else { return }
+        performShareBrainZip(brain)
+        #else
+        let policy = BiometricDataPolicy.load(for: brain)
+        if policy.shouldIncludeInExport {
+            brainPendingBiometricShareExport = brain
+            return
+        }
+        performShareBrainZip(brain)
+        #endif
+    }
+
+    func performShareBrainZip(_ brain: BrainDescriptor) {
         do {
             selectedBrainID = brain.id
             let shareDirectory = FileManager.default.temporaryDirectory
@@ -565,6 +600,38 @@ struct WelcomeView: View {
     func cleanupSharedBrainExport(at url: URL) {
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
         sharedBrainExport = nil
+    }
+
+    func exportPanelMessage(for brain: BrainDescriptor) -> String {
+        let policy = BiometricDataPolicy.load(for: brain)
+        if policy.shouldIncludeInExport {
+            return "Choose where to save \(brain.displayName). This export is configured to include biometric records and face templates in manual exports, sharing, and iCloud uploads after confirmation."
+        }
+        return "Choose where to save \(brain.displayName). Biometric records and face templates will be excluded from manual exports, sharing, and iCloud uploads."
+    }
+
+    func confirmBiometricExportIfNeeded(for brain: BrainDescriptor) -> Bool {
+        let policy = BiometricDataPolicy.load(for: brain)
+        guard policy.shouldIncludeInExport else { return true }
+        #if os(macOS)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Export biometric data?"
+        alert.informativeText = "This brain export will include face templates and local biometric records. People memory remains separate, but these records are sensitive biometric data."
+        alert.addButton(withTitle: "Export With Biometrics")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+        #else
+        return true
+        #endif
+    }
+
+    func syncSelectionMessage(for brain: BrainDescriptor, prefix: String) -> String {
+        let policy = BiometricDataPolicy.load(for: brain)
+        if policy.shouldIncludeInExport {
+            return "\(prefix) Biometric Privacy is configured to include biometrics in export and iCloud upload, so face templates and local biometric records will be uploaded to your iCloud."
+        }
+        return "\(prefix) Biometric records and face templates will be excluded from iCloud uploads."
     }
 
     func chooseAvatar(for brain: BrainDescriptor) {

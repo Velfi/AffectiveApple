@@ -359,7 +359,7 @@ struct BrainAvatar: View {
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.10))
+                .stroke(AppTheme.separator)
         )
         .accessibilityLabel("\(brain.displayName) avatar")
     }

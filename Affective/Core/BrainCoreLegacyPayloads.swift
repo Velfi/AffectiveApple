@@ -13,12 +13,15 @@ import Foundation
     let brainSummary: String
     let interruptedBy: String?
 
-    static func decode(from text: String) -> ConversationTurnPayload {
+    static func decode(from text: String) -> ConversationTurnPayload? {
       guard let data = text.data(using: .utf8),
-        let object = try? JSONValue.decodedObject(from: data)
+        let object = try? JSONValue.decodedObject(from: data),
+        object["user_text"] != nil
+          || object["spoken_text"] != nil
+          || object["user_summary"] != nil
+          || object["brain_summary"] != nil
       else {
-        return ConversationTurnPayload(
-          userText: "", spokenText: text, userSummary: "", brainSummary: "", interruptedBy: nil)
+        return nil
       }
 
       return ConversationTurnPayload(

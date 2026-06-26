@@ -299,11 +299,13 @@ final class BrainSyncManager: ObservableObject {
     private func runSync(brain: BrainDescriptor) async {
         setState(.checking, for: brain.id)
         do {
+            let includeBiometricData = BiometricDataPolicy.load(for: brain).shouldIncludeInExport
             let localCheckpoint = try BrainCheckpointArchive.createCheckpoint(
                 for: brain,
                 schemaVersion: Self.schemaVersion,
                 deviceID: deviceID,
                 revision: nil,
+                includeBiometricData: includeBiometricData,
                 fileManager: fileManager
             )
             defer { try? fileManager.removeItem(at: localCheckpoint.archiveURL.deletingLastPathComponent()) }
@@ -349,11 +351,13 @@ final class BrainSyncManager: ObservableObject {
         setState(.uploading, for: brain.id)
         do {
             let cloudManifest = try await store.loadManifest(brainID: brain.id)
+            let includeBiometricData = BiometricDataPolicy.load(for: brain).shouldIncludeInExport
             let localCheckpoint = try BrainCheckpointArchive.createCheckpoint(
                 for: brain,
                 schemaVersion: Self.schemaVersion,
                 deviceID: deviceID,
                 revision: (cloudManifest?.revision ?? 0) + 1,
+                includeBiometricData: includeBiometricData,
                 fileManager: fileManager
             )
             defer { try? fileManager.removeItem(at: localCheckpoint.archiveURL.deletingLastPathComponent()) }
@@ -602,13 +606,23 @@ nonisolated enum BrainCheckpointArchive {
         schemaVersion: Int,
         deviceID: String,
         revision: Int?,
+        includeBiometricData: Bool,
         fileManager: FileManager = .default
     ) throws -> Created {
         let scratch = fileManager.temporaryDirectory.appendingPathComponent("AffectiveBrainCheckpoint-\(UUID().uuidString)", isDirectory: true)
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
         let archiveURL = scratch.appendingPathComponent(archiveFileName(for: brain.id))
-        let components = try collectComponents(from: brain.rootURL, fileManager: fileManager)
-        let payload = Payload(formatVersion: formatVersion, brainID: brain.id, components: components)
+        let components = try collectComponents(
+            from: brain.rootURL,
+            includeBiometricData: includeBiometricData,
+            fileManager: fileManager
+        )
+        let payload = Payload(
+            formatVersion: formatVersion,
+            brainID: brain.id,
+            containsBiometricData: includeBiometricData,
+            components: components
+        )
         let data = try JSONEncoder.brainSync.encode(payload)
         try data.write(to: archiveURL, options: .atomic)
         let hash = sha256Hex(data)
@@ -678,7 +692,11 @@ nonisolated enum BrainCheckpointArchive {
         }
     }
 
-    private static func collectComponents(from rootURL: URL, fileManager: FileManager) throws -> [Component] {
+    private static func collectComponents(
+        from rootURL: URL,
+        includeBiometricData: Bool,
+        fileManager: FileManager
+    ) throws -> [Component] {
         guard let enumerator = fileManager.enumerator(
             at: rootURL,
             includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
@@ -697,14 +715,36 @@ nonisolated enum BrainCheckpointArchive {
             }
             let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
             let relativePath = try relativePath(for: url, root: rootURL)
+            if BrainLibrary.shouldExcludeFromExport(
+                relativePath: relativePath,
+                includeBiometricData: includeBiometricData
+            ) {
+                if values.isDirectory == true {
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
             try validateRelativePath(relativePath)
             if values.isDirectory == true {
                 components.append(Component(path: relativePath, isDirectory: true, dataBase64: nil))
             } else if values.isRegularFile == true {
-                let data = try Data(contentsOf: url)
+                let data: Data
+                if !includeBiometricData,
+                   relativePath == "memory/people.sqlite",
+                   let scrubbedData = try BiometricCognitiveMemoryScrubber.scrubbedDatabaseData(from: url, fileManager: fileManager) {
+                    data = scrubbedData
+                } else {
+                    data = try Data(contentsOf: url)
+                }
                 components.append(Component(path: relativePath, isDirectory: false, dataBase64: data.base64EncodedString()))
             }
         }
+        let manifestData = try BrainLibrary.biometricExportManifestData(containsBiometricData: includeBiometricData)
+        components.append(Component(
+            path: "export_manifest.json",
+            isDirectory: false,
+            dataBase64: manifestData.base64EncodedString()
+        ))
         return components.sorted {
             if $0.isDirectory != $1.isDirectory { return $0.isDirectory && !$1.isDirectory }
             return $0.path < $1.path
@@ -741,6 +781,7 @@ nonisolated enum BrainCheckpointArchive {
     private struct Payload: Codable {
         var formatVersion: Int
         var brainID: String
+        var containsBiometricData: Bool?
         var components: [Component]
     }
 

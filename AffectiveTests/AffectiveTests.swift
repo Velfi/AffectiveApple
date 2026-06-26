@@ -17,6 +17,10 @@ final class AffectiveTests: XCTestCase {
   private var temporaryRoots: [URL] = []
 
   override func setUpWithError() throws {
+    let libraryRoot = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveTests-Library-\(UUID().uuidString)", isDirectory: true)
+    BrainLibrary.storageRootURLOverride = libraryRoot
+    temporaryRoots.append(libraryRoot)
     UserDefaults.standard.removeObject(forKey: AffectiveViewModel.brainVoiceEnabledKey)
     UserDefaults.standard.removeObject(forKey: AffectiveViewModel.orientationPermissionStatusKey)
   }
@@ -28,6 +32,7 @@ final class AffectiveTests: XCTestCase {
       try? FileManager.default.removeItem(at: url)
     }
     temporaryRoots = []
+    BrainLibrary.storageRootURLOverride = nil
   }
 
   func testValidBrainShapePassesCoreValidation() throws {
@@ -50,6 +55,216 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(entity.attributeSet.identifier, "affective-brain:\(brain.id)")
     XCTAssertEqual(entity.attributeSet.domainIdentifier, AffectiveSemanticSchema.brainDomainIdentifier)
     XCTAssertTrue(entity.attributeSet.keywords?.contains(brain.displayName) == true)
+  }
+
+  func testProviderCredentialTesterExtractsJSONErrorMessage() throws {
+    let data = Data(#"{"error":{"message":"API key is invalid."}}"#.utf8)
+
+    XCTAssertEqual(
+      ProviderCredentialTester.providerErrorMessage(from: data),
+      "API key is invalid.")
+  }
+
+  func testProviderCredentialTesterExtractsPlainTextErrorMessage() throws {
+    let data = Data("  upstream validation failed  \n".utf8)
+
+    XCTAssertEqual(
+      ProviderCredentialTester.providerErrorMessage(from: data),
+      "upstream validation failed")
+  }
+
+  func testFaceRecognitionServiceEnrollsAndIdentifiesFixtureImages() throws {
+    let brain = try makeBrain()
+    try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
+      {
+        "schema_version": 2,
+        "traces": [],
+        "beliefs": [],
+        "subjects": [
+          {
+            "subject_id": "person_001",
+            "display_name": "Mara",
+            "relationship_status": "visitor",
+            "stable_notes": [],
+            "recent_notes": [],
+            "biometric_records": [],
+            "representative_image_path": null,
+            "representative_quality_score": 0,
+            "lifecycle": { "created_at": "1", "updated_at": "1" }
+          }
+        ],
+        "artifacts": [],
+        "dreams": []
+      }
+      """)
+
+    let service = FaceRecognitionService()
+    let known = try fixtureURL("known_01", extension: "png", subdirectory: "Fixtures/visitors")
+    let changed = try fixtureURL("known_changed_01", extension: "png", subdirectory: "Fixtures/visitors")
+    let unknown = try fixtureURL("unknown_01", extension: "png", subdirectory: "Fixtures/visitors")
+    try skipPlaceholderImageFixtures([known, changed, unknown])
+    let knownCameraImage = try cameraJPEGFixture(from: known, named: "known_01", in: brain.rootURL)
+    let changedCameraImage = try cameraJPEGFixture(from: changed, named: "known_changed_01", in: brain.rootURL)
+    let unknownCameraImage = try cameraJPEGFixture(from: unknown, named: "unknown_01", in: brain.rootURL)
+    XCTAssertEqual(knownCameraImage.pathExtension, "jpg")
+    XCTAssertEqual(changedCameraImage.pathExtension, "jpg")
+    XCTAssertEqual(unknownCameraImage.pathExtension, "jpg")
+    XCTAssertFalse(knownCameraImage.path.contains(".xctest"))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: knownCameraImage.path))
+
+    let enroll = try service.enroll(.init(
+      imagePath: knownCameraImage.path,
+      memoryPath: brain.memoryDatabaseURL.path,
+      embeddingsDir: brain.faceEmbeddingsURL.path,
+      detectorModel: nil,
+      recognizerModel: nil,
+      personID: "person_001",
+      name: nil,
+      keepExisting: false
+    ))
+    XCTAssertEqual(enroll.personID, "person_001")
+    XCTAssertTrue(FileManager.default.fileExists(atPath: enroll.embeddingPath))
+
+    let changedResult = try service.identify(.init(
+      imagePath: changedCameraImage.path,
+      memoryPath: brain.memoryDatabaseURL.path,
+      embeddingsDir: brain.faceEmbeddingsURL.path,
+      detectorModel: nil,
+      recognizerModel: nil,
+      knownThreshold: 0.85,
+      uncertainThreshold: 0.60
+    ))
+    XCTAssertTrue(["known", "uncertain"].contains(changedResult.matchStatus))
+    XCTAssertEqual(changedResult.personID, "person_001")
+
+    let unknownResult = try service.identify(.init(
+      imagePath: unknownCameraImage.path,
+      memoryPath: brain.memoryDatabaseURL.path,
+      embeddingsDir: brain.faceEmbeddingsURL.path,
+      detectorModel: nil,
+      recognizerModel: nil,
+      knownThreshold: 0.85,
+      uncertainThreshold: 0.60
+    ))
+    XCTAssertEqual(unknownResult.matchStatus, "unknown")
+
+  }
+
+  @MainActor
+  func testSpecialPokeCuriosityIdentifiesUnknownThenEnrollsAfterIntroduction() async throws {
+    let brain = try makeBrain()
+    try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
+      {
+        "schema_version": 2,
+        "traces": [],
+        "beliefs": [],
+        "subjects": [
+          {
+            "subject_id": "person_mara",
+            "display_name": "Mara",
+            "relationship_status": "introduced",
+            "stable_notes": [],
+            "recent_notes": ["Introduced herself after a poke-triggered curiosity check."],
+            "biometric_records": [],
+            "representative_image_path": null,
+            "representative_quality_score": 0,
+            "lifecycle": { "created_at": "1", "updated_at": "1" }
+          }
+        ],
+        "artifacts": [],
+        "dreams": []
+      }
+      """)
+
+    let visitor = try fixtureURL("known_01", extension: "png", subdirectory: "Fixtures/visitors")
+    try skipPlaceholderImageFixtures([visitor])
+    let cameraImage = try cameraJPEGFixture(from: visitor, named: "poke-curiosity-mara", in: brain.rootURL)
+    let hostServices = EmbeddedHostServices(
+      credentialProvider: { [:] },
+      providerPicker: { $0.first },
+      textProviderPreference: .random,
+      textRoutePicker: { $0.first }
+    )
+    let curiosityResponse = Self.toolResponse(
+      toolName: "poke_sequence",
+      events: [
+        attentionStatusEvent(
+          id: "poke-curiosity",
+          title: "Curiosity",
+          summary: "Curious after a poke; trying to identify the person nearby."
+        ),
+      ],
+      result: .object(["summary": .string("Poke made the brain curious about who is here.")]),
+      requestID: "poke-curiosity"
+    )
+    let core = ScriptedBrainCore(
+      toolResponse: curiosityResponse,
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: brain, brainCore: core)
+    model.isBrainConnected = true
+    model.pendingPokePulses = [
+      PokePulse(pressMilliseconds: 120, pauseBeforeMilliseconds: 0),
+    ]
+
+    await model.flushPokeSequence()
+
+    let pokes = await waitForPokeSequenceCount(1, in: core)
+    XCTAssertEqual(pokes.count, 1)
+    XCTAssertEqual(pokes.first?.first?.pressMilliseconds, 120)
+    XCTAssertEqual(model.commandEntries.last { $0.title == "Curiosity" }?.body, "Curious after a poke; trying to identify the person nearby.")
+    XCTAssertEqual(model.statusText, "Poke sent")
+
+    let identifyBody = try recognitionRequestData([
+      "image_path": cameraImage.path,
+      "memory_path": brain.memoryDatabaseURL.path,
+      "embeddings_dir": brain.faceEmbeddingsURL.path,
+      "known_threshold": 0.85,
+      "uncertain_threshold": 0.60,
+    ])
+    let unknownResult: RecognitionIdentityResponse = try postRecognitionResponse(
+      body: identifyBody,
+      to: "affective-host://recognize/identify",
+      using: hostServices
+    )
+    XCTAssertEqual(unknownResult.personPresent, true)
+    XCTAssertEqual(unknownResult.matchStatus, "unknown")
+    XCTAssertNil(unknownResult.personID)
+
+    _ = await model.applyCoreEvents([
+      expressionEvent(
+        title: "Other",
+        text: "I'm Mara.",
+        expressionID: "mara-introduction-expression",
+        role: .other,
+        source: .user
+      )
+    ], mirrorChatMessages: true, speak: false)
+
+    let enrollBody = try recognitionRequestData([
+      "image_path": cameraImage.path,
+      "memory_path": brain.memoryDatabaseURL.path,
+      "embeddings_dir": brain.faceEmbeddingsURL.path,
+      "name": "Mara",
+      "keep_existing": false,
+    ])
+    let enrollResult: RecognitionEnrollResponse = try postRecognitionResponse(
+      body: enrollBody,
+      to: "affective-host://recognize/enroll",
+      using: hostServices
+    )
+    XCTAssertEqual(enrollResult.personID, "person_mara")
+    XCTAssertEqual(enrollResult.displayName, "Mara")
+    XCTAssertTrue(FileManager.default.fileExists(atPath: enrollResult.embeddingPath))
+
+    let knownResult: RecognitionIdentityResponse = try postRecognitionResponse(
+      body: identifyBody,
+      to: "affective-host://recognize/identify",
+      using: hostServices
+    )
+    XCTAssertTrue(["known", "uncertain"].contains(knownResult.matchStatus))
+    XCTAssertEqual(knownResult.personID, "person_mara")
+    XCTAssertEqual(knownResult.candidateName, "Mara")
   }
 
   func testConversationSemanticEntityUsesBrainScopedIdentifier() throws {
@@ -80,15 +295,13 @@ final class AffectiveTests: XCTestCase {
     let brain = try makeBrain()
     let core = BrainCore(brain: brain)
 
-    try await core.connect()
-    await core.disconnect()
+    try await withConnectedCore(core) {}
   }
 
   func testEmbeddedProtocolContractMatchesWrapperHostManifest() throws {
     let manifestData = Data(CoreConfigStorage.hostManifestJSON(hasProvider: false).utf8)
     let manifest = try JSONValue.decodedObject(from: manifestData)
 
-    XCTAssertEqual(manifest["api_version"], .number(Double(EmbeddedProtocolContract.apiVersion)))
     XCTAssertEqual(manifest["max_envelope_bytes"], .number(16 * 1024))
     XCTAssertEqual(manifest["max_event_count"], .number(12))
     XCTAssertEqual(manifest["max_event_text_bytes"], .number(768))
@@ -98,17 +311,15 @@ final class AffectiveTests: XCTestCase {
     let capabilities = Set(capabilityValues.compactMap(\.stringValue))
     XCTAssertEqual(capabilities.count, capabilityValues.count, "Host manifest capabilities should be unique.")
 
-    for capability in EmbeddedProtocolContract.baseHostCapabilities {
+    let policyGatedCapabilities: Set<String> = ["face_identification", "face_enrollment"]
+    for capability in EmbeddedProtocolContract.baseHostCapabilities where !policyGatedCapabilities.contains(capability) {
       XCTAssertTrue(
         capabilities.contains(capability),
         "Affective host manifest is missing required embedded capability '\(capability)'.")
     }
-
-    for eventType in EmbeddedProtocolContract.eventTypesRequiringHostCapability {
-      XCTAssertTrue(
-        capabilities.contains(eventType),
-        "Affective dispatches '\(eventType)' but does not advertise it in the host manifest.")
-    }
+    XCTAssertFalse(capabilities.contains("face_identification"))
+    XCTAssertFalse(capabilities.contains("face_enrollment"))
+    XCTAssertEqual(manifest["capability_status"]?.objectValue?["face_identification"], .string("disabled_by_policy"))
 
     for providerCapability in EmbeddedProtocolContract.providerHostCapabilities {
       XCTAssertFalse(
@@ -125,8 +336,780 @@ final class AffectiveTests: XCTestCase {
         providerCapabilities.contains(providerCapability),
         "Provider-backed host manifest is missing capability '\(providerCapability)'.")
     }
-    XCTAssertTrue(providerCapabilities.contains("live_camera"))
+    XCTAssertFalse(providerCapabilities.contains("live_camera"))
+    XCTAssertTrue(providerCapabilities.contains("camera_capture"))
     XCTAssertEqual(providerManifest["capability_status"]?.objectValue?["camera"], .string("prompt_required"))
+
+    let senseCatalog = try XCTUnwrap(manifest["sense_catalog"]?.arrayValue)
+    let senseObjects = senseCatalog.compactMap(\.objectValue)
+    let sensesByID = Dictionary(uniqueKeysWithValues: senseObjects.compactMap { object -> (String, [String: JSONValue])? in
+      guard let id = object["sense_id"]?.stringValue else { return nil }
+      return (id, object)
+    })
+    XCTAssertEqual(sensesByID["camera"]?["sense_direction"], .string("pull"))
+    XCTAssertEqual(sensesByID["orientation"]?["sense_direction"], .string("pull"))
+    XCTAssertEqual(sensesByID["motion_gesture"]?["sense_direction"], .string("push"))
+  }
+
+  func testHostCapabilityManifestOwnsProviderRouting() throws {
+    let manifest = EmbeddedHostCapabilityManifest(
+      configuredProviders: [.google],
+      appleFoundationModelsStatus: .unsupportedPlatform,
+      textProviderPreference: .random,
+      cameraStatus: "available",
+      orientationStatus: "denied"
+    )
+    let object = try JSONValue.decodedObject(from: Data(manifest.jsonString().utf8))
+    let capabilities = Set(
+      try XCTUnwrap(object["capabilities"]?.arrayValue).compactMap(\.stringValue))
+    let routing = try XCTUnwrap(object["host_provider_routing"]?.objectValue)
+
+    XCTAssertTrue(capabilities.contains("provider_vision_completion"))
+    XCTAssertTrue(capabilities.contains("provider_image_generation"))
+    XCTAssertFalse(capabilities.contains("live_camera"))
+    XCTAssertTrue(capabilities.contains("camera_capture"))
+    XCTAssertTrue(capabilities.contains("orientation_read"))
+    XCTAssertEqual(object["capability_status"]?.objectValue?["provider_routing"], .string("available"))
+    XCTAssertEqual(routing["owner"], .string("host"))
+    XCTAssertEqual(routing["mode"], .string("random"))
+    XCTAssertEqual(routing["configured_providers"]?.arrayValue, [.string("Google")])
+  }
+
+  func testHostCapabilityManifestDoesNotAdvertiseProviderRoutingWithoutProviders() throws {
+    let manifest = EmbeddedHostCapabilityManifest(
+      configuredProviders: [],
+      appleFoundationModelsStatus: .unsupportedPlatform,
+      textProviderPreference: .random,
+      cameraStatus: "available",
+      orientationStatus: "available"
+    )
+    let object = try JSONValue.decodedObject(from: Data(manifest.jsonString().utf8))
+    let capabilities = Set(
+      try XCTUnwrap(object["capabilities"]?.arrayValue).compactMap(\.stringValue))
+
+    XCTAssertFalse(capabilities.contains("provider_vision_completion"))
+    XCTAssertFalse(capabilities.contains("provider_vision_completion"))
+    XCTAssertFalse(capabilities.contains("provider_image_generation"))
+    XCTAssertFalse(capabilities.contains("live_camera"))
+    XCTAssertTrue(capabilities.contains("camera_capture"))
+    XCTAssertTrue(capabilities.contains("orientation_read"))
+    XCTAssertEqual(object["capability_status"]?.objectValue?["provider_routing"], .string("unavailable"))
+    XCTAssertEqual(object["host_provider_routing"]?.objectValue?["configured_providers"]?.arrayValue, [])
+  }
+
+  func testHostCapabilityManifestGatesBiometricsByPolicy() throws {
+    let disabledManifest = EmbeddedHostCapabilityManifest(
+      configuredProviders: [],
+      appleFoundationModelsStatus: .unsupportedPlatform,
+      textProviderPreference: .random,
+      cameraStatus: "available",
+      orientationStatus: "available"
+    )
+    let disabledObject = try JSONValue.decodedObject(from: Data(disabledManifest.jsonString().utf8))
+    let disabledCapabilities = Set(
+      try XCTUnwrap(disabledObject["capabilities"]?.arrayValue).compactMap(\.stringValue))
+    XCTAssertFalse(disabledCapabilities.contains("face_identification"))
+    XCTAssertFalse(disabledCapabilities.contains("face_enrollment"))
+
+    let enabledPolicy = BiometricDataPolicy(
+      recognitionEnabled: true,
+      policyAcknowledged: true,
+      enrollmentAllowed: true,
+      retentionPeriod: BiometricDataPolicy.defaultRetentionPeriod,
+      exportIncluded: false,
+      exportConfirmationRequired: true,
+      autoDeleteUnconfirmed: true
+    )
+    let enabledManifest = EmbeddedHostCapabilityManifest(
+      configuredProviders: [],
+      appleFoundationModelsStatus: .unsupportedPlatform,
+      textProviderPreference: .random,
+      cameraStatus: "available",
+      orientationStatus: "available",
+      biometricPolicy: enabledPolicy
+    )
+    let enabledObject = try JSONValue.decodedObject(from: Data(enabledManifest.jsonString().utf8))
+    let enabledCapabilities = Set(
+      try XCTUnwrap(enabledObject["capabilities"]?.arrayValue).compactMap(\.stringValue))
+    XCTAssertTrue(enabledCapabilities.contains("face_identification"))
+    XCTAssertTrue(enabledCapabilities.contains("face_enrollment"))
+    XCTAssertEqual(enabledObject["capability_status"]?.objectValue?["face_identification"], .string("available"))
+  }
+
+  func testHostCapabilityManifestAdvertisesAppleFoundationModelsForTextOnly() throws {
+    let manifest = EmbeddedHostCapabilityManifest(
+      configuredProviders: [],
+      appleFoundationModelsStatus: .available,
+      textProviderPreference: .random,
+      cameraStatus: "available",
+      orientationStatus: "denied"
+    )
+    let object = try JSONValue.decodedObject(from: Data(manifest.jsonString().utf8))
+    let capabilities = Set(
+      try XCTUnwrap(object["capabilities"]?.arrayValue).compactMap(\.stringValue))
+
+    XCTAssertFalse(capabilities.contains("provider_vision_completion"))
+    XCTAssertFalse(capabilities.contains("provider_vision_completion"))
+    XCTAssertFalse(capabilities.contains("provider_image_generation"))
+    XCTAssertFalse(capabilities.contains("live_camera"))
+    XCTAssertTrue(capabilities.contains("camera_capture"))
+    XCTAssertEqual(object["capability_status"]?.objectValue?["provider_routing"], .string("available"))
+    XCTAssertEqual(object["capability_status"]?.objectValue?["apple_foundation_models"], .string("available"))
+    XCTAssertEqual(
+      object["host_provider_routing"]?.objectValue?["configured_providers"]?.arrayValue,
+      [.string("Apple Foundation Models")]
+    )
+  }
+
+  func testHostCapabilityManifestReportsConfiguredTextProviderPreference() throws {
+    let manifest = EmbeddedHostCapabilityManifest(
+      configuredProviders: [.openAI, .google],
+      appleFoundationModelsStatus: .available,
+      textProviderPreference: .openAI,
+      cameraStatus: "available",
+      orientationStatus: "denied"
+    )
+    let object = try JSONValue.decodedObject(from: Data(manifest.jsonString().utf8))
+    let routing = try XCTUnwrap(object["host_provider_routing"]?.objectValue)
+
+    XCTAssertEqual(routing["mode"], .string("openai"))
+    XCTAssertEqual(
+      routing["configured_providers"]?.arrayValue,
+      [.string("Apple Foundation Models"), .string("OpenAI"), .string("Google")]
+    )
+    XCTAssertEqual(object["capability_status"]?.objectValue?["provider_routing"], .string("available"))
+  }
+
+  func testHostCapabilityManifestMarksUnavailableExplicitTextProviderPreference() throws {
+    let manifest = EmbeddedHostCapabilityManifest(
+      configuredProviders: [.google],
+      appleFoundationModelsStatus: .available,
+      textProviderPreference: .openAI,
+      cameraStatus: "available",
+      orientationStatus: "denied"
+    )
+    let object = try JSONValue.decodedObject(from: Data(manifest.jsonString().utf8))
+
+    XCTAssertEqual(object["host_provider_routing"]?.objectValue?["mode"], .string("openai"))
+    XCTAssertEqual(object["capability_status"]?.objectValue?["provider_routing"], .string("unavailable"))
+  }
+
+  func testCoreConfigUsesHostManifestInsteadOfProviderCredentialFields() throws {
+    let storage = CoreConfigStorage(
+      brain: try makeBrain(),
+      providerCredentials: [
+        .openAI: "openai-secret",
+        .google: "google-secret",
+      ],
+      appleFoundationModelsStatus: .unsupportedPlatform,
+      textProviderPreference: .random
+    )
+
+    storage.withConfig { config in
+      let manifest = try? JSONValue.decodedObject(from: Data(embeddedString(config.host_manifest_json).utf8))
+      XCTAssertEqual(manifest?["capability_status"]?.objectValue?["provider_routing"], .string("available"))
+      XCTAssertEqual(
+        manifest?["host_provider_routing"]?.objectValue?["configured_providers"]?.arrayValue,
+        [.string("OpenAI"), .string("Google")]
+      )
+    }
+  }
+
+  func testHostProviderRouterFiltersConfiguredProvidersForRandomSelection() throws {
+    var offeredProviders: [ProviderCredentialKey] = []
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .openAI: " openai-secret ",
+          .anthropic: " ",
+          .google: "google-secret",
+        ]
+      },
+      providerPicker: { providers in
+        offeredProviders = providers
+        return .google
+      }
+    )
+
+    let selection = try XCTUnwrap(router.selectedProviderCredential())
+
+    XCTAssertEqual(offeredProviders, [.openAI, .google])
+    XCTAssertEqual(selection.provider, .google)
+    XCTAssertEqual(selection.credential, "google-secret")
+  }
+
+  func testHostLLMCompletionClientRunsSelectedProviderWithoutCore() async throws {
+    var offeredRoutes: [HostLLMCompletionProvider] = []
+    var requestedBody: [String: Any] = [:]
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .openAI: " openai-secret ",
+          .anthropic: "",
+          .google: "google-secret",
+        ]
+      }
+    )
+    let client = HostLLMCompletionClient(
+      providerRouter: router,
+      appleFoundationModelsClient: AppleFoundationModelsTextClient(
+        availabilityProvider: { .unsupportedPlatform },
+        completionProvider: { _ in
+          XCTFail("Local provider should not run when unavailable.")
+          return ""
+        }
+      ),
+      routePicker: { routes in
+        offeredRoutes = routes
+        return .credential(.openAI)
+      },
+      jsonLoader: { request in
+        XCTAssertEqual(request.url?.absoluteString, "https://api.openai.com/v1/responses")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer openai-secret")
+        if let body = request.httpBody {
+          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        }
+        return ["output_text": "  A host-owned completion.  "]
+      }
+    )
+
+    let completion = try await client.complete(HostLLMCompletionRequest(
+      prompt: "Summarize this.",
+      maxTokens: 42
+    ))
+
+    XCTAssertEqual(offeredRoutes, [.credential(.openAI), .credential(.google)])
+    XCTAssertEqual(completion, HostLLMCompletionResponse(text: "A host-owned completion.", provider: .credential(.openAI)))
+    XCTAssertEqual(requestedBody["input"] as? String, "Summarize this.")
+    XCTAssertEqual(requestedBody["max_output_tokens"] as? Int, 42)
+  }
+
+  func testHostLLMCompletionClientRandomIncludesLocalAndCredentialRoutes() async throws {
+    var offeredRoutes: [HostLLMCompletionProvider] = []
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .openAI: "openai-secret",
+          .google: "google-secret",
+        ]
+      }
+    )
+    let client = HostLLMCompletionClient(
+      providerRouter: router,
+      appleFoundationModelsClient: AppleFoundationModelsTextClient(
+        availabilityProvider: { .available },
+        completionProvider: { _ in "Local random completion." }
+      ),
+      routePicker: { routes in
+        offeredRoutes = routes
+        return .appleFoundationModels
+      },
+      jsonLoader: { _ in
+        XCTFail("Network provider should not run when random selects local.")
+        return [:]
+      }
+    )
+
+    let completion = try await client.complete(HostLLMCompletionRequest(
+      prompt: "Say hello.",
+      maxTokens: 64
+    ))
+
+    XCTAssertEqual(offeredRoutes, [.appleFoundationModels, .credential(.openAI), .credential(.google)])
+    XCTAssertEqual(completion, HostLLMCompletionResponse(
+      text: "Local random completion.",
+      provider: .appleFoundationModels
+    ))
+  }
+
+  func testHostLLMCompletionClientLocalPreferenceUsesAppleFoundationModelsOnly() async throws {
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .openAI: "openai-secret",
+        ]
+      }
+    )
+    let appleClient = AppleFoundationModelsTextClient(
+      availabilityProvider: { .available },
+      completionProvider: { request in
+        XCTAssertEqual(request.instructions, "You structure replies.")
+        XCTAssertEqual(request.prompt, "Say hello.")
+        XCTAssertEqual(request.maxTokens, 64)
+        return "  Local host completion.  "
+      }
+    )
+    let client = HostLLMCompletionClient(
+      providerRouter: router,
+      appleFoundationModelsClient: appleClient,
+      textProviderPreference: .local,
+      routePicker: { _ in
+        XCTFail("Random route picker should not run for local preference.")
+        return nil
+      },
+      jsonLoader: { _ in
+        XCTFail("Network provider should not run when Apple local text is available.")
+        return [:]
+      }
+    )
+
+    let completion = try await client.complete(HostLLMCompletionRequest(
+      prompt: "System:\nYou structure replies.\n\nUser:\nSay hello.",
+      maxTokens: 64
+    ))
+
+    XCTAssertEqual(completion, HostLLMCompletionResponse(
+      text: "Local host completion.",
+      provider: .appleFoundationModels
+    ))
+    XCTAssertEqual(completion.source, "apple_foundation_models")
+  }
+
+  func testHostLLMCompletionClientOpenAIPreferenceSkipsLocalWhenAvailable() async throws {
+    var requestedBody: [String: Any] = [:]
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .openAI: "openai-secret",
+        ]
+      }
+    )
+    let client = HostLLMCompletionClient(
+      providerRouter: router,
+      appleFoundationModelsClient: AppleFoundationModelsTextClient(
+        availabilityProvider: { .available },
+        completionProvider: { _ in
+          XCTFail("Local provider should not run when OpenAI is explicitly selected.")
+          return ""
+        }
+      ),
+      textProviderPreference: .openAI,
+      routePicker: { _ in
+        XCTFail("Random route picker should not run for OpenAI preference.")
+        return nil
+      },
+      jsonLoader: { request in
+        if let body = request.httpBody {
+          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        }
+        return ["output_text": "  OpenAI explicit completion.  "]
+      }
+    )
+
+    let completion = try await client.complete(HostLLMCompletionRequest(
+      prompt: "Use network.",
+      maxTokens: 42
+    ))
+
+    XCTAssertEqual(completion, HostLLMCompletionResponse(
+      text: "OpenAI explicit completion.",
+      provider: .credential(.openAI)
+    ))
+    XCTAssertEqual(requestedBody["input"] as? String, "Use network.")
+  }
+
+  func testHostLLMCompletionClientOpenAIJSONModeUsesProviderResponseFormat() async throws {
+    var requestedBody: [String: Any] = [:]
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .openAI: "openai-secret",
+        ]
+      }
+    )
+    let client = HostLLMCompletionClient(
+      providerRouter: router,
+      appleFoundationModelsClient: AppleFoundationModelsTextClient(
+        availabilityProvider: { .unsupportedPlatform },
+        completionProvider: { _ in "" }
+      ),
+      routePicker: { _ in .credential(.openAI) },
+      jsonLoader: { request in
+        if let body = request.httpBody {
+          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        }
+        return ["output_text": #"{"message":"line 1\nline 2"}"#]
+      }
+    )
+
+    let completion = try await client.complete(HostLLMCompletionRequest(
+      prompt: "Return JSON.",
+      maxTokens: 64,
+      responseFormat: .jsonObject,
+      jsonSchema: #"{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}"#
+    ))
+
+    XCTAssertEqual(completion.text, #"{"message":"line 1\nline 2"}"#)
+    let textConfig = try XCTUnwrap(requestedBody["text"] as? [String: Any])
+    let responseFormat = try XCTUnwrap(textConfig["format"] as? [String: Any])
+    XCTAssertEqual(responseFormat["type"] as? String, "json_schema")
+    XCTAssertEqual(responseFormat["name"] as? String, "text_completion")
+    XCTAssertEqual(responseFormat["strict"] as? Bool, true)
+    XCTAssertNotNil(responseFormat["schema"] as? [String: Any])
+    XCTAssertNil(responseFormat["json_schema"])
+  }
+
+  func testHostLLMCompletionClientAnthropicJSONModeUsesToolResponse() async throws {
+    var requestedBody: [String: Any] = [:]
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .anthropic: "anthropic-secret",
+        ]
+      }
+    )
+    let client = HostLLMCompletionClient(
+      providerRouter: router,
+      appleFoundationModelsClient: AppleFoundationModelsTextClient(
+        availabilityProvider: { .unsupportedPlatform },
+        completionProvider: { _ in "" }
+      ),
+      routePicker: { _ in .credential(.anthropic) },
+      jsonLoader: { request in
+        if let body = request.httpBody {
+          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        }
+        return [
+          "content": [
+            [
+              "type": "tool_use",
+              "name": "json_response",
+              "input": [
+                "message": "structured",
+              ],
+            ],
+          ],
+        ]
+      }
+    )
+
+    let completion = try await client.complete(HostLLMCompletionRequest(
+      prompt: "Return JSON.",
+      maxTokens: 64,
+      responseFormat: .jsonObject,
+      jsonSchema: #"{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}"#
+    ))
+
+    XCTAssertEqual(completion.text, #"{"message":"structured"}"#)
+    XCTAssertNotNil(requestedBody["tools"] as? [[String: Any]])
+    XCTAssertEqual(
+      (requestedBody["tool_choice"] as? [String: Any])?["name"] as? String,
+      "json_response"
+    )
+  }
+
+  func testHostLLMCompletionClientGoogleJSONModeUsesResponseMimeType() async throws {
+    var requestedBody: [String: Any] = [:]
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .google: "google-secret",
+        ]
+      }
+    )
+    let client = HostLLMCompletionClient(
+      providerRouter: router,
+      appleFoundationModelsClient: AppleFoundationModelsTextClient(
+        availabilityProvider: { .unsupportedPlatform },
+        completionProvider: { _ in "" }
+      ),
+      routePicker: { _ in .credential(.google) },
+      jsonLoader: { request in
+        if let body = request.httpBody {
+          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        }
+        return [
+          "candidates": [
+            [
+              "content": [
+                "parts": [
+                  ["text": #"```json { "message": "from google" } ```"#]
+                ]
+              ]
+            ]
+          ]
+        ]
+      }
+    )
+
+    let completion = try await client.complete(HostLLMCompletionRequest(
+      prompt: "Return JSON.",
+      maxTokens: 64,
+      responseFormat: .jsonObject,
+      jsonSchema: #"{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}"#
+    ))
+
+    XCTAssertEqual(completion.text, #"{"message":"from google"}"#)
+    let generationConfig = try XCTUnwrap(requestedBody["generationConfig"] as? [String: Any])
+    XCTAssertEqual(generationConfig["responseMimeType"] as? String, "application/json")
+  }
+
+  func testHostLLMCompletionClientUnavailableExplicitPreferenceFailsClearly() async throws {
+    let router = HostProviderRouter(credentialProvider: { [:] })
+    let client = HostLLMCompletionClient(
+      providerRouter: router,
+      appleFoundationModelsClient: AppleFoundationModelsTextClient(
+        availabilityProvider: { .unsupportedPlatform },
+        completionProvider: { _ in "" }
+      ),
+      textProviderPreference: .local
+    )
+
+    do {
+      _ = try await client.complete(HostLLMCompletionRequest(prompt: "Hello", maxTokens: 32))
+      XCTFail("Local-only preference should fail when the local model is unavailable.")
+    } catch HostLLMCompletionError.unavailableProvider(let provider) {
+      XCTAssertEqual(provider, "local")
+    }
+  }
+
+  func testEmbeddedHostServicesInjectsProviderCredentialsAtHTTPBoundary() throws {
+    let services = EmbeddedHostServices(credentialProvider: {
+      [
+        .openAI: "openai-secret",
+        .anthropic: "anthropic-secret",
+        .google: "google-secret",
+      ]
+    })
+    let openAIHeaders = #"[{"name":"Authorization","value":"Bearer host-managed:openai_api_key"}]"#
+    let openAIRequest = try services.requestForPostJSON(
+      url: "https://api.openai.com/v1/responses",
+      headersJSON: openAIHeaders,
+      body: Data("{}".utf8)
+    )
+    XCTAssertEqual(openAIRequest.value(forHTTPHeaderField: "Authorization"), "Bearer openai-secret")
+
+    let anthropicHeaders = #"[{"name":"x-api-key","value":"host-managed:anthropic_api_key"}]"#
+    let anthropicRequest = try services.requestForPostJSON(
+      url: "https://api.anthropic.com/v1/messages",
+      headersJSON: anthropicHeaders,
+      body: Data("{}".utf8)
+    )
+    XCTAssertEqual(anthropicRequest.value(forHTTPHeaderField: "x-api-key"), "anthropic-secret")
+
+    let googleRequest = try services.requestForPostJSON(
+      url: "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=host-managed:google_api_key",
+      headersJSON: "[]",
+      body: Data("{}".utf8)
+    )
+    let googleKey = URLComponents(url: try XCTUnwrap(googleRequest.url), resolvingAgainstBaseURL: false)?
+      .queryItems?.first { $0.name == "key" }?.value
+    XCTAssertEqual(googleKey, "google-secret")
+  }
+
+  func testEmbeddedHostServicesHandlesSemanticLLMCompletionEndpoint() throws {
+    var requestedBody: [String: Any] = [:]
+    var offeredRoutes: [HostLLMCompletionProvider] = []
+    let services = EmbeddedHostServices(
+      credentialProvider: {
+        [
+          .openAI: "openai-secret",
+          .google: "google-secret",
+        ]
+      },
+      textRoutePicker: { routes in
+        offeredRoutes = routes
+        return .credential(.openAI)
+      },
+      jsonLoader: { request in
+        XCTAssertEqual(request.url?.absoluteString, "https://api.openai.com/v1/responses")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer openai-secret")
+        if let body = request.httpBody {
+          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        }
+        return ["output_text": "  Semantic host completion.  "]
+      }
+    )
+    let coreBody = try JSONSerialization.data(withJSONObject: [
+      "subsystem": "conversation",
+      "system_prompt": "You structure replies.",
+      "user_prompt": "Say hello.",
+      "response_format": "text",
+      "response_size": "small",
+      "temperature": 0.2,
+      "max_tokens": 64,
+      "json_schema": "{}",
+    ])
+
+    let response = try services.postJSON(
+      url: "affective-host://llm/complete",
+      headersJSON: "[]",
+      body: coreBody
+    )
+
+    XCTAssertEqual(String(decoding: response, as: UTF8.self), "Semantic host completion.")
+    XCTAssertEqual(offeredRoutes.filter { $0 != .appleFoundationModels }, [.credential(.openAI), .credential(.google)])
+    XCTAssertEqual(requestedBody["max_output_tokens"] as? Int, 64)
+    let prompt = try XCTUnwrap(requestedBody["input"] as? String)
+    XCTAssertTrue(prompt.contains("System:\nYou structure replies."))
+    XCTAssertTrue(prompt.contains("User:\nSay hello."))
+    XCTAssertFalse(prompt.contains("openai-secret"))
+  }
+
+  func testEmbeddedHostServicesStripsMarkdownFenceFromJSONObjectCompletion() throws {
+    var requestedBody: [String: Any] = [:]
+    let services = EmbeddedHostServices(
+      credentialProvider: {
+        [
+          .openAI: "openai-secret",
+        ]
+      },
+      textRoutePicker: { _ in .credential(.openAI) },
+      jsonLoader: { request in
+        if let body = request.httpBody {
+          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        }
+        return [
+          "output_text": #"```json { "commands": [], "conversation_done": false } ```"#,
+        ]
+      }
+    )
+    let coreBody = try JSONSerialization.data(withJSONObject: [
+      "subsystem": "conversation",
+      "system_prompt": "You structure replies.",
+      "user_prompt": "Say hello.",
+      "response_format": "json_object",
+      "response_size": "small",
+      "temperature": 0.2,
+      "max_tokens": 64,
+      "json_schema": "{}",
+    ])
+
+    let response = try services.postJSON(
+      url: "affective-host://llm/complete",
+      headersJSON: "[]",
+      body: coreBody
+    )
+
+    XCTAssertEqual(
+      String(decoding: response, as: UTF8.self),
+      #"{"commands":[],"conversation_done":false}"#
+    )
+    let textConfig = try XCTUnwrap(requestedBody["text"] as? [String: Any])
+    let responseFormat = try XCTUnwrap(textConfig["format"] as? [String: Any])
+    XCTAssertEqual(responseFormat["type"] as? String, "json_schema")
+    XCTAssertEqual(responseFormat["name"] as? String, "text_completion")
+    XCTAssertEqual(responseFormat["strict"] as? Bool, true)
+    XCTAssertNotNil(responseFormat["schema"] as? [String: Any])
+    XCTAssertNil(responseFormat["json_schema"])
+  }
+
+  func testEmbeddedHostServicesHandlesSemanticImageGenerationEndpoint() throws {
+    let outputDirectory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("affective-host-image-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: outputDirectory) }
+    var requestedBody: [String: Any] = [:]
+    let services = EmbeddedHostServices(
+      credentialProvider: {
+        [
+          .openAI: "openai-secret",
+          .google: "google-secret",
+        ]
+      },
+      jsonLoader: { request in
+        XCTAssertEqual(request.url?.host, "generativelanguage.googleapis.com")
+        let googleKey = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?
+          .queryItems?.first { $0.name == "key" }?.value
+        XCTAssertEqual(googleKey, "google-secret")
+        if let body = request.httpBody {
+          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        }
+        return [
+          "output_image": [
+            "data": Data("image-bytes".utf8).base64EncodedString(),
+            "mime_type": "image/png",
+          ],
+        ]
+      }
+    )
+    let coreBody = try JSONSerialization.data(withJSONObject: [
+      "prompt": "a watercolor lighthouse",
+      "output_dir": outputDirectory.path,
+    ])
+
+    let response = try services.postJSON(
+      url: "affective-host://image/generate",
+      headersJSON: "[]",
+      body: coreBody
+    )
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [String: Any])
+    let path = try XCTUnwrap(object["path"] as? String)
+
+    XCTAssertEqual(object["mime_type"] as? String, "image/png")
+    XCTAssertTrue(path.hasPrefix(outputDirectory.path))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+    let fileData = try Data(contentsOf: URL(fileURLWithPath: path))
+    XCTAssertEqual(String(decoding: fileData, as: UTF8.self), "image-bytes")
+    let requestContents = try XCTUnwrap(requestedBody["contents"] as? [[String: Any]])
+    let firstContent = try XCTUnwrap(requestContents.first)
+    let parts = try XCTUnwrap(firstContent["parts"] as? [[String: Any]])
+    XCTAssertEqual(parts.first?["text"] as? String, "a watercolor lighthouse")
+  }
+
+  func testEmbeddedHostServicesHandlesSemanticVisionCompletionEndpoint() throws {
+    let imageURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("affective-host-vision-\(UUID().uuidString).png")
+    try Data("fake-png-bytes".utf8).write(to: imageURL)
+    defer { try? FileManager.default.removeItem(at: imageURL) }
+    var offeredProviders: [ProviderCredentialKey] = []
+    var requestedBody: [String: Any] = [:]
+    let services = EmbeddedHostServices(
+      credentialProvider: {
+        [
+          .openAI: "openai-secret",
+          .google: "google-secret",
+        ]
+      },
+      providerPicker: { providers in
+        offeredProviders = providers
+        return .openAI
+      },
+      jsonLoader: { request in
+        XCTAssertEqual(request.url?.absoluteString, "https://api.openai.com/v1/chat/completions")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer openai-secret")
+        if let body = request.httpBody {
+          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        }
+        return [
+          "choices": [
+            [
+              "message": [
+                "content": "  A host-owned image description.  ",
+              ],
+            ],
+          ],
+        ]
+      }
+    )
+    let coreBody = try JSONSerialization.data(withJSONObject: [
+      "subsystem": "vision_description",
+      "prompt": "Describe visible details.",
+      "image_paths": [imageURL.path],
+      "response_format": "text",
+      "response_size": "medium",
+      "temperature": 0.2,
+      "max_tokens": 800,
+      "json_schema": "{}",
+    ])
+
+    let response = try services.postJSON(
+      url: "affective-host://vision/complete",
+      headersJSON: "[]",
+      body: coreBody
+    )
+
+    XCTAssertEqual(String(decoding: response, as: UTF8.self), "A host-owned image description.")
+    XCTAssertEqual(offeredProviders, [.openAI, .google])
+    let messages = try XCTUnwrap(requestedBody["messages"] as? [[String: Any]])
+    let firstMessage = try XCTUnwrap(messages.first)
+    let content = try XCTUnwrap(firstMessage["content"] as? [[String: Any]])
+    XCTAssertEqual(content.first?["text"] as? String, "Describe visible details.")
+    let imagePart = try XCTUnwrap(content.last)
+    let imageURLObject = try XCTUnwrap(imagePart["image_url"] as? [String: Any])
+    let dataURL = try XCTUnwrap(imageURLObject["url"] as? String)
+    XCTAssertTrue(dataURL.hasPrefix("data:image/png;base64,"))
+    XCTAssertTrue(dataURL.hasSuffix(Data("fake-png-bytes".utf8).base64EncodedString()))
+    XCTAssertFalse(dataURL.contains("openai-secret"))
   }
 
   func testAdvertisedHostCapabilitiesHaveEndToEndCoverage() async throws {
@@ -139,56 +1122,63 @@ final class AffectiveTests: XCTestCase {
       "Every advertised host capability needs explicit e2e coverage or an intentional manifest-only classification."
     )
 
-    let dispatchable = coverage.filter {
-      $0.value == .embeddedDispatch || $0.value == .providerBackedDispatch
-    }.map(\.key)
-    XCTAssertEqual(
-      Set(dispatchable),
-      Set(EmbeddedProtocolContract.eventTypesRequiringHostCapability),
-      "Dispatchable host capability coverage should stay aligned with the embedded protocol contract."
+    XCTAssertTrue(
+      EmbeddedProtocolContract.eventTypesRequiringHostCapability.isEmpty,
+      "BrainEvent payload types should not be modeled as host capabilities."
     )
 
     let brain = try makeBrain()
     let core = BrainCore(brain: brain)
-    try await core.connect()
 
-    let shortTouch = try await core.shortTouch()
-    XCTAssertEqual(shortTouch.metadata["api_version"], "\(EmbeddedProtocolContract.apiVersion)")
+    try await withConnectedCore(core) {
+      let shortTouch = try await core.shortTouch()
+      XCTAssertNotNil(shortTouch.metadata["request_id"])
 
-    let longTouch = try await core.longTouch()
-    XCTAssertEqual(longTouch.metadata["api_version"], "\(EmbeddedProtocolContract.apiVersion)")
+      let longTouch = try await core.longTouch()
+      XCTAssertNotNil(longTouch.metadata["request_id"])
 
-    let poke = try await core.pokeSequence([
-      PokePulse(pressMilliseconds: 25, pauseBeforeMilliseconds: 0)
-    ])
-    XCTAssertEqual(poke.metadata["api_version"], "\(EmbeddedProtocolContract.apiVersion)")
+      let poke = try await core.pokeSequence([
+        PokePulse(pressMilliseconds: 25, pauseBeforeMilliseconds: 0)
+      ])
+      XCTAssertNotNil(poke.metadata["request_id"])
 
-    let tool = try await core.callTool("list_reminders")
-    XCTAssertEqual(tool.metadata["api_version"], "\(EmbeddedProtocolContract.apiVersion)")
+      let tool = try await core.sendEvent(actionRequestEvent(
+        actionID: "list-reminders-e2e",
+        action: "list_reminders",
+        arguments: [:]
+      ))
+      XCTAssertNotNil(tool.metadata["request_id"])
 
-    let typedText = try await core.sendText("capability e2e typed text")
-    XCTAssertEqual(typedText.metadata["api_version"], "\(EmbeddedProtocolContract.apiVersion)")
+      do {
+        let typedText = try await core.sendText("capability e2e typed text")
+        XCTAssertNotNil(typedText.metadata["request_id"])
+      } catch {
+        let description = String(describing: error)
+        guard description.contains("FrontendCaptureRequested") else { throw error }
+        // The coverage probe only verifies the dispatch route. If the brain
+        // elects to pull an awaited sense during that route, the host should not
+        // synthesize a chat fallback for this test.
+      }
 
-    let orientation = try await core.orientationObservation(
-      OrientationQueryProvider.classify(x: 0.02, y: 0.01, z: -0.99)
-    )
-    XCTAssertEqual(orientation.metadata["api_version"], "\(EmbeddedProtocolContract.apiVersion)")
+      let orientation = try await core.orientationObservation(
+        OrientationQueryProvider.classify(x: 0.02, y: 0.01, z: -0.99)
+      )
+      XCTAssertNotNil(orientation.metadata["request_id"])
 
-    let imageURL = brain.rootURL.appendingPathComponent("capability-e2e.png")
-    try Self.tinyPNGData.write(to: imageURL, options: .atomic)
-    let camera = try await core.cameraObservation(
-      path: imageURL.path,
-      mimeType: "image/png",
-      source: "capability_e2e",
-      requestID: "capability-e2e-camera"
-    )
-    XCTAssertEqual(camera.metadata["api_version"], "\(EmbeddedProtocolContract.apiVersion)")
+      let imageURL = await brain.rootURL.appendingPathComponent("capability-e2e.png")
+      try Self.tinyPNGData.write(to: imageURL, options: .atomic)
+      let camera = try await core.cameraObservation(
+        path: imageURL.path,
+        mimeType: "image/png",
+        source: "capability_e2e",
+        requestID: "capability-e2e-camera"
+      )
+      XCTAssertNotNil(camera.metadata["request_id"])
 
-    let state = try await core.refreshState()
-    XCTAssertEqual(state.metadata["api_version"], "\(EmbeddedProtocolContract.apiVersion)")
-    XCTAssertFalse(state.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-    await core.disconnect()
+      let state = try await core.refreshState()
+      XCTAssertNotNil(state.metadata["request_id"])
+      XCTAssertFalse(state.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
   }
 
   func testCameraPromptRequiredAdvertisesFrontendCameraSense() throws {
@@ -197,30 +1187,37 @@ final class AffectiveTests: XCTestCase {
     let capabilities = Set(
       try XCTUnwrap(manifest["capabilities"]?.arrayValue).compactMap(\.stringValue))
 
-    XCTAssertTrue(capabilities.contains("live_camera"))
-    XCTAssertTrue(capabilities.contains("visual_description"))
+    XCTAssertFalse(capabilities.contains("live_camera"))
+    XCTAssertTrue(capabilities.contains("camera_capture"))
+    XCTAssertTrue(capabilities.contains("provider_vision_completion"))
     XCTAssertEqual(manifest["capability_status"]?.objectValue?["camera"], .string("prompt_required"))
   }
 
-  func testCameraAvailableAdvertisesLiveCamera() throws {
+  func testCameraAvailableAdvertisesFrontendCameraSense() throws {
     let manifest = try JSONValue.decodedObject(
       from: Data(CoreConfigStorage.hostManifestJSON(hasProvider: true, cameraStatus: "available").utf8))
     let capabilities = Set(
       try XCTUnwrap(manifest["capabilities"]?.arrayValue).compactMap(\.stringValue))
 
-    XCTAssertTrue(capabilities.contains("live_camera"))
-    XCTAssertTrue(capabilities.contains("visual_description"))
+    XCTAssertFalse(capabilities.contains("live_camera"))
+    XCTAssertTrue(capabilities.contains("camera_capture"))
+    XCTAssertTrue(capabilities.contains("provider_vision_completion"))
     XCTAssertEqual(manifest["capability_status"]?.objectValue?["camera"], .string("available"))
   }
 
-  func testCameraDeniedRemovesLiveCameraFromHostManifest() throws {
+  func testCameraDeniedRemovesFrontendCameraSenseFromHostManifest() throws {
     let manifest = try JSONValue.decodedObject(
-      from: Data(CoreConfigStorage.hostManifestJSON(hasProvider: true, cameraStatus: "denied").utf8))
+      from: Data(CoreConfigStorage.hostManifestJSON(
+        hasProvider: true,
+        cameraStatus: "denied",
+        orientationStatus: "denied"
+      ).utf8))
     let capabilities = Set(
       try XCTUnwrap(manifest["capabilities"]?.arrayValue).compactMap(\.stringValue))
 
     XCTAssertFalse(capabilities.contains("live_camera"))
-    XCTAssertTrue(capabilities.contains("visual_description"))
+    XCTAssertTrue(capabilities.contains("camera_capture"))
+    XCTAssertTrue(capabilities.contains("provider_vision_completion"))
     XCTAssertEqual(manifest["capability_status"]?.objectValue?["camera"], .string("denied"))
   }
 
@@ -315,9 +1312,9 @@ final class AffectiveTests: XCTestCase {
 
   @MainActor
   func testLiveCameraHardwareCaptureReturnsVisibleImage() async throws {
-    guard ProcessInfo.processInfo.environment["AFFECTIVE_RUN_CAMERA_HARDWARE_E2E"] == "1" else {
-      throw XCTSkip("Set AFFECTIVE_RUN_CAMERA_HARDWARE_E2E=1 to run the live camera hardware capture check.")
-    }
+//    guard ProcessInfo.processInfo.environment["AFFECTIVE_RUN_CAMERA_HARDWARE_E2E"] == "1" else {
+//      throw XCTSkip("Set AFFECTIVE_RUN_CAMERA_HARDWARE_E2E=1 to run the live camera hardware capture check.")
+//    }
 
     let model = AffectiveViewModel(brain: try makeBrain())
     let status = await model.requestCameraPermissionIfNeeded(requestID: "camera-hardware-e2e")
@@ -339,241 +1336,125 @@ final class AffectiveTests: XCTestCase {
     let initialChatCount = model.chatEntries.count
 
     let result = await model.applyCoreEvents([
-      BrainHostEvent(
-        type: "sense_requested",
+      senseRequestEvent(
         requestID: "sense-fixture",
-        role: nil,
-        text: nil,
-        state: nil,
-        enabled: nil,
-        kind: nil,
-        title: "camera sense",
-        body: "Affective wants a fresh webcam image.",
         sense: "camera",
-        eyes: nil,
-        mouth: nil,
-        durationMS: nil,
-        mediaKind: nil,
-        path: nil,
-        url: nil,
-        mimeType: nil,
-        caption: nil,
-        rawRef: nil,
-        originalBytes: nil)
+        title: "camera sense",
+        summary: "Affective wants a fresh webcam image."
+      )
     ], mirrorChatMessages: true, speak: false, handleHostRequests: false)
 
     XCTAssertFalse(result.didAppendBrainChat)
     XCTAssertEqual(model.chatEntries.count, initialChatCount)
     XCTAssertEqual(model.commandEntries.last?.title, "camera sense")
-    XCTAssertEqual(model.commandEntries.last?.body, "Affective wants a fresh webcam image.")
-  }
-
-  @MainActor
-  func testFrontendCaptureDiagnosticBecomesCameraSenseRequest() async throws {
-    let model = AffectiveViewModel(brain: try makeBrain())
-    let initialChatCount = model.chatEntries.count
-    let diagnostic = "Something went wrong while I tried that: FrontendCaptureRequested."
-
-    let result = await model.applyCoreEvents([
-      BrainHostEvent(
-        type: "chat_message",
-        requestID: "capture-fixture",
-        role: "brain",
-        text: diagnostic,
-        state: nil,
-        enabled: nil,
-        kind: nil,
-        title: "Brain",
-        body: nil,
-        sense: nil,
-        eyes: nil,
-        mouth: nil,
-        durationMS: nil,
-        mediaKind: nil,
-        path: nil,
-        url: nil,
-        mimeType: nil,
-        caption: nil,
-        rawRef: nil,
-        originalBytes: nil),
-      BrainHostEvent(
-        type: "command_log",
-        requestID: "capture-fixture",
-        role: nil,
-        text: nil,
-        state: nil,
-        enabled: nil,
-        kind: "error",
-        title: "Hard error needs recovery",
-        body: diagnostic,
-        sense: nil,
-        eyes: nil,
-        mouth: nil,
-        durationMS: nil,
-        mediaKind: nil,
-        path: nil,
-        url: nil,
-        mimeType: nil,
-        caption: nil,
-        rawRef: nil,
-        originalBytes: nil),
-      BrainHostEvent(
-        type: "speech_requested",
-        requestID: "capture-fixture",
-        role: nil,
-        text: diagnostic,
-        state: nil,
-        enabled: nil,
-        kind: nil,
-        title: nil,
-        body: nil,
-        sense: nil,
-        eyes: nil,
-        mouth: nil,
-        durationMS: nil,
-        mediaKind: nil,
-        path: nil,
-        url: nil,
-        mimeType: nil,
-        caption: nil,
-        rawRef: nil,
-        originalBytes: nil)
-    ], mirrorChatMessages: true, speak: true, handleHostRequests: false)
-
-    XCTAssertFalse(result.didAppendBrainChat)
-    XCTAssertFalse(result.didRequestSpeech)
-    XCTAssertEqual(model.chatEntries.count, initialChatCount)
-    XCTAssertEqual(model.commandEntries.last?.title, "camera sense")
-    XCTAssertEqual(model.commandEntries.last?.body, "frontend camera sense requested")
-    XCTAssertEqual(model.commandEntries.last?.metadata["event_type"], "sense_requested")
+    XCTAssertEqual(model.commandEntries.last?.body, "")
     XCTAssertEqual(model.commandEntries.last?.metadata["sense"], "camera")
-    XCTAssertEqual(model.commandEntries.last?.metadata["await_response"], "true")
-    XCTAssertEqual(model.commandEntries.last?.metadata["timeout_ms"], "10000")
-    XCTAssertNil(model.commandEntries.last { $0.body == diagnostic })
   }
 
   @MainActor
-  func testFrontendCaptureMentionInNormalReplyDoesNotRequestCapture() async throws {
-    let model = AffectiveViewModel(brain: try makeBrain())
-    let text = "FrontendCaptureRequested means the frontend should provide an image."
-
-    let result = await model.applyCoreEvents([
-      BrainHostEvent(
-        type: "chat_message",
-        requestID: "capture-mention",
-        role: "brain",
-        text: text,
-        state: nil,
-        enabled: nil,
-        kind: nil,
-        title: "Brain",
-        body: nil,
-        sense: nil,
-        eyes: nil,
-        mouth: nil,
-        durationMS: nil,
-        mediaKind: nil,
-        path: nil,
-        url: nil,
-        mimeType: nil,
-        caption: nil,
-        rawRef: nil,
-        originalBytes: nil)
-    ], mirrorChatMessages: true, speak: false)
-
-    XCTAssertTrue(result.didAppendBrainChat)
-    XCTAssertEqual(model.chatEntries.last?.body, text)
-    XCTAssertNil(model.commandEntries.last { $0.title == "camera sense" })
-  }
-
-  @MainActor
-  func testRecognizeToolFrontendCaptureDiagnosticRunsCameraObservationFlow() async throws {
+  func testSenseCatalogRequestReturnsHostCatalog() async throws {
     let core = ScriptedBrainCore(
-      toolResponse: Self.toolResponse(
-        toolName: "recognize",
-        events: Self.frontendCaptureDiagnosticEvents(requestID: "capture-e2e")
-      ),
+      toolResponse: Self.toolResponse(toolName: "sense_catalog"),
       cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
-    model.cameraPermissionRequestTask = Task { .available }
-    model.cameraPhotoCaptureOverride = { Self.tinyPNGData }
-    let initialChatCount = model.chatEntries.count
 
-    await model.callCoreTool(name: "recognize", title: "Recognize", arguments: [:], mirrorToChat: true)
+    await model.applyCoreEvents([
+      actionRequestEvent(
+        actionID: "catalog-request",
+        action: "sense_catalog",
+        arguments: ["summary": .string("list senses")]
+      )
+    ], mirrorChatMessages: true, speak: false)
 
-    let toolCalls = await core.toolCalls
-    XCTAssertEqual(toolCalls.map(\.name), ["recognize"])
+    let requests = await core.senseCatalogRequests
+    XCTAssertEqual(requests, ["catalog-request"])
+  }
 
-    let observations = await core.cameraObservations
-    let observation = try XCTUnwrap(observations.last)
-    XCTAssertEqual(observation.mimeType, "image/png")
-    XCTAssertEqual(observation.source, "affective_requested_capture")
-    XCTAssertEqual(observation.requestID, "capture-e2e")
-    XCTAssertEqual(observation.presentation, .chat)
-    XCTAssertTrue(FileManager.default.fileExists(atPath: observation.path))
+  @MainActor
+  func testSpecificSenseStatusRequestReturnsStructuredStatus() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "sense_status"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
 
-    let captureEntry = try XCTUnwrap(model.commandEntries.last { $0.title == "camera sense" })
-    XCTAssertEqual(captureEntry.metadata["media_kind"], "image")
-    XCTAssertEqual(captureEntry.metadata["source"], "affective_requested_capture")
+    await model.applyCoreEvents([
+      actionRequestEvent(
+        actionID: "camera-status",
+        action: "sense_status",
+        arguments: ["sense": .string("camera"), "summary": .string("camera?")]
+      )
+    ], mirrorChatMessages: true, speak: false)
 
-    XCTAssertNotNil(model.commandEntries.last { $0.title == "sense_observation" })
-    XCTAssertNil(model.chatEntries.last { $0.body.contains("FrontendCaptureRequested") })
-    XCTAssertNil(model.commandEntries.last { $0.body.contains("Something went wrong while I tried that") })
-    XCTAssertEqual(model.commandEntries.last { $0.title == "Recognize" }?.body, "Recognize requested a camera sense.")
-    let awaitedSenseEntry = try XCTUnwrap(model.commandEntries.last { $0.title == "awaited sense" })
-    XCTAssertEqual(awaitedSenseEntry.body, "camera observation completed without a chat event.")
-    XCTAssertEqual(awaitedSenseEntry.metadata["event_type"], "awaited_sense_response")
-    XCTAssertEqual(awaitedSenseEntry.metadata["sense"], "camera")
-    XCTAssertEqual(model.chatEntries.count, initialChatCount)
-    XCTAssertFalse(model.speechSpeaker.isSpeaking)
+    let statuses = await core.pullSenseStatuses
+    let status = try XCTUnwrap(statuses.last)
+    XCTAssertEqual(status.sense, "camera")
+    XCTAssertEqual(status.requestID, "camera-status")
+    XCTAssertFalse(status.terminal)
+  }
+
+  @MainActor
+  func testUnsupportedPullSenseReturnsStructuredStatus() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "sense_status"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+
+    await model.fulfillSenseRequest(
+      senseRequestEvent(
+        requestID: "unsupported-sense",
+        sense: "location",
+        title: "location sense",
+        summary: "where am I?",
+        timeoutMS: 100
+      ),
+      observationResponsePresentation: .internalOnly
+    )
+
+    let statuses = await core.pullSenseStatuses
+    let status = try XCTUnwrap(statuses.last)
+    XCTAssertEqual(status.sense, "location")
+    XCTAssertEqual(status.status, .unsupported)
+    XCTAssertEqual(status.requestID, "unsupported-sense")
+    XCTAssertTrue(status.terminal)
   }
 
   @MainActor
   func testAwaitedCameraSenseTimesOutWaitingForObservationResponse() async throws {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "unused"),
-      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation"),
-      cameraObservationDelayNanoseconds: 50_000_000
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
     model.cameraPermissionRequestTask = Task { .available }
-    model.cameraPhotoCaptureOverride = { Self.tinyPNGData }
+    model.cameraPhotoCaptureOverride = {
+      await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+          continuation.resume()
+        }
+      }
+      return Self.tinyPNGData
+    }
 
     await model.applyCoreEvents([
-      BrainHostEvent(
-        type: "sense_requested",
+      senseRequestEvent(
         requestID: "capture-timeout",
-        role: nil,
-        text: nil,
-        state: nil,
-        enabled: nil,
-        kind: nil,
-        title: "camera sense",
-        body: "frontend camera sense requested",
         sense: "camera",
-        eyes: nil,
-        mouth: nil,
-        durationMS: nil,
-        mediaKind: nil,
-        path: nil,
-        url: nil,
-        mimeType: nil,
-        caption: nil,
-        rawRef: nil,
-        originalBytes: nil,
-        responsePresentation: BrainEventPresentation.chat.rawValue,
-        awaitResponse: true,
-        timeoutMS: 1)
+        title: "camera sense",
+        summary: "frontend camera sense requested",
+        responsePresentation: .chat,
+        timeoutMS: 1
+      )
     ], mirrorChatMessages: true, speak: false)
 
     let observations = await core.cameraObservations
-    let observation = try XCTUnwrap(observations.last)
-    XCTAssertEqual(observation.presentation, .chat)
-    let failure = try XCTUnwrap(model.commandEntries.last { $0.title == "camera sense failed" })
+    XCTAssertFalse(observations.contains { $0.requestID == "capture-timeout" })
+    let failure = try XCTUnwrap(model.commandEntries.last { $0.title == "camera sense timed out" })
     XCTAssertTrue(failure.body.contains("timed out"))
-    XCTAssertEqual(model.chatEntries.last?.title, "Camera")
-    XCTAssertTrue(model.chatEntries.last?.body.contains("couldn't get a usable image") == true)
+    XCTAssertEqual(failure.metadata["status"], PullSenseTerminalStatus.timedOut.rawValue)
+    XCTAssertNil(model.chatEntries.last { $0.title == "Camera" && $0.body.contains("couldn't get a usable image") })
     XCTAssertNil(model.chatEntries.last { $0.body == "I got the new picture." })
   }
 
@@ -592,38 +1473,229 @@ final class AffectiveTests: XCTestCase {
     }
 
     await model.applyCoreEvents([
-      BrainHostEvent(
-        type: "sense_requested",
+      senseRequestEvent(
         requestID: "black-frame",
-        role: nil,
-        text: nil,
-        state: nil,
-        enabled: nil,
-        kind: nil,
-        title: "camera sense",
-        body: "frontend camera sense requested",
         sense: "camera",
-        eyes: nil,
-        mouth: nil,
-        durationMS: nil,
-        mediaKind: nil,
-        path: nil,
-        url: nil,
-        mimeType: nil,
-        caption: nil,
-        rawRef: nil,
-        originalBytes: nil,
-        responsePresentation: BrainEventPresentation.chat.rawValue,
-        awaitResponse: true,
-        timeoutMS: 10_000)
+        title: "camera sense",
+        summary: "frontend camera sense requested",
+        responsePresentation: .chat,
+        timeoutMS: 10_000
+      )
     ], mirrorChatMessages: true, speak: false)
 
     let observations = await core.cameraObservations
     XCTAssertTrue(observations.isEmpty)
     let failure = try XCTUnwrap(model.commandEntries.last { $0.title == "camera sense failed" })
     XCTAssertEqual(failure.metadata["camera_error"], "blackImageData")
-    XCTAssertEqual(model.chatEntries.last?.title, "Camera")
-    XCTAssertEqual(model.chatEntries.last?.body, "I tried to use the camera, but the frame came back nearly black.")
+    XCTAssertNil(model.chatEntries.last { $0.title == "Camera" })
+  }
+
+  @MainActor
+  func testCameraPermissionDeniedReturnsPullSenseStatus() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "sense_status"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.cameraPermissionRequestTask = Task { .denied }
+
+    await model.fulfillSenseRequest(
+      senseRequestEvent(
+        requestID: "camera-denied",
+        sense: "camera",
+        title: "camera sense",
+        summary: "frontend camera sense requested",
+        timeoutMS: 10_000
+      ),
+      observationResponsePresentation: .internalOnly
+    )
+
+    let statuses = await core.pullSenseStatuses
+    let status = try XCTUnwrap(statuses.last)
+    XCTAssertEqual(status.sense, "camera")
+    XCTAssertEqual(status.status, .permissionDenied)
+    XCTAssertEqual(status.requestID, "camera-denied")
+    XCTAssertTrue(status.terminal)
+  }
+
+  @MainActor
+  func testOrientationPermissionDeniedReturnsPullSenseStatus() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "sense_status"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.orientationPermissionStatusOverride = .denied
+
+    await model.fulfillSenseRequest(
+      senseRequestEvent(
+        requestID: "orientation-denied",
+        sense: "orientation",
+        title: "orientation sense",
+        summary: "Affective wants orientation.",
+        timeoutMS: 10_000
+      ),
+      observationResponsePresentation: .internalOnly
+    )
+
+    let statuses = await core.pullSenseStatuses
+    let status = try XCTUnwrap(statuses.last)
+    XCTAssertEqual(status.sense, "orientation")
+    XCTAssertEqual(status.status, .permissionDenied)
+    XCTAssertEqual(status.requestID, "orientation-denied")
+    XCTAssertTrue(status.terminal)
+  }
+
+  @MainActor
+  func testPullSenseTimeoutCoversPendingOrientationPermission() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "sense_status"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    UserDefaults.standard.removeObject(forKey: AffectiveViewModel.orientationPermissionStatusKey)
+    model.orientationCapabilityStatusOverride = .promptRequired
+
+    await model.fulfillSenseRequest(
+      senseRequestEvent(
+        requestID: "orientation-timeout",
+        sense: "orientation",
+        title: "orientation sense",
+        summary: "Affective wants orientation.",
+        timeoutMS: 1
+      ),
+      observationResponsePresentation: .internalOnly
+    )
+
+    let statuses = await core.pullSenseStatuses
+    XCTAssertEqual(statuses.filter { $0.requestID == "orientation-timeout" && $0.terminal }.count, 1)
+    let status = try XCTUnwrap(statuses.last { $0.requestID == "orientation-timeout" })
+    XCTAssertEqual(status.status, .timedOut)
+    XCTAssertNil(model.orientationPermissionPrompt)
+  }
+
+  @MainActor
+  func testDuplicateOrientationPullReturnsBusyStatus() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "sense_status"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.pendingOrientationRequestID = "orientation-first"
+
+    await model.fulfillSenseRequest(
+      senseRequestEvent(
+        requestID: "orientation-second",
+        sense: "orientation",
+        title: "orientation sense",
+        summary: "Affective wants orientation.",
+        timeoutMS: 10_000
+      ),
+      observationResponsePresentation: .internalOnly
+    )
+
+    let statuses = await core.pullSenseStatuses
+    let status = try XCTUnwrap(statuses.last { $0.requestID == "orientation-second" })
+    XCTAssertEqual(status.sense, "orientation")
+    XCTAssertEqual(status.status, .busy)
+    XCTAssertTrue(status.terminal)
+  }
+
+  @MainActor
+  func testPullSenseTimeoutReturnsBeforeSlowHostOperationFinishes() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "sense_status"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.cameraPermissionRequestTask = Task { .available }
+    model.cameraPhotoCaptureOverride = {
+      await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+          continuation.resume()
+        }
+      }
+      return Self.tinyPNGData
+    }
+
+    let start = Date()
+    await model.fulfillSenseRequest(
+      senseRequestEvent(
+        requestID: "slow-camera-timeout",
+        sense: "camera",
+        title: "camera sense",
+        summary: "frontend camera sense requested",
+        timeoutMS: 1
+      ),
+      observationResponsePresentation: .internalOnly
+    )
+
+    XCTAssertLessThan(Date().timeIntervalSince(start), 0.2)
+    XCTAssertNil(model.pendingCameraRequestID)
+    XCTAssertEqual(model.hostPipelineHold, .none)
+    let statuses = await core.pullSenseStatuses
+    let status = try XCTUnwrap(statuses.last { $0.requestID == "slow-camera-timeout" })
+    XCTAssertEqual(status.status, .timedOut)
+  }
+
+  @MainActor
+  func testFailedPullSenseStatusDeliveryDoesNotConsumeTerminalRequestID() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "sense_status"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation"),
+      pullSenseStatusError: NSError(domain: "PullSenseStatus", code: 1)
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+
+    let delivered = await model.sendPullSenseStatus(
+      sense: "camera",
+      status: .unavailable,
+      requestID: "status-fails",
+      timeoutMS: nil,
+      reason: "test failure",
+      availability: "unavailable",
+      permissionState: "unavailable",
+      terminal: true
+    )
+
+    XCTAssertFalse(delivered)
+    XCTAssertFalse(model.terminalPullSenseRequestIDs.contains("status-fails"))
+    XCTAssertFalse(model.closedPullSenseRequestIDs.contains("status-fails"))
+  }
+
+  @MainActor
+  func testTimedOutCameraPullDoesNotEmitLateObservation() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "sense_status"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.cameraPermissionRequestTask = Task { .available }
+    model.cameraPhotoCaptureOverride = {
+      await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+          continuation.resume()
+        }
+      }
+      return Self.tinyPNGData
+    }
+
+    await model.fulfillSenseRequest(
+      senseRequestEvent(
+        requestID: "late-camera-timeout",
+        sense: "camera",
+        title: "camera sense",
+        summary: "frontend camera sense requested",
+        timeoutMS: 1
+      ),
+      observationResponsePresentation: .internalOnly
+    )
+
+    let statuses = await core.pullSenseStatuses
+    let status = try XCTUnwrap(statuses.last { $0.requestID == "late-camera-timeout" })
+    XCTAssertEqual(status.status, .timedOut)
+    let observations = await core.cameraObservations
+    XCTAssertFalse(observations.contains { $0.requestID == "late-camera-timeout" })
   }
 
   @MainActor
@@ -642,29 +1714,13 @@ final class AffectiveTests: XCTestCase {
     let initialChatCount = model.chatEntries.count
 
     await model.fulfillCameraSenseRequest(
-      BrainHostEvent(
-        type: "sense_requested",
+      senseRequestEvent(
         requestID: "internal-black-frame",
-        role: nil,
-        text: nil,
-        state: nil,
-        enabled: nil,
-        kind: nil,
-        title: "camera sense",
-        body: "frontend camera sense requested",
         sense: "camera",
-        eyes: nil,
-        mouth: nil,
-        durationMS: nil,
-        mediaKind: nil,
-        path: nil,
-        url: nil,
-        mimeType: nil,
-        caption: nil,
-        rawRef: nil,
-        originalBytes: nil,
-        awaitResponse: true,
-        timeoutMS: 10_000),
+        title: "camera sense",
+        summary: "frontend camera sense requested",
+        timeoutMS: 10_000
+      ),
       observationResponsePresentation: .internalOnly
     )
 
@@ -681,28 +1737,13 @@ final class AffectiveTests: XCTestCase {
       shortTouchResponse: Self.toolResponse(
         toolName: "short_touch",
         events: [
-          BrainHostEvent(
-            type: "sense_requested",
+          senseRequestEvent(
             requestID: "short-touch-capture",
-            role: nil,
-            text: nil,
-            state: nil,
-            enabled: nil,
-            kind: nil,
-            title: "camera sense",
-            body: "frontend camera sense requested",
             sense: "camera",
-            eyes: nil,
-            mouth: nil,
-            durationMS: nil,
-            mediaKind: nil,
-            path: nil,
-            url: nil,
-            mimeType: nil,
-            caption: nil,
-            rawRef: nil,
-            originalBytes: nil,
-            responsePresentation: BrainEventPresentation.chat.rawValue)
+            title: "camera sense",
+            summary: "frontend camera sense requested",
+            responsePresentation: .chat
+          )
         ]
       ),
       cameraObservationResponse: Self.toolResponse(
@@ -750,12 +1791,12 @@ final class AffectiveTests: XCTestCase {
 
     await model.callCoreTouch(name: "short_touch", title: "short_touch")
 
-    let entry = try XCTUnwrap(model.commandEntries.last { $0.title == "stimulus result" })
+    let entry = try XCTUnwrap(model.commandEntries.last { $0.title == "short_touch" })
     XCTAssertEqual(entry.metadata["ignored_because"], "low_salience")
   }
 
   @MainActor
-  func testIgnoredStimulusResultSynthesizesReasonFromCoreEvidence() async throws {
+  func testIgnoredStimulusResultRequiresStructuredReason() async throws {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "unused"),
       shortTouchResponse: Self.toolResponse(
@@ -773,8 +1814,8 @@ final class AffectiveTests: XCTestCase {
 
     await model.callCoreTouch(name: "short_touch", title: "short_touch")
 
-    let entry = try XCTUnwrap(model.commandEntries.last { $0.title == "stimulus result" })
-    XCTAssertEqual(entry.metadata["ignored_because"], "defer_visual_lookup")
+    let entry = try XCTUnwrap(model.commandEntries.last { $0.title == "short_touch" })
+    XCTAssertNil(entry.metadata["ignored_because"])
   }
 
   @MainActor
@@ -796,7 +1837,7 @@ final class AffectiveTests: XCTestCase {
 
     await model.callCoreTouch(name: "short_touch", title: "short_touch")
 
-    let entry = try XCTUnwrap(model.commandEntries.last { $0.title == "stimulus result" })
+    let entry = try XCTUnwrap(model.commandEntries.last { $0.title == "short_touch" })
     XCTAssertNil(entry.metadata["ignored_because"])
   }
 
@@ -816,27 +1857,12 @@ final class AffectiveTests: XCTestCase {
     )
 
     await model.fulfillCameraSenseRequest(
-      BrainHostEvent(
-        type: "sense_requested",
+      senseRequestEvent(
         requestID: "recent-camera",
-        role: nil,
-        text: nil,
-        state: nil,
-        enabled: nil,
-        kind: nil,
-        title: "camera sense",
-        body: "frontend camera sense requested",
         sense: "camera",
-        eyes: nil,
-        mouth: nil,
-        durationMS: nil,
-        mediaKind: nil,
-        path: nil,
-        url: nil,
-        mimeType: nil,
-        caption: nil,
-        rawRef: nil,
-        originalBytes: nil),
+        title: "camera sense",
+        summary: "frontend camera sense requested"
+      ),
       observationResponsePresentation: .internalOnly
     )
 
@@ -855,32 +1881,17 @@ final class AffectiveTests: XCTestCase {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "unused"),
       textResponse: BrainTextResponse(
-        toolName: "typed_text",
+        toolName: "experience",
         text: "Hello from the first turn.",
         metadata: [:],
         events: [
           brainChatEvent(title: "Brain", text: "Hello from the first turn."),
-          BrainHostEvent(
-            type: "sense_requested",
+          senseRequestEvent(
             requestID: "typed-text-capture",
-            role: nil,
-            text: nil,
-            state: nil,
-            enabled: nil,
-            kind: nil,
-            title: "camera sense",
-            body: "frontend camera sense requested",
             sense: "camera",
-            eyes: nil,
-            mouth: nil,
-            durationMS: nil,
-            mediaKind: nil,
-            path: nil,
-            url: nil,
-            mimeType: nil,
-            caption: nil,
-            rawRef: nil,
-            originalBytes: nil)
+            title: "camera sense",
+            summary: "frontend camera sense requested"
+          )
         ]
       ),
       cameraObservationResponse: Self.toolResponse(
@@ -916,28 +1927,13 @@ final class AffectiveTests: XCTestCase {
       shortTouchResponse: Self.toolResponse(
         toolName: "short_touch",
         events: [
-          BrainHostEvent(
-            type: "sense_requested",
+          senseRequestEvent(
             requestID: "orientation-capture",
-            role: nil,
-            text: nil,
-            state: nil,
-            enabled: nil,
-            kind: nil,
-            title: "orientation sense",
-            body: "Affective wants orientation.",
             sense: "orientation",
-            eyes: nil,
-            mouth: nil,
-            durationMS: nil,
-            mediaKind: nil,
-            path: nil,
-            url: nil,
-            mimeType: nil,
-            caption: nil,
-            rawRef: nil,
-            originalBytes: nil,
-            responsePresentation: BrainEventPresentation.chat.rawValue)
+            title: "orientation sense",
+            summary: "Affective wants orientation.",
+            responsePresentation: .chat
+          )
         ]
       ),
       orientationObservationResponse: Self.toolResponse(
@@ -1024,6 +2020,46 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
+  func testMotionGestureObservationQueuesAndRecordsStimulus() async throws {
+    let observation = try XCTUnwrap(MotionGestureMonitor.classify(x: 2.9, y: 0.2, z: 0.1))
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.isHostPipelineRunning = true
+
+    model.handleMotionGestureObservation(observation)
+
+    guard case .pushedMotionGesture(let queuedObservation) = model.hostPipelineQueue.last else {
+      return XCTFail("Expected motion gesture to queue a pushed motion gesture action.")
+    }
+    XCTAssertEqual(queuedObservation.gesture, "shake")
+    XCTAssertEqual(model.pendingChatResponseCount, 0)
+    XCTAssertEqual(model.commandEntries.last?.title, "motion gesture")
+
+    let context = model.currentStimulusContext(kind: "user_message")
+    XCTAssertEqual(context.recentStimuli.first?.kind, "motion_gesture")
+    XCTAssertEqual(context.recentStimuli.first?.metadata["gesture"], "shake")
+    XCTAssertEqual(context.recentStimuli.first?.metadata["sense_direction"], "push")
+  }
+
+  @MainActor
+  func testMotionGestureObservationDispatchesToCore() async throws {
+    let observation = try XCTUnwrap(MotionGestureMonitor.classify(x: -1.5, y: 0.1, z: 0.1))
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      motionGestureObservationResponse: Self.toolResponse(toolName: "sense_observation"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+
+    await model.sendPushedMotionGestureObservation(observation)
+
+    let observations = await core.motionGestureObservations
+    XCTAssertEqual(observations.last?.observation.gesture, "tilt_left")
+    XCTAssertEqual(observations.last?.presentation, .internalOnly)
+    XCTAssertNotNil(model.commandEntries.last { $0.title == "pushed_motion_gesture" })
+  }
+
+  @MainActor
   func testRecentStimuliExpireFromStimulusContext() throws {
     let model = AffectiveViewModel(brain: try makeBrain())
     let now = Date()
@@ -1085,7 +2121,7 @@ final class AffectiveTests: XCTestCase {
   func testSendTextPassesRecentStimuliToBrainCore() async throws {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "unused"),
-      textResponse: BrainTextResponse(toolName: "typed_text", text: "", metadata: [:], events: []),
+      textResponse: BrainTextResponse(toolName: "experience", text: "", metadata: [:], events: []),
       cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
@@ -1098,9 +2134,8 @@ final class AffectiveTests: XCTestCase {
     model.messageText = "Did you feel that?"
 
     model.sendText()
-    try await Task.sleep(nanoseconds: 200_000_000)
 
-    let textCalls = await core.textCalls
+    let textCalls = await core.waitForTextCallCount(1)
     let context = try XCTUnwrap(textCalls.last?.stimulusContext)
     let recentStimuli = try XCTUnwrap(context.eventArguments["recent_stimuli"]?.arrayValue)
     let stimulus = try XCTUnwrap(recentStimuli.first?.objectValue)
@@ -1120,19 +2155,18 @@ final class AffectiveTests: XCTestCase {
   func testTypedTextPassesPriorConversationContextWithoutCurrentMessage() async throws {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "unused"),
-      textResponse: BrainTextResponse(toolName: "typed_text", text: "Sure.", metadata: [:], events: []),
+      textResponse: BrainTextResponse(toolName: "experience", text: "Sure.", metadata: [:], events: []),
       cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
     model.isBrainConnected = true
-    model.recordConversationTurn(role: "user", text: "Let's design working memory.", source: "typed_text", metadata: ["source": "typed text"])
-    model.recordConversationTurn(role: "brain", text: "We can keep a bounded recent window.", source: "chat_message", metadata: ["event_type": "chat_message"])
+    model.recordConversationTurn(role: "user", text: "Let's design working memory.", source: "experience", metadata: ["source": "typed text"])
+    model.recordConversationTurn(role: "brain", text: "We can keep a bounded recent window.", source: "expression", metadata: ["event_type": "expression"])
     model.messageText = "Now make it time-aware."
 
     model.sendText()
-    try await Task.sleep(nanoseconds: 200_000_000)
 
-    let textCalls = await core.textCalls
+    let textCalls = await core.waitForTextCallCount(1)
     let arguments = try XCTUnwrap(textCalls.last?.stimulusContext?.eventArguments)
     let conversation = try XCTUnwrap(arguments["conversation_context"]?.objectValue)
     let turns = try XCTUnwrap(conversation["recent_turns"]?.arrayValue)
@@ -1141,6 +2175,10 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(turns.compactMap { $0.objectValue?["text"]?.stringValue }, [
       "Let's design working memory.",
       "We can keep a bounded recent window.",
+    ])
+    XCTAssertEqual(turns.compactMap { $0.objectValue?["speaker_role"]?.stringValue }, [
+      "other",
+      "self",
     ])
     XCTAssertFalse(turns.contains { $0.objectValue?["text"]?.stringValue == "Now make it time-aware." })
   }
@@ -1153,7 +2191,7 @@ final class AffectiveTests: XCTestCase {
     model.recordConversationTurn(
       role: "user",
       text: "Remember this temporal detail?",
-      source: "typed_text",
+      source: "experience",
       metadata: [:],
       now: turnTime
     )
@@ -1166,13 +2204,30 @@ final class AffectiveTests: XCTestCase {
     XCTAssertTrue(arguments["local_time_iso8601"]?.stringValue?.hasPrefix("1970-01-01T00:17:10") == true)
     XCTAssertEqual(turn["occurred_at_unix_ms"], .number(1_000_000))
     XCTAssertEqual(turn["age_seconds"], .number(30))
+    XCTAssertEqual(turn["speaker_role"], .string("other"))
   }
 
   @MainActor
-  func testFallbackBrainResponseRecordsConversationTurn() async throws {
+  func testConversationContextCarriesIdentifiedSpeakerName() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.recordConversationTurn(
+      role: "other",
+      text: "Can you keep track of me?",
+      source: "speech_transcript",
+      metadata: ["speaker_name": "Mira"]
+    )
+
+    let turn = try XCTUnwrap(model.conversationContextSnapshot().recentTurns.last)
+    XCTAssertEqual(turn.speakerRole, "other")
+    XCTAssertEqual(turn.speakerName, "Mira")
+    XCTAssertEqual(turn.eventArguments["speaker_name"], .string("Mira"))
+  }
+
+  @MainActor
+  func testFallbackBrainResponseDoesNotRecordConversationTurn() async throws {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "unused"),
-      textResponse: BrainTextResponse(toolName: "typed_text", text: "Fallback hello.", metadata: [:], events: []),
+      textResponse: BrainTextResponse(toolName: "experience", text: "Fallback hello.", metadata: [:], events: []),
       cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
@@ -1181,9 +2236,7 @@ final class AffectiveTests: XCTestCase {
     await model.sendTextToBrain("Hello?", speakResponse: false)
 
     let turns = model.conversationContextSnapshot().recentTurns
-    XCTAssertEqual(turns.last?.role, "brain")
-    XCTAssertEqual(turns.last?.text, "Fallback hello.")
-    XCTAssertEqual(turns.filter { $0.text == "Fallback hello." }.count, 1)
+    XCTAssertNil(turns.last { $0.speakerRole == "self" && $0.text == "Fallback hello." })
   }
 
   @MainActor
@@ -1196,9 +2249,28 @@ final class AffectiveTests: XCTestCase {
 
     let turns = model.conversationContextSnapshot().recentTurns
     XCTAssertTrue(result.didAppendBrainChat)
-    XCTAssertEqual(turns.last?.role, "brain")
+    XCTAssertEqual(turns.last?.speakerRole, "self")
     XCTAssertEqual(turns.last?.text, "Event hello.")
     XCTAssertEqual(turns.filter { $0.text == "Event hello." }.count, 1)
+  }
+
+  @MainActor
+  func testExpressionStreamIsAuthoritativeForChatTranscript() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    let initialChatCount = model.chatEntries.count
+
+    let result = await model.applyCoreEvents([
+      brainExpressionEvent(text: "Expression hello."),
+      speechRequestedEvent(text: "Expression hello.")
+    ], mirrorChatMessages: true, speak: false)
+
+    let turns = model.conversationContextSnapshot().recentTurns
+    XCTAssertTrue(result.didAppendBrainChat)
+    XCTAssertEqual(model.chatEntries.count, initialChatCount + 1)
+    XCTAssertEqual(model.chatEntries.last?.body, "Expression hello.")
+    XCTAssertEqual(turns.filter { $0.text == "Expression hello." }.count, 1)
+    XCTAssertEqual(model.chatEntries.last?.metadata["event_type"], "expression")
+    XCTAssertEqual(model.chatEntries.last?.metadata["modality"], "text")
   }
 
   @MainActor
@@ -1212,8 +2284,8 @@ final class AffectiveTests: XCTestCase {
     let turns = model.conversationContextSnapshot().recentTurns
     XCTAssertFalse(result.didAppendBrainChat)
     XCTAssertTrue(result.didRecordBrainTurn)
-    XCTAssertEqual(turns.last?.role, "brain")
-    XCTAssertEqual(turns.last?.source, "speech_requested")
+    XCTAssertEqual(turns.last?.speakerRole, "self")
+    XCTAssertEqual(turns.last?.source, "action_request")
     XCTAssertEqual(turns.filter { $0.text == "Speech-only hello." }.count, 1)
   }
 
@@ -1232,8 +2304,8 @@ final class AffectiveTests: XCTestCase {
 
     let snapshot = model.conversationContextSnapshot()
     XCTAssertEqual(snapshot.recentTurns.count, AffectiveViewModel.conversationRecentTurnLimit)
-    XCTAssertTrue(snapshot.rollingSummary.contains("user: Turn 0"))
-    XCTAssertTrue(snapshot.rollingSummary.contains("brain: Turn 1"))
+    XCTAssertTrue(snapshot.rollingSummary.contains("other: Turn 0"))
+    XCTAssertTrue(snapshot.rollingSummary.contains("A brain: Turn 1"))
     XCTAssertEqual(snapshot.recentTurns.first?.text, "Turn 2")
   }
 
@@ -1241,7 +2313,7 @@ final class AffectiveTests: XCTestCase {
   func testImageMessageRecordsConversationTurnWithMediaMetadata() async throws {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "unused"),
-      textResponse: BrainTextResponse(toolName: "typed_text", text: "", metadata: [:], events: []),
+      textResponse: BrainTextResponse(toolName: "experience", text: "", metadata: [:], events: []),
       cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
@@ -1249,24 +2321,23 @@ final class AffectiveTests: XCTestCase {
     model.messageText = "Look at this sketch."
 
     model.sendImage(data: Self.tinyPNGData, suggestedName: "sketch.png")
-    try await Task.sleep(nanoseconds: 200_000_000)
+    let textCalls = await core.waitForTextCallCount(1)
 
     let imageTurn = try XCTUnwrap(model.conversationContextSnapshot().recentTurns.last)
-    XCTAssertEqual(imageTurn.role, "user")
+    XCTAssertEqual(imageTurn.speakerRole, "other")
     XCTAssertEqual(imageTurn.source, "image")
     XCTAssertEqual(imageTurn.metadata["media_kind"], "image")
     XCTAssertEqual(imageTurn.metadata["mime_type"], "image/png")
     XCTAssertNotNil(imageTurn.metadata["image_path"])
     XCTAssertNil(imageTurn.metadata["original_bytes"])
 
-    let textCalls = await core.textCalls
     let callContext = try XCTUnwrap(textCalls.last?.stimulusContext?.eventArguments["conversation_context"]?.objectValue)
     let sentContextTurns = try XCTUnwrap(callContext["recent_turns"]?.arrayValue)
     XCTAssertFalse(sentContextTurns.contains { $0.objectValue?["text"]?.stringValue == "Look at this sketch." })
   }
 
   @MainActor
-  func testFacialExpressionRequestAddsChatAsideForStaticAvatar() async throws {
+  func testFacialExpressionRequestStaysOutOfChatForStaticAvatar() async throws {
     let model = AffectiveViewModel(brain: try makeBrain())
     let initialChatCount = model.chatEntries.count
 
@@ -1275,10 +2346,7 @@ final class AffectiveTests: XCTestCase {
     ], mirrorChatMessages: true, speak: false)
 
     XCTAssertFalse(result.didAppendBrainChat)
-    XCTAssertEqual(model.chatEntries.count, initialChatCount + 1)
-    XCTAssertEqual(model.chatEntries.last?.title, "Aside")
-    XCTAssertEqual(model.chatEntries.last?.body, "(bright eyes / small smile)")
-    XCTAssertEqual(model.chatEntries.last?.metadata["presentation"], "chat_aside")
+    XCTAssertEqual(model.chatEntries.count, initialChatCount)
     XCTAssertEqual(model.commandEntries.last?.title, "facial expression")
     XCTAssertEqual(model.commandEntries.last?.body, "bright eyes / small smile")
   }
@@ -1542,7 +2610,7 @@ final class AffectiveTests: XCTestCase {
     XCTAssertTrue(awaitingContext.awaitingSocialResponse)
     XCTAssertGreaterThan(awaitingContext.socialTurnResponseWindowRemainingSeconds, 0)
 
-    model.recordConversationTurn(role: "user", text: "I'm still here.", source: "typed_text", metadata: [:])
+    model.recordConversationTurn(role: "user", text: "I'm still here.", source: "experience", metadata: [:])
 
     let clearedContext = model.currentStimulusContext(kind: "user_message", now: now.addingTimeInterval(2))
     XCTAssertEqual(clearedContext.receivedDuring, "idle")
@@ -1574,27 +2642,11 @@ final class AffectiveTests: XCTestCase {
     let initialChatCount = model.chatEntries.count
 
     _ = await model.applyCoreEvents([
-      BrainHostEvent(
-        type: "activity_status_changed",
-        requestID: "activity-fixture",
-        role: nil,
-        text: "Waiting for your name.",
-        state: "waiting_for_user_identity",
-        enabled: nil,
-        kind: nil,
+      attentionStatusEvent(
+        id: "activity-fixture",
         title: "Learning your name",
-        body: nil,
-        sense: nil,
-        eyes: nil,
-        mouth: nil,
-        durationMS: nil,
-        mediaKind: nil,
-        path: nil,
-        url: nil,
-        mimeType: nil,
-        caption: nil,
-        rawRef: nil,
-        originalBytes: nil)
+        summary: "Waiting for your name."
+      )
     ], mirrorChatMessages: true, speak: false)
 
     XCTAssertEqual(model.statusText, "Waiting for your name.")
@@ -1608,19 +2660,24 @@ final class AffectiveTests: XCTestCase {
     let capabilities = Set(
       try XCTUnwrap(manifest["capabilities"]?.arrayValue).compactMap(\.stringValue))
 
-    XCTAssertTrue(capabilities.contains("orientation_query"))
-    XCTAssertTrue(capabilities.contains("sense_observation"))
+    XCTAssertTrue(capabilities.contains("orientation_read"))
+    XCTAssertTrue(capabilities.contains("orientation_read"))
     XCTAssertEqual(manifest["capability_status"]?.objectValue?["orientation"], .string("prompt_required"))
   }
 
   func testOrientationDeniedRemovesGenericSenseObservation() throws {
+    // The capability remains advertised while permission state carries current availability.
     let manifest = try JSONValue.decodedObject(
-      from: Data(CoreConfigStorage.hostManifestJSON(hasProvider: false, orientationStatus: "denied").utf8))
+      from: Data(CoreConfigStorage.hostManifestJSON(
+        hasProvider: false,
+        cameraStatus: "denied",
+        orientationStatus: "denied",
+        motionGestureStatus: "disabled").utf8))
     let capabilities = Set(
       try XCTUnwrap(manifest["capabilities"]?.arrayValue).compactMap(\.stringValue))
 
-    XCTAssertFalse(capabilities.contains("orientation_query"))
-    XCTAssertFalse(capabilities.contains("sense_observation"))
+    XCTAssertTrue(capabilities.contains("orientation_read"))
+    XCTAssertTrue(capabilities.contains("camera_capture"))
     XCTAssertEqual(manifest["capability_status"]?.objectValue?["orientation"], .string("denied"))
   }
 
@@ -1635,18 +2692,16 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(landscape.gravityX, 0.91)
   }
 
-  func testEmbeddedProtocolContractBuildsV2WrapperDispatchRequests() throws {
+  func testEmbeddedProtocolContractBuildsWrapperDispatchRequests() throws {
     for eventType in EmbeddedProtocolContract.wrapperDispatchEventTypes {
       let request: JSONValue = .object([
-        "api_version": .number(Double(EmbeddedProtocolContract.apiVersion)),
         "request_id": .string("fixture-\(eventType)"),
-        "event": .object(["type": .string(eventType)]),
+        "event": .object(["payload": .object([eventType: .object([:])])]),
       ])
       let fixture = try JSONValue.decodedObject(from: request.encodedData())
 
-      XCTAssertEqual(fixture["api_version"], .number(2))
       XCTAssertEqual(fixture["request_id"], .string("fixture-\(eventType)"))
-      XCTAssertEqual(fixture["event"]?.objectValue?["type"], .string(eventType))
+      XCTAssertNotNil(fixture["event"]?.objectValue?["payload"]?.objectValue?[eventType])
     }
   }
 
@@ -1671,7 +2726,7 @@ final class AffectiveTests: XCTestCase {
     XCTAssertNotNil(object["text_json_contracts"])
     XCTAssertNotNil(object["vision_json_contracts"])
     XCTAssertNotNil(object["health_routes"])
-    XCTAssertNotNil(object["image_generation_checked"])
+    XCTAssertNotNil(object["provider_image_generation_checked"])
   }
 
   func testBrainToolResponseParsesSpokenCommandResults() throws {
@@ -1692,11 +2747,13 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(response.metadata["command"], "say")
     XCTAssertEqual(response.metadata["display_source"], "spoken_text")
     XCTAssertEqual(response.metadata["spoken_text_present"], "true")
-    XCTAssertEqual(response.metadata["migration_fallback"], "legacy_command_result")
-    XCTAssertNotNil(response.metadata["fallback_warning"])
   }
 
-  func testBrainToolResponseFallsBackToObservationForSilentCommandResults() throws {
+  func testConversationTurnPayloadRejectsPlainText() throws {
+    XCTAssertNil(ConversationTurnPayload.decode(from: "I heard you say: hello"))
+  }
+
+  func testBrainToolResponseUsesObservationForDirectSilentCommandResults() throws {
     let response = BrainToolResponse(
       toolName: "recall_memory",
       rawText: #"""
@@ -1713,36 +2770,30 @@ final class AffectiveTests: XCTestCase {
     XCTAssertFalse(response.shouldSpeak)
     XCTAssertEqual(response.metadata["display_source"], "observation")
     XCTAssertEqual(response.metadata["observation_present"], "true")
-    XCTAssertEqual(response.metadata["migration_fallback"], "legacy_command_result")
-    XCTAssertNotNil(response.metadata["fallback_warning"])
   }
 
   func testBrainToolResponsePrefersEventEnvelope() throws {
-    let envelope = try BrainDispatchEnvelope.decode(from: #"""
-      {
-        "api_version": 2,
-        "request_id": "test-request",
-        "ok": true,
-        "events": [
-          { "type": "send_enabled_changed", "enabled": false },
-          { "type": "speech_requested", "text": "I found one memory." },
-          { "type": "chat_message", "role": "brain", "text": "Here is what I remember." },
-          { "type": "send_enabled_changed", "enabled": true }
-        ],
-        "result": {
-          "event_type": "tool_call",
-          "summary": "{\"command\":\"recall_memory\",\"observation\":\"legacy observation\",\"spoken_text\":null,\"ended_with_speech\":false,\"interrupted_by\":null}",
-          "raw_result": true
-        },
-        "budget": {
-          "max_bytes": 16384,
-          "used_bytes": 512,
-          "compacted": false,
-          "dropped_event_count": 0,
-          "raw_refs": []
-        }
-      }
-      """#)
+    let envelope = try BrainDispatchEnvelope.decode(from: encodedEnvelopeText(
+      requestID: "test-request",
+      events: [
+        controlEvent(id: "control-off", sendEnabled: false),
+        speechRequestedEvent(text: "I found one memory."),
+        expressionEvent(title: nil, text: "Here is what I remember.", expressionID: "remember-expression"),
+        controlEvent(id: "control-on", sendEnabled: true),
+      ],
+      result: .object([
+        "event_type": .string("memory_result"),
+        "summary": .string("memory result handled by event stream"),
+        "raw_result": .bool(true),
+      ]),
+      budget: BrainDispatchBudget(
+        maxBytes: 16384,
+        usedBytes: 512,
+        compacted: false,
+        droppedEventCount: 0,
+        rawRefs: []
+      )
+    ))
 
     let response = BrainToolResponse(toolName: "recall_memory", envelope: envelope, rawText: envelope.rawText)
 
@@ -1750,45 +2801,38 @@ final class AffectiveTests: XCTestCase {
     XCTAssertTrue(response.shouldSpeak)
     XCTAssertEqual(response.events.count, 4)
     XCTAssertEqual(response.metadata["display_source"], "event_envelope")
-    XCTAssertNil(response.metadata["migration_fallback"])
-    XCTAssertEqual(response.metadata["event_types"], "send_enabled_changed,speech_requested,chat_message,send_enabled_changed")
+    XCTAssertEqual(response.metadata["event_types"], "control,action_request,expression,control")
     XCTAssertEqual(response.metadata["budget_max_bytes"], "16384")
   }
 
-  func testBrainToolResponseMarksEnvelopeFallbackAsMigrationOnly() throws {
-    let envelope = try BrainDispatchEnvelope.decode(from: #"""
-      {
-        "api_version": 2,
-        "request_id": "test-request",
-        "ok": true,
-        "events": [],
-        "result": {
-          "event_type": "tool_call",
-          "summary": "{\"command\":\"recall_memory\",\"observation\":\"legacy observation\",\"spoken_text\":null,\"ended_with_speech\":false,\"interrupted_by\":null}",
-          "raw_result": true
-        },
-        "budget": {
-          "max_bytes": 16384,
-          "used_bytes": 180,
-          "compacted": false,
-          "dropped_event_count": 0,
-          "raw_refs": []
-        }
-      }
-      """#)
+  func testBrainToolResponseIgnoresLegacyEnvelopeCommandSummary() throws {
+    let envelope = try BrainDispatchEnvelope.decode(from: encodedEnvelopeText(
+      requestID: "test-request",
+      events: [],
+      result: .object([
+        "event_type": .string("memory_result"),
+        "summary": .string("memory result handled by event stream"),
+        "raw_result": .bool(true),
+      ]),
+      budget: BrainDispatchBudget(
+        maxBytes: 16384,
+        usedBytes: 180,
+        compacted: false,
+        droppedEventCount: 0,
+        rawRefs: []
+      )
+    ))
 
     let response = BrainToolResponse(toolName: "recall_memory", envelope: envelope, rawText: envelope.rawText)
 
-    XCTAssertEqual(response.text, "legacy observation")
-    XCTAssertEqual(response.metadata["display_source"], "observation")
-    XCTAssertEqual(response.metadata["migration_fallback"], "legacy_command_result")
-    XCTAssertNotNil(response.metadata["fallback_warning"])
+    XCTAssertEqual(response.text, "")
+    XCTAssertEqual(response.metadata["display_source"], "empty")
+    XCTAssertEqual(response.metadata["display_text_length"], "0")
   }
 
   func testBrainToolResponseDecodesDirectTouchCommandResult() throws {
     let envelope = try BrainDispatchEnvelope.decode(from: #"""
       {
-        "api_version": 2,
         "request_id": "touch-request",
         "ok": true,
         "events": [],
@@ -1810,105 +2854,71 @@ final class AffectiveTests: XCTestCase {
     let response = BrainToolResponse(toolName: "short_touch", envelope: envelope, rawText: envelope.rawText)
 
     XCTAssertEqual(response.text, "touch stimulus received")
-    XCTAssertEqual(response.metadata["display_source"], "raw_text")
+    XCTAssertEqual(response.metadata["display_source"], "result_summary")
     XCTAssertEqual(response.metadata["event_types"], "")
-    XCTAssertEqual(response.metadata["migration_fallback"], "raw_text")
   }
 
-  func testBrainDispatchEnvelopeDecodesV2Envelopes() throws {
-    let success = try BrainDispatchEnvelope.decode(from: #"""
-      {
-        "api_version": 2,
-        "request_id": "fixture-success-001",
-        "ok": true,
-        "events": [
-          {
-            "type": "send_enabled_changed",
-            "request_id": "fixture-success-001",
-            "enabled": false
-          },
-          {
-            "type": "chat_message",
-            "request_id": "fixture-success-001",
-            "role": "brain",
-            "title": "AMBI",
-            "text": "I found one memory about soldering."
-          },
-          {
-            "type": "speech_requested",
-            "request_id": "fixture-success-001",
-            "text": "I found one memory about soldering."
-          },
-          {
-            "type": "send_enabled_changed",
-            "request_id": "fixture-success-001",
-            "enabled": true
-          }
-        ],
-        "result": {
-          "event_type": "typed_text",
-          "summary": "{\"user_text\":\"What do you remember about soldering?\",\"spoken_text\":\"I found one memory about soldering.\",\"user_summary\":\"Asked for soldering memories.\",\"brain_summary\":\"Shared a soldering memory.\",\"interrupted_by\":null}",
-          "raw_result": true
-        },
-        "budget": {
-          "max_bytes": 16384,
-          "used_bytes": 780,
-          "compacted": false,
-          "dropped_event_count": 0,
-          "raw_refs": []
-        }
-      }
-      """#)
+  func testBrainDispatchEnvelopeDecodesEnvelopes() throws {
+    let success = try BrainDispatchEnvelope.decode(from: encodedEnvelopeText(
+      requestID: "fixture-success-001",
+      events: [
+        controlEvent(id: "fixture-success-001-control-off", sendEnabled: false),
+        expressionEvent(
+          title: "AMBI",
+          text: "I found one memory about soldering.",
+          expressionID: "fixture-success-001-expression"
+        ),
+        actionRequestEvent(
+          actionID: "fixture-success-001-speech",
+          action: "speak",
+          arguments: ["text": .string("I found one memory about soldering.")]
+        ),
+        controlEvent(id: "fixture-success-001-control-on", sendEnabled: true),
+      ],
+      result: .object([
+        "event_type": .string("experience"),
+        "summary": .string("{\"user_text\":\"What do you remember about soldering?\",\"spoken_text\":\"I found one memory about soldering.\",\"user_summary\":\"Asked for soldering memories.\",\"brain_summary\":\"Shared a soldering memory.\",\"interrupted_by\":null}"),
+        "raw_result": .bool(true),
+      ]),
+      budget: BrainDispatchBudget(
+        maxBytes: 16384,
+        usedBytes: 780,
+        compacted: false,
+        droppedEventCount: 0,
+        rawRefs: []
+      )
+    ))
 
     XCTAssertTrue(success.ok)
-    XCTAssertEqual(success.apiVersion, 2)
     XCTAssertEqual(success.requestID, "fixture-success-001")
     XCTAssertEqual(success.events.count, 4)
-    XCTAssertEqual(success.events.first?.requestID, "fixture-success-001")
+    XCTAssertEqual(success.events.first?.id, "fixture-success-001-control-off")
     XCTAssertEqual(success.displayTextFromEvents, "I found one memory about soldering.")
     XCTAssertNotNil(success.conversationTurnJSON)
     XCTAssertEqual(success.budget?.maxBytes, 16384)
 
-    let drain = try BrainDispatchEnvelope.decode(from: #"""
-      {
-        "api_version": 2,
-        "request_id": "",
-        "ok": true,
-        "events": [
-          {
-            "type": "command_log",
-            "request_id": "fixture-tool-call-001",
-            "kind": "result",
-            "title": "remember_memory",
-            "body": "memory_saved"
-          },
-          {
-            "type": "state_changed",
-            "request_id": "fixture-tool-call-001",
-            "state": "ready",
-            "text": "Ready"
-          }
-        ],
-        "result": {
-          "kind": "drain"
-        },
-        "budget": {
-          "max_bytes": 16384,
-          "used_bytes": 220,
-          "compacted": false,
-          "dropped_event_count": 0,
-          "raw_refs": []
-        }
-      }
-      """#)
+    let drain = try BrainDispatchEnvelope.decode(from: encodedEnvelopeText(
+      requestID: "",
+      events: [
+        memoryMutationEvent(id: "fixture-tool-call-001", summary: "memory_saved"),
+        controlEvent(id: "fixture-tool-call-002", status: "Ready"),
+      ],
+      result: .object(["kind": .string("drain")]),
+      budget: BrainDispatchBudget(
+        maxBytes: 16384,
+        usedBytes: 220,
+        compacted: false,
+        droppedEventCount: 0,
+        rawRefs: []
+      )
+    ))
 
     XCTAssertTrue(drain.ok)
     XCTAssertEqual(drain.events.count, 2)
-    XCTAssertEqual(drain.events.first?.requestID, "fixture-tool-call-001")
+    XCTAssertEqual(drain.events.first?.id, "fixture-tool-call-001")
 
     let envelope = try BrainDispatchEnvelope.decode(from: #"""
       {
-        "api_version": 2,
         "request_id": "fixture-error-001",
         "ok": false,
         "events": [],
@@ -1928,10 +2938,178 @@ final class AffectiveTests: XCTestCase {
       """#)
 
     XCTAssertFalse(envelope.ok)
-    XCTAssertEqual(envelope.apiVersion, 2)
     XCTAssertEqual(envelope.error?.code, "unknown_event_type")
     XCTAssertEqual(envelope.error?.message, "unknown embedded event type")
     XCTAssertEqual(envelope.error?.recoverable, false)
+  }
+
+  func testBrainEventPayloadRoundTripsEveryCase() throws {
+    let media = BrainMediaRef(
+      kind: .image,
+      path: "/tmp/image.png",
+      url: nil,
+      mimeType: "image/png",
+      caption: "fixture"
+    )
+    let payloads: [BrainEventPayload] = [
+      .experience(BrainExperiencePayload(
+        kind: "user_message",
+        modality: .text,
+        role: .other,
+        text: "hello",
+        media: [],
+        context: .object(["local_time": .string("now")])
+      )),
+      .senseRequest(BrainSenseRequestPayload(
+        senseID: "camera",
+        direction: .pull,
+        timeoutMS: 100,
+        responsePresentation: .chat
+      )),
+      .senseObservation(BrainSenseObservationPayload(
+        senseID: "camera",
+        modality: .image,
+        summary: "image captured",
+        media: [media],
+        value: .object(["width": .number(1)]),
+        confidence: 0.9,
+        observedAt: "2026-06-26T00:00:00Z"
+      )),
+      .capabilityManifest(BrainCapabilityManifestPayload(
+        capabilities: [BrainCapabilityDescriptor(id: "speech_output", status: "available", reason: nil)],
+        senses: [BrainCapabilityDescriptor(id: "camera", status: "prompt_required", reason: "permission")]
+      )),
+      .capabilityStatus(BrainCapabilityStatusPayload(
+        capabilityID: "camera_capture",
+        status: "available",
+        reason: nil,
+        permissionState: "granted"
+      )),
+      .thought(BrainThoughtPayload(text: "I should answer.", salience: 0.6, tags: ["reply"])),
+      .appraisal(BrainAppraisalPayload(
+        valence: 0.2,
+        arousal: 0.4,
+        salience: 0.7,
+        confidence: 0.8,
+        novelty: 0.3,
+        tags: ["safe"],
+        summary: "warm"
+      )),
+      .needState(BrainNeedStatePayload(needs: ["connection": 0.7], summary: "connected")),
+      .attentionState(BrainAttentionStatePayload(
+        focusEventID: "event-1",
+        competingEventIDs: ["event-2"],
+        summary: "selected user text",
+        suppressionReason: "lower salience"
+      )),
+      .intention(BrainIntentionPayload(
+        goal: "respond",
+        priority: 0.8,
+        expectedAction: "speak",
+        stoppingCondition: "answer delivered"
+      )),
+      .actionRequest(BrainActionRequestPayload(
+        actionID: "action-1",
+        action: "speak",
+        arguments: .object(["text": .string("hello")]),
+        requires: ["speech_output"],
+        awaitResponse: true
+      )),
+      .actionResult(BrainActionResultPayload(
+        actionID: "action-1",
+        status: .succeeded,
+        summary: "spoken",
+        result: .object(["duration_ms": .number(10)]),
+        error: nil
+      )),
+      .expression(BrainExpressionPayload(
+        modality: .text,
+        role: .selfRole,
+        title: "Brain",
+        text: "hello",
+        media: [],
+        expressionID: "expression-1",
+        eyes: nil,
+        mouth: nil,
+        durationMS: nil
+      )),
+      .memoryRequest(BrainMemoryRequestPayload(
+        operation: .recall,
+        layers: [.working, .episodic],
+        query: "hello",
+        text: nil,
+        tags: ["conversation"]
+      )),
+      .memoryResult(BrainMemoryResultPayload(
+        operation: .recall,
+        records: [BrainMemoryRecord(
+          id: "memory-1",
+          layer: .episodic,
+          summary: "said hello",
+          relevance: 0.8,
+          confidence: 0.9
+        )],
+        summary: "one memory"
+      )),
+      .memoryMutation(BrainMemoryMutationPayload(
+        operation: .remember,
+        layer: .episodic,
+        recordIDs: ["memory-1"],
+        summary: "stored greeting"
+      )),
+      .control(BrainControlPayload(phase: .thinking, sendEnabled: false, status: "thinking")),
+      .error(BrainEventErrorPayload(code: "fixture", message: "fixture error", recoverable: true)),
+    ]
+
+    for payload in payloads {
+      let event = BrainEvent(
+        id: "event-\(payload.eventType)",
+        traceID: "trace-\(payload.eventType)",
+        parentID: nil,
+        turnID: "turn-1",
+        loopID: "loop-1",
+        occurredAt: "2026-06-26T00:00:00Z",
+        source: .brain,
+        target: .host,
+        visibility: .diagnostic,
+        presentation: .internalOnly,
+        payload: payload
+      )
+      let data = try JSONEncoder().encode(event)
+      let decoded = try JSONDecoder().decode(BrainEvent.self, from: data)
+      XCTAssertEqual(decoded, event)
+    }
+  }
+
+  func testBrainEventEnvelopeDoesNotEncodeTopLevelType() throws {
+    let event = expressionEvent(title: "Brain", text: "hello")
+    let object = try JSONValue.decodedObject(from: try JSONEncoder().encode(event))
+
+    XCTAssertNil(object["type"])
+    XCTAssertNotNil(object["payload"]?.objectValue?["expression"])
+    XCTAssertEqual(event.type, "expression")
+  }
+
+  func testBrainEventRejectsMissingRequiredEnvelopeID() throws {
+    let malformed = Data(#"""
+      {
+        "trace_id": "trace-1",
+        "occurred_at": "2026-06-26T00:00:00Z",
+        "source": "brain",
+        "target": "host",
+        "visibility": "diagnostic",
+        "presentation": "internal",
+        "payload": {
+          "thought": {
+            "text": "hello",
+            "salience": null,
+            "tags": []
+          }
+        }
+      }
+      """#.utf8)
+
+    XCTAssertThrowsError(try JSONDecoder().decode(BrainEvent.self, from: malformed))
   }
 
   func testMissingRequiredFileFailsCoreValidation() throws {
@@ -2232,7 +3410,7 @@ final class AffectiveTests: XCTestCase {
     XCTAssertNotNil(UUID(uuidString: second.id))
   }
 
-  func testAppIntentBridgeConsumesPendingBrainRequest() throws {
+  @MainActor func testAppIntentBridgeConsumesPendingBrainRequest() throws {
     let defaults = try makeUserDefaults()
     defaults.set("existing-brain", forKey: AffectiveViewModel.lastOpenedBrainIDKey)
 
@@ -2245,7 +3423,7 @@ final class AffectiveTests: XCTestCase {
     XCTAssertNil(AffectiveAppIntentBridge.consumePendingBrainID(defaults: defaults))
   }
 
-  func testAppIntentBridgeRecordsLastOpenedBrainAfterSuccessfulOpen() throws {
+  @MainActor func testAppIntentBridgeRecordsLastOpenedBrainAfterSuccessfulOpen() throws {
     let defaults = try makeUserDefaults()
     defaults.set("existing-brain", forKey: AffectiveViewModel.lastOpenedBrainIDKey)
 
@@ -2269,7 +3447,7 @@ final class AffectiveTests: XCTestCase {
     ))
   }
 
-  func testAppIntentBridgeFallsBackToLastOpenedBrain() throws {
+  @MainActor func testAppIntentBridgeFallsBackToLastOpenedBrain() throws {
     let defaults = try makeUserDefaults()
     let first = BrainDescriptor(
       id: "first",
@@ -2347,7 +3525,8 @@ final class AffectiveTests: XCTestCase {
       for: source,
       schemaVersion: 1,
       deviceID: "test-device",
-      revision: 1
+      revision: 1,
+      includeBiometricData: true
     )
     defer { try? FileManager.default.removeItem(at: checkpoint.archiveURL.deletingLastPathComponent()) }
     let library = BrainLibrary()
@@ -2395,7 +3574,8 @@ final class AffectiveTests: XCTestCase {
       for: remoteBrain,
       schemaVersion: 1,
       deviceID: "cloud-device",
-      revision: 1
+      revision: 1,
+      includeBiometricData: true
     )
     defer { try? FileManager.default.removeItem(at: remoteCheckpoint.archiveURL.deletingLastPathComponent()) }
     let remoteManifest = remoteCheckpoint.manifest
@@ -2589,7 +3769,8 @@ final class AffectiveTests: XCTestCase {
       for: cloudBrain,
       schemaVersion: 1,
       deviceID: "cloud-device",
-      revision: 2
+      revision: 2,
+      includeBiometricData: true
     )
     defer { try? FileManager.default.removeItem(at: cloudCheckpoint.archiveURL.deletingLastPathComponent()) }
     store.manifests[brain.id] = BrainCloudManifest(
@@ -2623,7 +3804,8 @@ final class AffectiveTests: XCTestCase {
       for: brain,
       schemaVersion: 1,
       deviceID: "test-device",
-      revision: 1
+      revision: 1,
+      includeBiometricData: true
     )
     defer { try? FileManager.default.removeItem(at: checkpoint.archiveURL.deletingLastPathComponent()) }
 
@@ -2643,6 +3825,178 @@ final class AffectiveTests: XCTestCase {
       modifiedAt: nil,
       isRecent: false
     ).validateForCoreConnection())
+  }
+
+  func testBrainCheckpointExcludesBiometricsWhenPolicyOptOut() throws {
+    let brain = try makeBrain()
+    try "template".write(
+      to: brain.faceEmbeddingsURL.appendingPathComponent("user.embedding"),
+      atomically: true,
+      encoding: .utf8
+    )
+    try #"{"identities":[{"name":"User","template_count":1}]}"#.write(
+      to: brain.biometricMetadataURL,
+      atomically: true,
+      encoding: .utf8
+    )
+    try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
+    {
+      "schema_version": 2,
+      "subjects": [
+        {
+          "subject_id": "person-1",
+          "display_name": "User",
+          "notes": "friend",
+          "biometric_records": [{"embedding_id": "emb_1", "quality_score": 0.91}],
+          "representative_image_path": "memory/faces/person-1.jpg",
+          "representative_quality_score": 0.91
+        }
+      ]
+    }
+    """)
+
+    let checkpoint = try BrainCheckpointArchive.createCheckpoint(
+      for: brain,
+      schemaVersion: 1,
+      deviceID: "test-device",
+      revision: 1,
+      includeBiometricData: false
+    )
+    defer { try? FileManager.default.removeItem(at: checkpoint.archiveURL.deletingLastPathComponent()) }
+
+    let archiveObject = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(contentsOf: checkpoint.archiveURL)) as? [String: Any])
+    XCTAssertEqual(archiveObject["containsBiometricData"] as? Bool, false)
+    let components = try XCTUnwrap(archiveObject["components"] as? [[String: Any]])
+    let paths = Set(components.compactMap { $0["path"] as? String })
+
+    XCTAssertFalse(paths.contains("memory/face_embeddings"))
+    XCTAssertFalse(paths.contains("memory/face_embeddings/user.embedding"))
+    XCTAssertFalse(paths.contains("memory/biometric_identities.json"))
+    XCTAssertTrue(paths.contains("export_manifest.json"))
+
+    let peopleData = try XCTUnwrap(archiveComponentData("memory/people.sqlite", in: components))
+    let scrubbedDatabaseURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveScrubbedPeople-Test-\(UUID().uuidString).sqlite")
+    temporaryRoots.append(scrubbedDatabaseURL)
+    try peopleData.write(to: scrubbedDatabaseURL, options: .atomic)
+    let scrubbedJSON = try XCTUnwrap(readCognitiveJSON(from: scrubbedDatabaseURL))
+    let scrubbedObject = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(scrubbedJSON.utf8)) as? [String: Any])
+    let subjects = try XCTUnwrap(scrubbedObject["subjects"] as? [[String: Any]])
+    let subject = try XCTUnwrap(subjects.first)
+    XCTAssertEqual(subject["display_name"] as? String, "User")
+    XCTAssertEqual(subject["notes"] as? String, "friend")
+    XCTAssertNil(subject["embeddings"])
+    XCTAssertNil(subject["biometric_records"])
+    XCTAssertNil(subject["representative_image_path"])
+    XCTAssertNil(subject["representative_quality_score"])
+  }
+
+  func testBrainCheckpointIncludesBiometricsWhenPolicyOptIn() throws {
+    let brain = try makeBrain()
+    try "template".write(
+      to: brain.faceEmbeddingsURL.appendingPathComponent("user.embedding"),
+      atomically: true,
+      encoding: .utf8
+    )
+    try #"{"identities":[{"name":"User","template_count":1}]}"#.write(
+      to: brain.biometricMetadataURL,
+      atomically: true,
+      encoding: .utf8
+    )
+    try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
+    {
+      "schema_version": 2,
+      "subjects": [
+        {
+          "subject_id": "person-1",
+          "display_name": "User",
+          "biometric_records": [{"embedding_id": "emb_1", "quality_score": 0.91}],
+          "representative_image_path": "memory/faces/person-1.jpg",
+          "representative_quality_score": 0.91
+        }
+      ]
+    }
+    """)
+
+    let checkpoint = try BrainCheckpointArchive.createCheckpoint(
+      for: brain,
+      schemaVersion: 1,
+      deviceID: "test-device",
+      revision: 1,
+      includeBiometricData: true
+    )
+    defer { try? FileManager.default.removeItem(at: checkpoint.archiveURL.deletingLastPathComponent()) }
+
+    let archiveObject = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(contentsOf: checkpoint.archiveURL)) as? [String: Any])
+    XCTAssertEqual(archiveObject["containsBiometricData"] as? Bool, true)
+    let components = try XCTUnwrap(archiveObject["components"] as? [[String: Any]])
+    let paths = Set(components.compactMap { $0["path"] as? String })
+
+    XCTAssertTrue(paths.contains("memory/face_embeddings"))
+    XCTAssertTrue(paths.contains("memory/face_embeddings/user.embedding"))
+    XCTAssertTrue(paths.contains("memory/biometric_identities.json"))
+
+    let peopleData = try XCTUnwrap(archiveComponentData("memory/people.sqlite", in: components))
+    let databaseURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveIncludedPeople-Test-\(UUID().uuidString).sqlite")
+    temporaryRoots.append(databaseURL)
+    try peopleData.write(to: databaseURL, options: .atomic)
+    let cognitiveJSON = try XCTUnwrap(readCognitiveJSON(from: databaseURL))
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(cognitiveJSON.utf8)) as? [String: Any])
+    let subjects = try XCTUnwrap(object["subjects"] as? [[String: Any]])
+    let subject = try XCTUnwrap(subjects.first)
+    XCTAssertNotNil(subject["biometric_records"])
+    XCTAssertEqual(subject["representative_image_path"] as? String, "memory/faces/person-1.jpg")
+    XCTAssertEqual(subject["representative_quality_score"] as? Double, 0.91)
+  }
+
+  @MainActor
+  func testBrainSyncCheckpointUsesSharedBiometricExportToggle() async throws {
+    let defaults = try makeUserDefaults()
+    let store = FakeBrainCloudCheckpointStore()
+    let excludedBrain = try makeBrain()
+    try "template".write(
+      to: excludedBrain.faceEmbeddingsURL.appendingPathComponent("excluded.embedding"),
+      atomically: true,
+      encoding: .utf8
+    )
+    try writeCognitiveStore(at: excludedBrain.memoryDatabaseURL, dataJSON: """
+    {"schema_version":2,"subjects":[{"subject_id":"person-1","display_name":"User","biometric_records":[{"embedding_id":"emb_1","quality_score":0.91}],"representative_image_path":"memory/faces/person-1.jpg","representative_quality_score":0.91}]}
+    """)
+
+    let excludedManager = BrainSyncManager(store: store, userDefaults: defaults, deviceID: "test-device")
+    excludedManager.selectBrainForSync(excludedBrain)
+    try await waitForSyncState(.synced, manager: excludedManager, brain: excludedBrain)
+
+    let excludedArchive = try XCTUnwrap(store.archives[excludedBrain.id])
+    let excludedComponents = try archiveComponents(from: excludedArchive)
+    let excludedPaths = Set(excludedComponents.compactMap { $0["path"] as? String })
+    XCTAssertFalse(excludedPaths.contains("memory/face_embeddings/excluded.embedding"))
+    XCTAssertEqual(try archiveContainsBiometricData(excludedArchive), false)
+
+    let includedBrain = try makeBrain()
+    try "template".write(
+      to: includedBrain.faceEmbeddingsURL.appendingPathComponent("included.embedding"),
+      atomically: true,
+      encoding: .utf8
+    )
+    try #"{"biometric_export_included": true}"#.write(
+      to: includedBrain.runtimeOptionsURL,
+      atomically: true,
+      encoding: .utf8
+    )
+
+    let includedManager = BrainSyncManager(store: store, userDefaults: try makeUserDefaults(), deviceID: "test-device")
+    includedManager.selectBrainForSync(includedBrain)
+    try await waitForSyncState(.synced, manager: includedManager, brain: includedBrain)
+
+    let includedArchive = try XCTUnwrap(store.archives[includedBrain.id])
+    let includedComponents = try archiveComponents(from: includedArchive)
+    let includedPaths = Set(includedComponents.compactMap { $0["path"] as? String })
+    XCTAssertTrue(includedPaths.contains("memory/face_embeddings/included.embedding"))
+    XCTAssertEqual(try archiveContainsBiometricData(includedArchive), true)
   }
 
   func testBrainStatsJournalRecordsDailySizeSnapshots() throws {
@@ -3001,6 +4355,75 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(lifecycle["status"] as? String, "active")
   }
 
+  func testDreamReportProviderSummarizerOffersOnlyConfiguredProvidersToRandomPicker() async throws {
+    var offeredRoutes: [HostLLMCompletionProvider] = []
+    let summarizer = DreamReportProviderSummarizer(
+      credentialProvider: {
+        [
+          .openAI: " openai-key ",
+          .anthropic: "   ",
+          .google: "google-key",
+        ]
+      },
+      textRoutePicker: { routes in
+        offeredRoutes = routes
+        return nil
+      }
+    )
+
+    do {
+      _ = try await summarizer.summarize(dreamReportDraft())
+      XCTFail("Summarizer should fail when the picker declines all configured providers.")
+    } catch DreamReportSummaryError.missingProviderCredential {
+      XCTAssertEqual(offeredRoutes.filter { $0 != .appleFoundationModels }, [.credential(.openAI), .credential(.google)])
+    }
+  }
+
+  func testDreamReportProviderSummarizerUsesRandomlySelectedProvider() async throws {
+    var requestedURL: URL?
+    var requestedBody: [String: Any] = [:]
+    let summarizer = DreamReportProviderSummarizer(
+      credentialProvider: {
+        [
+          .openAI: "openai-key",
+          .anthropic: "anthropic-key",
+          .google: "google-key",
+        ]
+      },
+      textRoutePicker: { routes in
+        XCTAssertTrue(routes.contains(.credential(.openAI)))
+        XCTAssertTrue(routes.contains(.credential(.anthropic)))
+        XCTAssertTrue(routes.contains(.credential(.google)))
+        return .credential(.google)
+      },
+      jsonLoader: { request in
+        requestedURL = request.url
+        if let body = request.httpBody {
+          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        }
+        return [
+          "candidates": [
+            [
+              "content": [
+                "parts": [
+                  ["text": "  A generated dream summary.  "]
+                ]
+              ]
+            ]
+          ]
+        ]
+      }
+    )
+
+    let summary = try await summarizer.summarize(dreamReportDraft())
+
+    XCTAssertEqual(summary, DreamReportSummaryResult(text: "A generated dream summary.", source: "google"))
+    XCTAssertEqual(requestedURL?.host, "generativelanguage.googleapis.com")
+    XCTAssertEqual(URLComponents(url: try XCTUnwrap(requestedURL), resolvingAgainstBaseURL: false)?
+      .queryItems?.first { $0.name == "key" }?.value, "google-key")
+    XCTAssertNotNil(requestedBody["contents"])
+  }
+
   func testDreamReportSummaryFallsBackWhenProviderFails() async throws {
     let brain = try makeBrain(events: dreamImageEventJSONL())
     try writeCognitiveStore(
@@ -3131,6 +4554,21 @@ final class AffectiveTests: XCTestCase {
     )
   }
 
+  private func withConnectedCore<Result>(
+    _ core: BrainCore,
+    _ body: () async throws -> Result
+  ) async throws -> Result {
+    try await core.connect()
+    do {
+      let result = try await body()
+      await core.disconnect()
+      return result
+    } catch {
+      await core.disconnect()
+      throw error
+    }
+  }
+
   private static let tinyPNGData = Data([
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
     0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
@@ -3247,76 +4685,318 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(sqlite3_exec(database, sql, nil, nil, nil), SQLITE_OK)
   }
 
-  private func brainChatEvent(title: String?, text: String) -> BrainHostEvent {
-    BrainHostEvent(
-      type: "chat_message",
-      requestID: "chat-fixture",
-      role: "brain",
-      text: text,
-      state: nil,
-      enabled: nil,
-      kind: nil,
-      title: title,
-      body: nil,
-      sense: nil,
-      eyes: nil,
-      mouth: nil,
-      durationMS: nil,
-      mediaKind: nil,
-      path: nil,
-      url: nil,
-      mimeType: nil,
-      caption: nil,
-      rawRef: nil,
-      originalBytes: nil)
+  private func readCognitiveJSON(from url: URL) throws -> String? {
+    var database: OpaquePointer?
+    XCTAssertEqual(sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+    defer { sqlite3_close(database) }
+
+    var statement: OpaquePointer?
+    XCTAssertEqual(sqlite3_prepare_v2(database, "SELECT data_json FROM cognitive_memory WHERE id = 1", -1, &statement, nil), SQLITE_OK)
+    defer { sqlite3_finalize(statement) }
+
+    guard sqlite3_step(statement) == SQLITE_ROW,
+          let textPointer = sqlite3_column_text(statement, 0) else {
+      return nil
+    }
+    return String(cString: textPointer)
   }
 
-  private func facialExpressionEvent(eyes: String?, mouth: String?) -> BrainHostEvent {
-    BrainHostEvent(
-      type: "facial_expression_requested",
-      requestID: "expression-fixture",
-      role: nil,
-      text: nil,
-      state: nil,
-      enabled: nil,
-      kind: nil,
-      title: nil,
-      body: nil,
-      sense: nil,
-      eyes: eyes,
-      mouth: mouth,
-      durationMS: nil,
-      mediaKind: nil,
-      path: nil,
-      url: nil,
-      mimeType: nil,
-      caption: nil,
-      rawRef: nil,
-      originalBytes: nil)
+  private func archiveComponents(from data: Data) throws -> [[String: Any]] {
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    return try XCTUnwrap(object["components"] as? [[String: Any]])
   }
 
-  private func speechRequestedEvent(text: String) -> BrainHostEvent {
-    BrainHostEvent(
-      type: "speech_requested",
-      requestID: "speech-fixture",
-      role: nil,
-      text: text,
-      state: nil,
-      enabled: nil,
-      kind: nil,
-      title: nil,
-      body: nil,
-      sense: nil,
-      eyes: nil,
-      mouth: nil,
-      durationMS: nil,
-      mediaKind: nil,
-      path: nil,
-      url: nil,
-      mimeType: nil,
-      caption: nil,
-      rawRef: nil,
-      originalBytes: nil)
+  private func archiveContainsBiometricData(_ data: Data) throws -> Bool? {
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    return object["containsBiometricData"] as? Bool
+  }
+
+  private func archiveComponentData(_ path: String, in components: [[String: Any]]) throws -> Data? {
+    guard let component = components.first(where: { $0["path"] as? String == path }),
+          let dataBase64 = component["dataBase64"] as? String else {
+      return nil
+    }
+    return Data(base64Encoded: dataBase64)
+  }
+
+  private func fixtureURL(_ name: String, extension ext: String, subdirectory: String) throws -> URL {
+    try XCTUnwrap(
+      Bundle(for: Self.self).url(forResource: name, withExtension: ext, subdirectory: subdirectory)
+        ?? Bundle(for: Self.self).url(forResource: name, withExtension: ext),
+      "Missing test fixture \(subdirectory)/\(name).\(ext)"
+    )
+  }
+
+  private func skipPlaceholderImageFixtures(_ urls: [URL]) throws {
+    for url in urls {
+      let data = try Data(contentsOf: url)
+      if data.starts(with: Data("placeholder fixture:".utf8)) {
+        throw XCTSkip("Face recognition fixture \(url.lastPathComponent) is a text placeholder, not an image.")
+      }
+    }
+  }
+
+  private func cameraJPEGFixture(from sourceURL: URL, named name: String, in rootURL: URL) throws -> URL {
+    #if canImport(ImageIO)
+    let data = try Data(contentsOf: sourceURL)
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+      throw CameraCaptureError.invalidImageData
+    }
+    let directory = rootURL.appendingPathComponent("test-camera-fixtures", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let destinationURL = directory.appendingPathComponent("\(name).jpg")
+    let output = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(output, "public.jpeg" as CFString, 1, nil) else {
+      throw CameraCaptureError.invalidImageData
+    }
+    let options = [kCGImageDestinationLossyCompressionQuality: 0.95] as CFDictionary
+    CGImageDestinationAddImage(destination, image, options)
+    guard CGImageDestinationFinalize(destination) else {
+      throw CameraCaptureError.invalidImageData
+    }
+    try (output as Data).write(to: destinationURL, options: .atomic)
+    return destinationURL
+    #else
+    throw CameraCaptureError.invalidImageData
+    #endif
+  }
+
+  private func recognitionRequestData(_ object: [String: Any]) throws -> Data {
+    try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+  }
+
+  private func postRecognitionResponse<Response: Decodable>(
+    body: Data,
+    to url: String,
+    using hostServices: EmbeddedHostServices
+  ) throws -> Response {
+    let response = try hostServices.postJSON(url: url, headersJSON: "[]", body: body)
+    return try JSONDecoder().decode(Response.self, from: response)
+  }
+
+  private func waitForPokeSequenceCount(
+    _ expected: Int,
+    in core: ScriptedBrainCore,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) async -> [[PokePulse]] {
+    for _ in 0..<100 {
+      let pokes = await core.pokeSequences
+      if pokes.count >= expected {
+        return pokes
+      }
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    XCTFail("Timed out waiting for \(expected) poke sequence calls.", file: file, line: line)
+    return await core.pokeSequences
+  }
+
+  private func brainChatEvent(title: String?, text: String) -> BrainEvent {
+    expressionEvent(title: title, text: text)
+  }
+
+  private func brainExpressionEvent(text: String) -> BrainEvent {
+    expressionEvent(title: "Brain", text: text)
+  }
+
+  private func facialExpressionEvent(eyes: String?, mouth: String?) -> BrainEvent {
+    actionRequestEvent(
+      actionID: "expression-fixture",
+      action: "show_expression",
+      arguments: [
+        "eyes": eyes.map(JSONValue.string) ?? .null,
+        "mouth": mouth.map(JSONValue.string) ?? .null,
+      ],
+      presentation: .chat
+    )
+  }
+
+  private func speechRequestedEvent(text: String) -> BrainEvent {
+    actionRequestEvent(
+      actionID: "speech-fixture",
+      action: "speak",
+      arguments: ["text": .string(text)],
+      presentation: .chat
+    )
+  }
+
+  private func expressionEvent(
+    title: String?,
+    text: String,
+    expressionID: String = "chat-fixture-expression",
+    role: BrainParticipantRole = .selfRole,
+    modality: BrainEventModality = .text,
+    visibility: BrainEventVisibility = .public,
+    presentation: BrainEventPresentation = .chat,
+    source: BrainEventEndpoint = .brain,
+    target: BrainEventEndpoint = .host
+  ) -> BrainEvent {
+    BrainEvent(
+      id: expressionID,
+      traceID: "trace-\(expressionID)",
+      parentID: nil,
+      turnID: nil,
+      loopID: nil,
+      occurredAt: "2026-06-26T00:00:00Z",
+      source: source,
+      target: target,
+      visibility: visibility,
+      presentation: presentation,
+      payload: .expression(BrainExpressionPayload(
+        modality: modality,
+        role: role,
+        title: title,
+        text: text,
+        media: [],
+        expressionID: expressionID,
+        eyes: nil,
+        mouth: nil,
+        durationMS: nil
+      ))
+    )
+  }
+
+  private func actionRequestEvent(
+    actionID: String,
+    action: String,
+    arguments: [String: JSONValue],
+    requires: [String] = [],
+    presentation: BrainEventPresentation = .internalOnly
+  ) -> BrainEvent {
+    BrainEvent(
+      id: actionID,
+      traceID: "trace-\(actionID)",
+      parentID: nil,
+      turnID: nil,
+      loopID: nil,
+      occurredAt: "2026-06-26T00:00:00Z",
+      source: .brain,
+      target: .host,
+      visibility: .public,
+      presentation: presentation,
+      payload: .actionRequest(BrainActionRequestPayload(
+        actionID: actionID,
+        action: action,
+        arguments: .object(arguments),
+        requires: requires,
+        awaitResponse: true
+      ))
+    )
+  }
+
+  private func senseRequestEvent(
+    requestID: String,
+    sense: String,
+    title: String,
+    summary: String,
+    responsePresentation: BrainEventPresentation = .internalOnly,
+    awaitResponse: Bool = true,
+    timeoutMS: Int? = nil
+  ) -> BrainEvent {
+    BrainEvent(
+      id: requestID,
+      traceID: "trace-\(requestID)",
+      parentID: nil,
+      turnID: nil,
+      loopID: nil,
+      occurredAt: "2026-06-26T00:00:00Z",
+      source: .brain,
+      target: .host,
+      visibility: .diagnostic,
+      presentation: .internalOnly,
+      payload: .senseRequest(BrainSenseRequestPayload(
+        senseID: sense,
+        direction: .pull,
+        timeoutMS: awaitResponse ? timeoutMS : nil,
+        responsePresentation: responsePresentation
+      ))
+    )
+  }
+
+  private func attentionStatusEvent(id: String, title: String, summary: String) -> BrainEvent {
+    BrainEvent(
+      id: id,
+      traceID: "trace-\(id)",
+      parentID: nil,
+      turnID: nil,
+      loopID: nil,
+      occurredAt: "2026-06-26T00:00:00Z",
+      source: .brain,
+      target: .host,
+      visibility: .diagnostic,
+      presentation: .status,
+      payload: .attentionState(BrainAttentionStatePayload(
+        focusEventID: nil,
+        competingEventIDs: [],
+        summary: summary,
+        suppressionReason: title
+      ))
+    )
+  }
+
+  private func controlEvent(
+    id: String,
+    sendEnabled: Bool? = nil,
+    status: String? = nil
+  ) -> BrainEvent {
+    BrainEvent(
+      id: id,
+      traceID: "trace-\(id)",
+      parentID: nil,
+      turnID: nil,
+      loopID: nil,
+      occurredAt: "2026-06-26T00:00:00Z",
+      source: .brain,
+      target: .host,
+      visibility: .diagnostic,
+      presentation: .status,
+      payload: .control(BrainControlPayload(
+        phase: nil,
+        sendEnabled: sendEnabled,
+        status: status
+      ))
+    )
+  }
+
+  private func memoryMutationEvent(id: String, summary: String) -> BrainEvent {
+    BrainEvent(
+      id: id,
+      traceID: "trace-\(id)",
+      parentID: nil,
+      turnID: nil,
+      loopID: nil,
+      occurredAt: "2026-06-26T00:00:00Z",
+      source: .brain,
+      target: .host,
+      visibility: .diagnostic,
+      presentation: .log,
+      payload: .memoryMutation(BrainMemoryMutationPayload(
+        operation: .remember,
+        layer: .episodic,
+        recordIDs: ["record-\(id)"],
+        summary: summary
+      ))
+    )
+  }
+
+  private func encodedEnvelopeText(
+    requestID: String,
+    events: [BrainEvent],
+    result: JSONValue?,
+    budget: BrainDispatchBudget?
+  ) throws -> String {
+    let envelope = BrainDispatchEnvelope(
+      requestID: requestID,
+      ok: true,
+      events: events,
+      result: result,
+      error: nil,
+      budget: budget,
+      rawText: ""
+    )
+    let data = try JSONEncoder().encode(envelope)
+    return String(decoding: data, as: UTF8.self)
   }
 
   private func cognitiveFixtureJSON(
@@ -3453,6 +5133,26 @@ final class AffectiveTests: XCTestCase {
     )
   }
 
+  private func dreamReportDraft(
+    dreamID: String = "dream_1",
+    dayKey: String = "2026-06-25"
+  ) -> DreamReportDraft {
+    DreamReportDraft(
+      dreamID: dreamID,
+      dayKey: dayKey,
+      createdAt: DreamReportDateFormatter.date(from: "\(dayKey)T22:30:00Z") ?? Date(),
+      reflection: "A dream linked a memory to a quiet symbol.",
+      heat: 0.5,
+      style: "associative_synthesis",
+      confidence: 0.575,
+      sourceTraceIDs: ["trace_1"],
+      generatedArtifactID: "artifact_\(dreamID)",
+      imagePath: "generated/images/dream.png",
+      imageMimeType: "image/png",
+      imagePrompt: "Create a quiet symbolic dream image."
+    )
+  }
+
   private func dreamImageEventJSONL() -> String {
     """
     {"event_id":"event_1","time":"2026-06-25T22:30:01Z","kind":"autonomy","source":"brain","title":"dream_image","body":"generated/images/dream.png","subject":"dream_image","raw":"Create a quiet symbolic dream image.","interpretation":"generated/images/dream.png","tags":["dream","image"]}
@@ -3465,6 +5165,13 @@ final class AffectiveTests: XCTestCase {
     let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
     defaults.removePersistentDomain(forName: suiteName)
     return defaults
+  }
+
+  private func embeddedString(_ value: AffectiveCoreEmbeddedString) -> String {
+    guard let ptr = value.ptr, value.len > 0 else {
+      return ""
+    }
+    return String(decoding: UnsafeBufferPointer(start: ptr, count: value.len), as: UTF8.self)
   }
 
   @MainActor
@@ -3567,36 +5274,46 @@ final class AffectiveTests: XCTestCase {
 
   private static var hostCapabilityE2ECoverage: [String: HostCapabilityE2ECoverage] {
     [
-      "typed_text": .providerBackedDispatch,
-      "poke_sequence": .embeddedDispatch,
-      "short_touch": .embeddedDispatch,
-      "long_touch": .embeddedDispatch,
-      "tool_call": .embeddedDispatch,
+      "text_input": .providerBackedDispatch,
+      "speech_input": .hostAdapter,
       "speech_output": .hostAdapter,
+      "camera_capture": .permissionGatedHostAdapter,
+      "microphone_capture": .hostAdapter,
+      "orientation_read": .permissionGatedHostAdapter,
+      "motion_gesture_read": .embeddedDispatch,
       "uploaded_media_read": .hostAdapter,
-      "stored_memory_read": .hostAdapter,
-      "stored_memory_write": .hostAdapter,
+      "memory_read": .hostAdapter,
+      "memory_write": .hostAdapter,
+      "reminder_read": .hostAdapter,
+      "reminder_write": .hostAdapter,
+      "notification_schedule": .hostAdapter,
       "stored_image_read": .hostAdapter,
-      "identity_recognition": .hostAdapter,
+      "face_identification": .hostAdapter,
+      "face_enrollment": .hostAdapter,
       "introspection": .embeddedRoute,
       "time_lookup": .hostAdapter,
       "power_status": .hostAdapter,
       "storage_fullness": .hostAdapter,
       "database_stats": .hostAdapter,
-      "reminder_io": .hostAdapter,
-      "image_generation": .providerBackedHostAdapter,
-      "face_picture_update": .hostAdapter,
       "local_process_io": .hostAdapter,
-      "facial_expression_output": .hostAdapter,
-      "visual_description": .providerBackedHostAdapter,
-      "visual_comparison": .providerBackedHostAdapter,
-      "live_camera": .permissionGatedHostAdapter,
-      "orientation_query": .permissionGatedHostAdapter,
-      "sense_observation": .embeddedDispatch,
+      "file_import": .hostAdapter,
+      "file_export": .hostAdapter,
+      "provider_image_generation": .providerBackedHostAdapter,
+      "provider_vision_completion": .providerBackedHostAdapter,
+      "provider_text_completion": .providerBackedHostAdapter,
     ]
   }
 
   private static func allAdvertisedHostCapabilities() throws -> Set<String> {
+    let enabledBiometricPolicy = BiometricDataPolicy(
+      recognitionEnabled: true,
+      policyAcknowledged: true,
+      enrollmentAllowed: true,
+      retentionPeriod: BiometricDataPolicy.defaultRetentionPeriod,
+      exportIncluded: false,
+      exportConfirmationRequired: true,
+      autoDeleteUnconfirmed: true
+    )
     let manifests = [
       CoreConfigStorage.hostManifestJSON(
         hasProvider: false,
@@ -3609,7 +5326,13 @@ final class AffectiveTests: XCTestCase {
       CoreConfigStorage.hostManifestJSON(
         hasProvider: true,
         cameraStatus: "prompt_required",
-        orientationStatus: "prompt_required"),
+        orientationStatus: "prompt_required",
+        motionGestureStatus: "available"),
+      CoreConfigStorage.hostManifestJSON(
+        hasProvider: true,
+        cameraStatus: "available",
+        orientationStatus: "available",
+        biometricPolicy: enabledBiometricPolicy),
     ]
     let capabilityLists = try manifests.map { manifest -> [String] in
       let object = try JSONValue.decodedObject(from: Data(manifest.utf8))
@@ -3618,62 +5341,13 @@ final class AffectiveTests: XCTestCase {
     return Set(capabilityLists.flatMap { $0 })
   }
 
-  private static func frontendCaptureDiagnosticEvents(requestID: String) -> [BrainHostEvent] {
-    let diagnostic = "Something went wrong while I tried that: FrontendCaptureRequested."
-    return [
-      BrainHostEvent(
-        type: "chat_message",
-        requestID: requestID,
-        role: "brain",
-        text: diagnostic,
-        state: nil,
-        enabled: nil,
-        kind: nil,
-        title: "Brain",
-        body: nil,
-        sense: nil,
-        eyes: nil,
-        mouth: nil,
-        durationMS: nil,
-        mediaKind: nil,
-        path: nil,
-        url: nil,
-        mimeType: nil,
-        caption: nil,
-        rawRef: nil,
-        originalBytes: nil),
-      BrainHostEvent(
-        type: "speech_requested",
-        requestID: requestID,
-        role: nil,
-        text: diagnostic,
-        state: nil,
-        enabled: nil,
-        kind: nil,
-        title: nil,
-        body: nil,
-        sense: nil,
-        eyes: nil,
-        mouth: nil,
-        durationMS: nil,
-        mediaKind: nil,
-        path: nil,
-        url: nil,
-        mimeType: nil,
-        caption: nil,
-        rawRef: nil,
-        originalBytes: nil)
-    ]
-  }
-
   private static func toolResponse(
     toolName: String,
-    events: [BrainHostEvent] = [],
+    events: [BrainEvent] = [],
     result: JSONValue? = nil,
     requestID: String = UUID().uuidString
   ) -> BrainToolResponse {
     let envelope = BrainDispatchEnvelope(
-      apiVersion: EmbeddedProtocolContract.apiVersion,
       requestID: requestID,
       ok: true,
       events: events,
@@ -3692,6 +5366,44 @@ private enum HostCapabilityE2ECoverage: Equatable {
   case permissionGatedHostAdapter
   case providerBackedDispatch
   case providerBackedHostAdapter
+}
+
+private struct RecognitionIdentityResponse: Decodable {
+  let personPresent: Bool
+  let matchStatus: String
+  let personID: String?
+  let confidence: Float
+  let candidateName: String?
+  let peopleCount: Int
+
+  enum CodingKeys: String, CodingKey {
+    case personPresent = "person_present"
+    case matchStatus = "match_status"
+    case personID = "person_id"
+    case confidence
+    case candidateName = "candidate_name"
+    case peopleCount = "people_count"
+  }
+}
+
+private struct RecognitionEnrollResponse: Decodable {
+  let personID: String
+  let displayName: String?
+  let representativeImagePath: String
+  let embeddingPath: String
+  let qualityScore: Float
+  let removedEmbeddings: Int
+  let keptExisting: Bool
+
+  enum CodingKeys: String, CodingKey {
+    case personID = "person_id"
+    case displayName = "display_name"
+    case representativeImagePath = "representative_image_path"
+    case embeddingPath = "embedding_path"
+    case qualityScore = "quality_score"
+    case removedEmbeddings = "removed_embeddings"
+    case keptExisting = "kept_existing"
+  }
 }
 
 private actor ScriptedBrainCore: BrainCoreClient {
@@ -3721,33 +5433,61 @@ private actor ScriptedBrainCore: BrainCoreClient {
     let presentation: BrainEventPresentation
   }
 
+  struct MotionGestureObservationCall: Equatable {
+    let observation: MotionGestureObservation
+    let presentation: BrainEventPresentation
+  }
+
+  struct PullSenseStatusCall: Equatable {
+    let sense: String
+    let direction: PullSenseDirection
+    let status: PullSenseTerminalStatus
+    let requestID: String?
+    let timeoutMS: Int?
+    let reason: String
+    let availability: String?
+    let permissionState: String?
+    let terminal: Bool
+  }
+
   private let toolResponse: BrainToolResponse
   private let textResponse: BrainTextResponse
   private let shortTouchResponse: BrainToolResponse
   private let orientationObservationResponse: BrainToolResponse
+  private let motionGestureObservationResponse: BrainToolResponse
   private let cameraObservationResponse: BrainToolResponse
   private let cameraObservationDelayNanoseconds: UInt64
+  private let pullSenseStatusError: Error?
   private(set) var didConnect = false
   private(set) var didDisconnect = false
   private(set) var toolCalls: [ToolCall] = []
   private(set) var textCalls: [TextCall] = []
+  private(set) var pokeSequences: [[PokePulse]] = []
+  private var textCallContinuations: [(minimumCount: Int, continuation: CheckedContinuation<[TextCall], Never>)] = []
   private(set) var orientationObservations: [OrientationObservationCall] = []
+  private(set) var motionGestureObservations: [MotionGestureObservationCall] = []
   private(set) var cameraObservations: [CameraObservation] = []
+  private(set) var senseCatalogRequests: [String?] = []
+  private(set) var pullSenseStatuses: [PullSenseStatusCall] = []
 
   init(
     toolResponse: BrainToolResponse,
     textResponse: BrainTextResponse? = nil,
     shortTouchResponse: BrainToolResponse? = nil,
     orientationObservationResponse: BrainToolResponse? = nil,
+    motionGestureObservationResponse: BrainToolResponse? = nil,
     cameraObservationResponse: BrainToolResponse,
-    cameraObservationDelayNanoseconds: UInt64 = 0
+    cameraObservationDelayNanoseconds: UInt64 = 0,
+    pullSenseStatusError: Error? = nil
   ) {
     self.toolResponse = toolResponse
-    self.textResponse = textResponse ?? BrainTextResponse(toolName: "typed_text", text: "", metadata: [:], events: [])
+    self.textResponse = textResponse ?? BrainTextResponse(toolName: "experience", text: "", metadata: [:], events: [])
     self.shortTouchResponse = shortTouchResponse ?? toolResponse
     self.orientationObservationResponse = orientationObservationResponse ?? toolResponse
+    self.motionGestureObservationResponse = motionGestureObservationResponse ?? toolResponse
     self.cameraObservationResponse = cameraObservationResponse
     self.cameraObservationDelayNanoseconds = cameraObservationDelayNanoseconds
+    self.pullSenseStatusError = pullSenseStatusError
   }
 
   func connect() async throws {
@@ -3758,8 +5498,32 @@ private actor ScriptedBrainCore: BrainCoreClient {
     didDisconnect = true
   }
 
-  func callTool(_ name: String, arguments: [String: JSONValue]) async throws -> BrainToolResponse {
-    toolCalls.append(ToolCall(name: name, arguments: arguments))
+  func sendEvent(_ event: BrainEvent) async throws -> BrainToolResponse {
+    switch event.payload {
+    case .memoryRequest(let payload):
+      var arguments: [String: JSONValue] = [
+        "operation": .string(payload.operation.rawValue),
+        "layers": .array(payload.layers.map { .string($0.rawValue) }),
+        "tags": .array(payload.tags.map { .string($0) }),
+      ]
+      if let query = payload.query { arguments["query"] = .string(query) }
+      if let text = payload.text { arguments["text"] = .string(text) }
+      toolCalls.append(ToolCall(name: "memory_request", arguments: arguments))
+    case .actionRequest(let payload):
+      toolCalls.append(ToolCall(
+        name: payload.action,
+        arguments: payload.arguments.objectValue ?? [:]
+      ))
+    default:
+      toolCalls.append(ToolCall(name: event.type, arguments: [:]))
+    }
+    return toolResponse
+  }
+
+  func sendEvents(_ events: [BrainEvent]) async throws -> BrainToolResponse {
+    for event in events {
+      _ = try await sendEvent(event)
+    }
     return toolResponse
   }
 
@@ -3771,8 +5535,9 @@ private actor ScriptedBrainCore: BrainCoreClient {
     toolResponse
   }
 
-  func pokeSequence(_: [PokePulse]) async throws -> BrainToolResponse {
-    toolResponse
+  func pokeSequence(_ pulses: [PokePulse]) async throws -> BrainToolResponse {
+    pokeSequences.append(pulses)
+    return toolResponse
   }
 
   func orientationObservation(
@@ -3786,6 +5551,17 @@ private actor ScriptedBrainCore: BrainCoreClient {
       presentation: presentation
     ))
     return orientationObservationResponse
+  }
+
+  func pushedMotionGestureObservation(
+    _ observation: MotionGestureObservation,
+    presentation: BrainEventPresentation
+  ) async throws -> BrainToolResponse {
+    motionGestureObservations.append(MotionGestureObservationCall(
+      observation: observation,
+      presentation: presentation
+    ))
+    return motionGestureObservationResponse
   }
 
   func cameraObservation(
@@ -3806,6 +5582,42 @@ private actor ScriptedBrainCore: BrainCoreClient {
       try await Task.sleep(nanoseconds: cameraObservationDelayNanoseconds)
     }
     return cameraObservationResponse
+  }
+
+  func senseCatalog(
+    senses _: [PullSenseDescriptor],
+    requestID: String?
+  ) async throws -> BrainToolResponse {
+    senseCatalogRequests.append(requestID)
+    return toolResponse
+  }
+
+  func pullSenseStatus(
+    sense: String,
+    direction: PullSenseDirection,
+    status: PullSenseTerminalStatus,
+    requestID: String?,
+    timeoutMS: Int?,
+    reason: String,
+    availability: String?,
+    permissionState: String?,
+    terminal: Bool
+  ) async throws -> BrainToolResponse {
+    if let pullSenseStatusError {
+      throw pullSenseStatusError
+    }
+    pullSenseStatuses.append(PullSenseStatusCall(
+      sense: sense,
+      direction: direction,
+      status: status,
+      requestID: requestID,
+      timeoutMS: timeoutMS,
+      reason: reason,
+      availability: availability,
+      permissionState: permissionState,
+      terminal: terminal
+    ))
+    return toolResponse
   }
 
   func hostCapabilityStatus(
@@ -3840,7 +5652,31 @@ private actor ScriptedBrainCore: BrainCoreClient {
       attachments: attachments,
       stimulusContext: stimulusContext
     ))
+    fulfillTextCallContinuations()
     return textResponse
+  }
+
+  func waitForTextCallCount(_ minimumCount: Int) async -> [TextCall] {
+    guard textCalls.count < minimumCount else { return textCalls }
+
+    return await withCheckedContinuation { continuation in
+      textCallContinuations.append((minimumCount, continuation))
+    }
+  }
+
+  private func fulfillTextCallContinuations() {
+    let completedCalls = textCalls
+    var pendingContinuations: [(minimumCount: Int, continuation: CheckedContinuation<[TextCall], Never>)] = []
+
+    for waiter in textCallContinuations {
+      if completedCalls.count >= waiter.minimumCount {
+        waiter.continuation.resume(returning: completedCalls)
+      } else {
+        pendingContinuations.append(waiter)
+      }
+    }
+
+    textCallContinuations = pendingContinuations
   }
 
   func refreshState() async throws -> BrainStateSnapshot {

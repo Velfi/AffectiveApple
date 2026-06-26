@@ -9,7 +9,7 @@ nonisolated struct BrainTextResponse: Equatable {
   let toolName: String
   let text: String
   let metadata: [String: String]
-  let events: [BrainHostEvent]
+  let events: [BrainEvent]
 }
 
 nonisolated struct BrainStateSnapshot: Equatable {
@@ -24,7 +24,7 @@ nonisolated struct BrainToolResponse: Equatable {
   let rawText: String
   let metadata: [String: String]
   let shouldSpeak: Bool
-  let events: [BrainHostEvent]
+  let events: [BrainEvent]
 
   init(toolName: String, rawText: String) {
     self.toolName = toolName
@@ -35,17 +35,14 @@ nonisolated struct BrainToolResponse: Equatable {
     if let payload {
       let displayText = payload.displayText(rawJSON: rawText)
       text = displayText
-      metadata = Self.migrationFallbackMetadata(
-        payload.metadata(rawJSON: rawText),
-        kind: "legacy_command_result"
-      )
+      metadata = payload.metadata(rawJSON: rawText)
       shouldSpeak = payload.endedWithSpeech && !payload.spokenText.isEmpty
     } else {
       text = rawText
-      metadata = Self.migrationFallbackMetadata([
+      metadata = [
         "display_source": rawText.isEmpty ? "empty" : "raw_text",
         "display_text_length": "\(rawText.count)",
-      ], kind: rawText.isEmpty ? "empty_legacy_result" : "raw_text")
+      ]
       shouldSpeak = false
     }
   }
@@ -55,48 +52,21 @@ nonisolated struct BrainToolResponse: Equatable {
     self.rawText = rawText
     events = envelope.events
 
-    let outputJSON = envelope.toolOutputJSON ?? envelope.resultSummary ?? rawText
-    let payload = CommandResultPayload.decode(from: outputJSON)
     let eventText = envelope.displayTextFromEvents
-    if let payload {
-      let fallbackText = payload.displayText(rawJSON: outputJSON)
-      text = eventText.isEmpty ? fallbackText : eventText
-      var mergedMetadata = payload.metadata(rawJSON: outputJSON)
-      mergedMetadata.merge(envelope.metadata()) { current, _ in current }
-      mergedMetadata["display_source"] = eventText.isEmpty ? mergedMetadata["display_source"] : "event_envelope"
-      if eventText.isEmpty {
-        mergedMetadata = Self.migrationFallbackMetadata(
-          mergedMetadata,
-          kind: "legacy_command_result"
-        )
-      }
-      metadata = mergedMetadata
-      shouldSpeak = !envelope.speechTexts.isEmpty || (payload.endedWithSpeech && !payload.spokenText.isEmpty)
-    } else {
-      text = eventText.isEmpty ? outputJSON : eventText
-      var mergedMetadata = envelope.metadata()
-      mergedMetadata["display_source"] = eventText.isEmpty ? (outputJSON.isEmpty ? "empty" : "raw_text") : "event_envelope"
-      mergedMetadata["display_text_length"] = "\(text.count)"
-      if eventText.isEmpty {
-        mergedMetadata = Self.migrationFallbackMetadata(
-          mergedMetadata,
-          kind: outputJSON.isEmpty ? "empty_legacy_result" : "raw_text"
-        )
-      }
-      metadata = mergedMetadata
-      shouldSpeak = !envelope.speechTexts.isEmpty
-    }
-  }
+    let summaryText = envelope.resultRawResult == false ? (envelope.resultSummary ?? "") : ""
+    text = eventText.isEmpty ? summaryText : eventText
 
-  private static func migrationFallbackMetadata(_ metadata: [String: String], kind: String) -> [String: String] {
-    var annotated = metadata
-    annotated["migration_fallback"] = kind
-    annotated["fallback_warning"] = BrainCore.migrationFallbackWarning
-    return annotated
+    var mergedMetadata = envelope.metadata()
+    mergedMetadata["display_source"] = eventText.isEmpty
+      ? (summaryText.isEmpty ? "empty" : "result_summary")
+      : "event_envelope"
+    mergedMetadata["display_text_length"] = "\(text.count)"
+    metadata = mergedMetadata
+    shouldSpeak = !envelope.speechTexts.isEmpty
   }
 }
 
-nonisolated enum BrainEventPresentation: String, Codable, Equatable {
+nonisolated enum BrainEventPresentation: String, Codable, Equatable, Sendable {
   case chat
   case internalOnly = "internal"
   case status
@@ -107,124 +77,578 @@ nonisolated enum BrainEventPresentation: String, Codable, Equatable {
   }
 }
 
-nonisolated struct BrainHostEvent: Codable, Equatable {
-  let type: String
-  let requestID: String?
-  let role: String?
-  let text: String?
-  let state: String?
-  let enabled: Bool?
-  let kind: String?
-  let title: String?
-  let body: String?
-  let sense: String?
-  let eyes: String?
-  let mouth: String?
-  let durationMS: Int?
-  let mediaKind: String?
+nonisolated enum BrainEventEndpoint: String, Codable, Equatable, Sendable {
+  case brain
+  case host
+  case user
+  case system
+}
+
+nonisolated enum BrainEventVisibility: String, Codable, Equatable, Sendable {
+  case `private`
+  case diagnostic
+  case `public`
+}
+
+nonisolated enum BrainEventModality: String, Codable, Equatable, Sendable {
+  case text
+  case image
+  case audio
+  case video
+  case scalar
+  case structured
+  case media
+  case face
+  case facialExpression = "facial_expression"
+}
+
+nonisolated enum BrainParticipantRole: String, Codable, Equatable, Sendable {
+  case selfRole = "self"
+  case other
+  case brain
+  case host
+  case system
+}
+
+nonisolated enum BrainSenseDirection: String, Codable, Equatable, Sendable {
+  case pull
+  case push
+  case both
+}
+
+nonisolated enum BrainActionStatus: String, Codable, Equatable, Sendable {
+  case succeeded
+  case denied
+  case unavailable
+  case failed
+  case cancelled
+  case timedOut = "timed_out"
+}
+
+nonisolated enum BrainMemoryLayer: String, Codable, Equatable, Sendable, CaseIterable {
+  case working
+  case episodic
+  case semantic
+  case procedural
+  case affective
+  case relational
+  case autobiographical
+  case prospective
+}
+
+nonisolated enum BrainMemoryOperation: String, Codable, Equatable, Sendable {
+  case remember
+  case recall
+  case forget
+  case consolidate
+  case summarize
+  case pin
+  case inspect
+}
+
+nonisolated enum BrainLoopPhase: String, Codable, Equatable, Sendable {
+  case idle
+  case receivingExperience
+  case appraising
+  case recalling
+  case thinking
+  case planning
+  case awaitingHostAction
+  case integratingResult
+  case remembering
+  case expressing
+  case sleeping
+  case error
+}
+
+nonisolated struct BrainMediaRef: Codable, Equatable, Sendable {
+  let kind: BrainEventModality
   let path: String?
   let url: String?
   let mimeType: String?
   let caption: String?
-  let rawRef: String?
-  let originalBytes: Int?
-  let presentation: String?
-  let responsePresentation: String?
-  let awaitResponse: Bool?
-  let timeoutMS: Int?
-
-  init(
-    type: String,
-    requestID: String?,
-    role: String?,
-    text: String?,
-    state: String?,
-    enabled: Bool?,
-    kind: String?,
-    title: String?,
-    body: String?,
-    sense: String?,
-    eyes: String?,
-    mouth: String?,
-    durationMS: Int?,
-    mediaKind: String?,
-    path: String?,
-    url: String?,
-    mimeType: String?,
-    caption: String?,
-    rawRef: String?,
-    originalBytes: Int?,
-    presentation: String? = nil,
-    responsePresentation: String? = nil,
-    awaitResponse: Bool? = nil,
-    timeoutMS: Int? = nil
-  ) {
-    self.type = type
-    self.requestID = requestID
-    self.role = role
-    self.text = text
-    self.state = state
-    self.enabled = enabled
-    self.kind = kind
-    self.title = title
-    self.body = body
-    self.sense = sense
-    self.eyes = eyes
-    self.mouth = mouth
-    self.durationMS = durationMS
-    self.mediaKind = mediaKind
-    self.path = path
-    self.url = url
-    self.mimeType = mimeType
-    self.caption = caption
-    self.rawRef = rawRef
-    self.originalBytes = originalBytes
-    self.presentation = presentation
-    self.responsePresentation = responsePresentation
-    self.awaitResponse = awaitResponse
-    self.timeoutMS = timeoutMS
-  }
 
   private enum CodingKeys: String, CodingKey {
-    case type
-    case requestID = "request_id"
-    case role
-    case text
-    case state
-    case enabled
     case kind
-    case title
-    case body
-    case sense
-    case eyes
-    case mouth
-    case durationMS = "duration_ms"
-    case mediaKind = "media_kind"
     case path
     case url
     case mimeType = "mime_type"
     case caption
-    case rawRef = "raw_ref"
-    case originalBytes = "original_bytes"
-    case presentation
-    case responsePresentation = "response_presentation"
-    case awaitResponse = "await_response"
+  }
+}
+
+nonisolated struct BrainExperiencePayload: Codable, Equatable, Sendable {
+  let kind: String
+  let modality: BrainEventModality
+  let role: BrainParticipantRole?
+  let text: String?
+  let media: [BrainMediaRef]
+  let context: JSONValue?
+}
+
+nonisolated struct BrainSenseRequestPayload: Codable, Equatable, Sendable {
+  let senseID: String
+  let direction: BrainSenseDirection
+  let timeoutMS: Int?
+  let responsePresentation: BrainEventPresentation
+
+  private enum CodingKeys: String, CodingKey {
+    case senseID = "sense_id"
+    case direction
     case timeoutMS = "timeout_ms"
+    case responsePresentation = "response_presentation"
+  }
+}
+
+nonisolated struct BrainSenseObservationPayload: Codable, Equatable, Sendable {
+  let senseID: String
+  let modality: BrainEventModality
+  let summary: String
+  let media: [BrainMediaRef]
+  let value: JSONValue?
+  let confidence: Double?
+  let observedAt: String
+
+  private enum CodingKeys: String, CodingKey {
+    case senseID = "sense_id"
+    case modality
+    case summary
+    case media
+    case value
+    case confidence
+    case observedAt = "observed_at"
+  }
+}
+
+nonisolated struct BrainCapabilityDescriptor: Codable, Equatable, Sendable {
+  let id: String
+  let status: String
+  let reason: String?
+}
+
+nonisolated struct BrainCapabilityManifestPayload: Codable, Equatable, Sendable {
+  let capabilities: [BrainCapabilityDescriptor]
+  let senses: [BrainCapabilityDescriptor]
+}
+
+nonisolated struct BrainCapabilityStatusPayload: Codable, Equatable, Sendable {
+  let capabilityID: String
+  let status: String
+  let reason: String?
+  let permissionState: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case capabilityID = "capability_id"
+    case status
+    case reason
+    case permissionState = "permission_state"
+  }
+}
+
+nonisolated struct BrainThoughtPayload: Codable, Equatable, Sendable {
+  let text: String
+  let salience: Double?
+  let tags: [String]
+}
+
+nonisolated struct BrainAppraisalPayload: Codable, Equatable, Sendable {
+  let valence: Double?
+  let arousal: Double?
+  let salience: Double?
+  let confidence: Double?
+  let novelty: Double?
+  let tags: [String]
+  let summary: String?
+}
+
+nonisolated struct BrainNeedStatePayload: Codable, Equatable, Sendable {
+  let needs: [String: Double]
+  let summary: String?
+}
+
+nonisolated struct BrainAttentionStatePayload: Codable, Equatable, Sendable {
+  let focusEventID: String?
+  let competingEventIDs: [String]
+  let summary: String
+  let suppressionReason: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case focusEventID = "focus_event_id"
+    case competingEventIDs = "competing_event_ids"
+    case summary
+    case suppressionReason = "suppression_reason"
+  }
+}
+
+nonisolated struct BrainIntentionPayload: Codable, Equatable, Sendable {
+  let goal: String
+  let priority: Double?
+  let expectedAction: String?
+  let stoppingCondition: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case goal
+    case priority
+    case expectedAction = "expected_action"
+    case stoppingCondition = "stopping_condition"
+  }
+}
+
+nonisolated struct BrainActionRequestPayload: Codable, Equatable, Sendable {
+  let actionID: String
+  let action: String
+  let arguments: JSONValue
+  let requires: [String]
+  let awaitResponse: Bool
+
+  private enum CodingKeys: String, CodingKey {
+    case actionID = "action_id"
+    case action
+    case arguments
+    case requires
+    case awaitResponse = "await_response"
+  }
+}
+
+nonisolated struct BrainActionResultPayload: Codable, Equatable, Sendable {
+  let actionID: String
+  let status: BrainActionStatus
+  let summary: String
+  let result: JSONValue?
+  let error: BrainEventErrorPayload?
+
+  private enum CodingKeys: String, CodingKey {
+    case actionID = "action_id"
+    case status
+    case summary
+    case result
+    case error
+  }
+}
+
+nonisolated struct BrainExpressionPayload: Codable, Equatable, Sendable {
+  let modality: BrainEventModality
+  let role: BrainParticipantRole
+  let title: String?
+  let text: String?
+  let media: [BrainMediaRef]
+  let expressionID: String?
+  let eyes: String?
+  let mouth: String?
+  let durationMS: Int?
+
+  private enum CodingKeys: String, CodingKey {
+    case modality
+    case role
+    case title
+    case text
+    case media
+    case expressionID = "expression_id"
+    case eyes
+    case mouth
+    case durationMS = "duration_ms"
+  }
+}
+
+nonisolated struct BrainMemoryRequestPayload: Codable, Equatable, Sendable {
+  let operation: BrainMemoryOperation
+  let layers: [BrainMemoryLayer]
+  let query: String?
+  let text: String?
+  let tags: [String]
+}
+
+nonisolated struct BrainMemoryRecord: Codable, Equatable, Sendable {
+  let id: String
+  let layer: BrainMemoryLayer
+  let summary: String
+  let relevance: Double?
+  let confidence: Double?
+}
+
+nonisolated struct BrainMemoryResultPayload: Codable, Equatable, Sendable {
+  let operation: BrainMemoryOperation
+  let records: [BrainMemoryRecord]
+  let summary: String?
+}
+
+nonisolated struct BrainMemoryMutationPayload: Codable, Equatable, Sendable {
+  let operation: BrainMemoryOperation
+  let layer: BrainMemoryLayer
+  let recordIDs: [String]
+  let summary: String
+
+  private enum CodingKeys: String, CodingKey {
+    case operation
+    case layer
+    case recordIDs = "record_ids"
+    case summary
+  }
+}
+
+nonisolated struct BrainControlPayload: Codable, Equatable, Sendable {
+  let phase: BrainLoopPhase?
+  let sendEnabled: Bool?
+  let status: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case phase
+    case sendEnabled = "send_enabled"
+    case status
+  }
+}
+
+nonisolated struct BrainEventErrorPayload: Codable, Equatable, Sendable {
+  let code: String
+  let message: String
+  let recoverable: Bool?
+}
+
+nonisolated enum BrainEventPayload: Codable, Equatable, Sendable {
+  case experience(BrainExperiencePayload)
+  case senseRequest(BrainSenseRequestPayload)
+  case senseObservation(BrainSenseObservationPayload)
+  case capabilityManifest(BrainCapabilityManifestPayload)
+  case capabilityStatus(BrainCapabilityStatusPayload)
+  case thought(BrainThoughtPayload)
+  case appraisal(BrainAppraisalPayload)
+  case needState(BrainNeedStatePayload)
+  case attentionState(BrainAttentionStatePayload)
+  case intention(BrainIntentionPayload)
+  case actionRequest(BrainActionRequestPayload)
+  case actionResult(BrainActionResultPayload)
+  case expression(BrainExpressionPayload)
+  case memoryRequest(BrainMemoryRequestPayload)
+  case memoryResult(BrainMemoryResultPayload)
+  case memoryMutation(BrainMemoryMutationPayload)
+  case control(BrainControlPayload)
+  case error(BrainEventErrorPayload)
+
+  enum CodingKeys: String, CodingKey {
+    case experience
+    case senseRequest = "sense_request"
+    case senseObservation = "sense_observation"
+    case capabilityManifest = "capability_manifest"
+    case capabilityStatus = "capability_status"
+    case thought
+    case appraisal
+    case needState = "need_state"
+    case attentionState = "attention_state"
+    case intention
+    case actionRequest = "action_request"
+    case actionResult = "action_result"
+    case expression
+    case memoryRequest = "memory_request"
+    case memoryResult = "memory_result"
+    case memoryMutation = "memory_mutation"
+    case control
+    case error
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    if let value = try container.decodeIfPresent(BrainExperiencePayload.self, forKey: .experience) {
+      self = .experience(value)
+    } else if let value = try container.decodeIfPresent(BrainSenseRequestPayload.self, forKey: .senseRequest) {
+      self = .senseRequest(value)
+    } else if let value = try container.decodeIfPresent(BrainSenseObservationPayload.self, forKey: .senseObservation) {
+      self = .senseObservation(value)
+    } else if let value = try container.decodeIfPresent(BrainCapabilityManifestPayload.self, forKey: .capabilityManifest) {
+      self = .capabilityManifest(value)
+    } else if let value = try container.decodeIfPresent(BrainCapabilityStatusPayload.self, forKey: .capabilityStatus) {
+      self = .capabilityStatus(value)
+    } else if let value = try container.decodeIfPresent(BrainThoughtPayload.self, forKey: .thought) {
+      self = .thought(value)
+    } else if let value = try container.decodeIfPresent(BrainAppraisalPayload.self, forKey: .appraisal) {
+      self = .appraisal(value)
+    } else if let value = try container.decodeIfPresent(BrainNeedStatePayload.self, forKey: .needState) {
+      self = .needState(value)
+    } else if let value = try container.decodeIfPresent(BrainAttentionStatePayload.self, forKey: .attentionState) {
+      self = .attentionState(value)
+    } else if let value = try container.decodeIfPresent(BrainIntentionPayload.self, forKey: .intention) {
+      self = .intention(value)
+    } else if let value = try container.decodeIfPresent(BrainActionRequestPayload.self, forKey: .actionRequest) {
+      self = .actionRequest(value)
+    } else if let value = try container.decodeIfPresent(BrainActionResultPayload.self, forKey: .actionResult) {
+      self = .actionResult(value)
+    } else if let value = try container.decodeIfPresent(BrainExpressionPayload.self, forKey: .expression) {
+      self = .expression(value)
+    } else if let value = try container.decodeIfPresent(BrainMemoryRequestPayload.self, forKey: .memoryRequest) {
+      self = .memoryRequest(value)
+    } else if let value = try container.decodeIfPresent(BrainMemoryResultPayload.self, forKey: .memoryResult) {
+      self = .memoryResult(value)
+    } else if let value = try container.decodeIfPresent(BrainMemoryMutationPayload.self, forKey: .memoryMutation) {
+      self = .memoryMutation(value)
+    } else if let value = try container.decodeIfPresent(BrainControlPayload.self, forKey: .control) {
+      self = .control(value)
+    } else if let value = try container.decodeIfPresent(BrainEventErrorPayload.self, forKey: .error) {
+      self = .error(value)
+    } else {
+      throw BrainCoreError.malformedResponse
+    }
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    switch self {
+    case .experience(let value): try container.encode(value, forKey: .experience)
+    case .senseRequest(let value): try container.encode(value, forKey: .senseRequest)
+    case .senseObservation(let value): try container.encode(value, forKey: .senseObservation)
+    case .capabilityManifest(let value): try container.encode(value, forKey: .capabilityManifest)
+    case .capabilityStatus(let value): try container.encode(value, forKey: .capabilityStatus)
+    case .thought(let value): try container.encode(value, forKey: .thought)
+    case .appraisal(let value): try container.encode(value, forKey: .appraisal)
+    case .needState(let value): try container.encode(value, forKey: .needState)
+    case .attentionState(let value): try container.encode(value, forKey: .attentionState)
+    case .intention(let value): try container.encode(value, forKey: .intention)
+    case .actionRequest(let value): try container.encode(value, forKey: .actionRequest)
+    case .actionResult(let value): try container.encode(value, forKey: .actionResult)
+    case .expression(let value): try container.encode(value, forKey: .expression)
+    case .memoryRequest(let value): try container.encode(value, forKey: .memoryRequest)
+    case .memoryResult(let value): try container.encode(value, forKey: .memoryResult)
+    case .memoryMutation(let value): try container.encode(value, forKey: .memoryMutation)
+    case .control(let value): try container.encode(value, forKey: .control)
+    case .error(let value): try container.encode(value, forKey: .error)
+    }
+  }
+
+  var eventType: String {
+    switch self {
+    case .experience: "experience"
+    case .senseRequest: "sense_request"
+    case .senseObservation: "sense_observation"
+    case .capabilityManifest: "capability_manifest"
+    case .capabilityStatus: "capability_status"
+    case .thought: "thought"
+    case .appraisal: "appraisal"
+    case .needState: "need_state"
+    case .attentionState: "attention_state"
+    case .intention: "intention"
+    case .actionRequest: "action_request"
+    case .actionResult: "action_result"
+    case .expression: "expression"
+    case .memoryRequest: "memory_request"
+    case .memoryResult: "memory_result"
+    case .memoryMutation: "memory_mutation"
+    case .control: "control"
+    case .error: "error"
+    }
+  }
+}
+
+nonisolated struct BrainEvent: Codable, Equatable, Sendable {
+  let id: String
+  let traceID: String
+  let parentID: String?
+  let turnID: String?
+  let loopID: String?
+  let occurredAt: String
+  let source: BrainEventEndpoint
+  let target: BrainEventEndpoint
+  let visibility: BrainEventVisibility
+  let presentation: BrainEventPresentation
+  let payload: BrainEventPayload
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case traceID = "trace_id"
+    case parentID = "parent_id"
+    case turnID = "turn_id"
+    case loopID = "loop_id"
+    case occurredAt = "occurred_at"
+    case source
+    case target
+    case visibility
+    case presentation
+    case payload
+  }
+
+  var type: String { payload.eventType }
+
+  static func hostEvent(
+    payload: BrainEventPayload,
+    target: BrainEventEndpoint = .brain,
+    visibility: BrainEventVisibility = .diagnostic,
+    presentation: BrainEventPresentation = .internalOnly,
+    traceID: String = UUID().uuidString,
+    parentID: String? = nil,
+    turnID: String? = nil,
+    loopID: String? = nil,
+    occurredAt: String = BrainEvent.iso8601Now()
+  ) -> BrainEvent {
+    BrainEvent(
+      id: UUID().uuidString,
+      traceID: traceID,
+      parentID: parentID,
+      turnID: turnID,
+      loopID: loopID,
+      occurredAt: occurredAt,
+      source: .host,
+      target: target,
+      visibility: visibility,
+      presentation: presentation,
+      payload: payload
+    )
+  }
+
+  nonisolated static func iso8601Now() -> String {
+    ISO8601DateFormatter().string(from: Date())
+  }
+
+  func encodedJSONValue() throws -> JSONValue {
+    let data = try JSONEncoder().encode(self)
+    return try JSONDecoder().decode(JSONValue.self, from: data)
+  }
+}
+
+nonisolated enum PullSenseDirection: String, Codable, Equatable {
+  case pull
+  case push
+  case both
+}
+
+nonisolated enum PullSenseTerminalStatus: String, Codable, Equatable {
+  case fulfilled
+  case unavailable
+  case permissionDenied = "permission_denied"
+  case permissionRequired = "permission_required"
+  case permissionPending = "permission_pending"
+  case busy
+  case failed
+  case cancelled
+  case timedOut = "timed_out"
+  case unsupported
+}
+
+nonisolated struct PullSenseDescriptor: Equatable {
+  let senseID: String
+  let direction: PullSenseDirection
+  let availability: String
+  let permissionState: String
+  let statusReason: String
+
+  var jsonValue: JSONValue {
+    .object([
+      "sense_id": .string(senseID),
+      "sense": .string(senseID),
+      "sense_direction": .string(direction.rawValue),
+      "availability": .string(availability),
+      "permission_state": .string(permissionState),
+      "status_reason": .string(statusReason),
+    ])
   }
 }
 
 nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
-  let apiVersion: Int
   let requestID: String
   let ok: Bool
-  let events: [BrainHostEvent]
+  let events: [BrainEvent]
   let result: JSONValue?
   let error: BrainDispatchError?
   let budget: BrainDispatchBudget?
   let rawText: String
 
   private enum CodingKeys: String, CodingKey {
-    case apiVersion = "api_version"
     case requestID = "request_id"
     case ok
     case events
@@ -235,10 +659,9 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
 
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
-    apiVersion = try container.decode(Int.self, forKey: .apiVersion)
     requestID = try container.decode(String.self, forKey: .requestID)
     ok = try container.decode(Bool.self, forKey: .ok)
-    events = try container.decodeIfPresent([BrainHostEvent].self, forKey: .events) ?? []
+    events = try container.decodeIfPresent([BrainEvent].self, forKey: .events) ?? []
     result = try container.decodeIfPresent(JSONValue.self, forKey: .result)
     error = try container.decodeIfPresent(BrainDispatchError.self, forKey: .error)
     budget = try container.decodeIfPresent(BrainDispatchBudget.self, forKey: .budget)
@@ -246,16 +669,14 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
   }
 
   init(
-    apiVersion: Int,
     requestID: String,
     ok: Bool,
-    events: [BrainHostEvent],
+    events: [BrainEvent],
     result: JSONValue?,
     error: BrainDispatchError?,
     budget: BrainDispatchBudget? = nil,
     rawText: String = ""
   ) {
-    self.apiVersion = apiVersion
     self.requestID = requestID
     self.ok = ok
     self.events = events
@@ -267,7 +688,6 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
 
   func encode(to encoder: Encoder) throws {
     var container = encoder.container(keyedBy: CodingKeys.self)
-    try container.encode(apiVersion, forKey: .apiVersion)
     try container.encode(requestID, forKey: .requestID)
     try container.encode(ok, forKey: .ok)
     try container.encode(events, forKey: .events)
@@ -282,7 +702,6 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
     }
     var decoded = try JSONDecoder().decode(BrainDispatchEnvelope.self, from: data)
     decoded = BrainDispatchEnvelope(
-      apiVersion: decoded.apiVersion,
       requestID: decoded.requestID,
       ok: decoded.ok,
       events: decoded.events,
@@ -296,33 +715,27 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
 
   var speechTexts: [String] {
     events.compactMap { event in
-      event.type == "speech_requested" ? event.text : nil
+      if case .actionRequest(let value) = event.payload,
+        value.action == "speak",
+        case .object(let arguments) = value.arguments
+      {
+        return arguments["text"]?.stringValue
+      }
+      return nil
     }.filter { !$0.isEmpty }
   }
 
   var displayTextFromEvents: String {
-    if let chatText = events.last(where: { $0.type == "chat_message" && $0.role == "brain" })?.text,
-      !chatText.isEmpty
+    if let expressionText = events
+      .last(where: {
+        $0.type == "expression" && $0.isSelfMessage && ($0.modality ?? "text") == "text"
+      })?.text,
+      !expressionText.isEmpty
     {
-      return chatText
+      return expressionText
     }
     if let speechText = speechTexts.last {
       return speechText
-    }
-    if let commandBody = events.last(where: { $0.type == "command_log" })?.body,
-      !commandBody.isEmpty
-    {
-      return commandBody
-    }
-    if let captureBody = events.last(where: { $0.type == "capture_requested" })?.body,
-      !captureBody.isEmpty
-    {
-      return captureBody
-    }
-    if let senseBody = events.last(where: { $0.type == "sense_requested" })?.body,
-      !senseBody.isEmpty
-    {
-      return senseBody
     }
     return ""
   }
@@ -330,15 +743,8 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
   var conversationTurnJSON: String? {
     if resultRawResult == true,
       let summary = resultSummary,
-      eventType == "typed_text" || eventType == "speech_transcript"
+      eventType == "experience"
     {
-      return summary
-    }
-    return nil
-  }
-
-  var toolOutputJSON: String? {
-    if resultRawResult == true, let summary = resultSummary, eventType == "tool_call" {
       return summary
     }
     return nil
@@ -358,7 +764,6 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
 
   func metadata() -> [String: String] {
     var values = [
-      "api_version": "\(apiVersion)",
       "request_id": requestID,
       "event_count": "\(events.count)",
       "event_types": events.map(\.type).joined(separator: ","),
@@ -378,6 +783,252 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
       }
     }
     return values
+  }
+}
+
+extension BrainEvent {
+  var isSelfMessage: Bool {
+    role == "self" || role == "brain" || role == "bot" || role == "assistant" || role == "agent"
+  }
+
+  var requestID: String? {
+    switch payload {
+    case .senseRequest:
+      id
+    case .actionRequest(let value):
+      value.actionID
+    case .actionResult(let value):
+      value.actionID
+    default:
+      nil
+    }
+  }
+
+  var expressionID: String? {
+    if case .expression(let value) = payload { value.expressionID } else { nil }
+  }
+
+  var modality: String? {
+    switch payload {
+    case .experience(let value): value.modality.rawValue
+    case .senseObservation(let value): value.modality.rawValue
+    case .expression(let value): value.modality.rawValue
+    default: nil
+    }
+  }
+
+  var capability: String? {
+    switch payload {
+    case .capabilityStatus(let value): value.capabilityID
+    case .actionRequest(let value): value.action
+    default: nil
+    }
+  }
+
+  var status: String? {
+    switch payload {
+    case .capabilityStatus(let value): value.status
+    case .actionResult(let value): value.status.rawValue
+    case .control(let value): value.status
+    default: nil
+    }
+  }
+
+  var reason: String? {
+    switch payload {
+    case .capabilityStatus(let value): value.reason
+    case .error(let value): value.message
+    default: nil
+    }
+  }
+
+  var role: String? {
+    switch payload {
+    case .experience(let value): value.role?.rawValue
+    case .expression(let value): value.role.rawValue
+    default: nil
+    }
+  }
+
+  var text: String? {
+    switch payload {
+    case .experience(let value): value.text
+    case .thought(let value): value.text
+    case .appraisal(let value): value.summary
+    case .needState(let value): value.summary
+    case .attentionState(let value): value.summary
+    case .intention(let value): value.goal
+    case .actionRequest(let value):
+      if case .object(let arguments) = value.arguments {
+        arguments["text"]?.stringValue ?? arguments["summary"]?.stringValue
+      } else {
+        nil
+      }
+    case .actionResult(let value): value.summary
+    case .expression(let value): value.text
+    case .memoryResult(let value): value.summary
+    case .memoryMutation(let value): value.summary
+    case .control(let value): value.status
+    case .error(let value): value.message
+    default: nil
+    }
+  }
+
+  var state: String? {
+    if case .control(let value) = payload { value.phase?.rawValue ?? value.status } else { nil }
+  }
+
+  var enabled: Bool? {
+    if case .control(let value) = payload { value.sendEnabled } else { nil }
+  }
+
+  var kind: String? {
+    switch payload {
+    case .thought: "thought"
+    case .appraisal: "appraisal"
+    case .needState: "need_state"
+    case .attentionState: "attention_state"
+    case .intention: "intention"
+    case .memoryMutation: "memory"
+    default: nil
+    }
+  }
+
+  var title: String? {
+    switch payload {
+    case .expression(let value): value.title
+    case .memoryRequest(let value): value.operation.rawValue
+    case .memoryResult(let value): value.operation.rawValue
+    case .memoryMutation(let value): value.operation.rawValue
+    case .attentionState(let value): value.suppressionReason
+    case .senseRequest(let value): "\(value.senseID) sense"
+    case .actionRequest(let value): value.action
+    case .actionResult(let value): value.actionID
+    default: nil
+    }
+  }
+
+  var body: String? { text }
+
+  var sense: String? {
+    switch payload {
+    case .senseRequest(let value): value.senseID
+    case .senseObservation(let value): value.senseID
+    case .actionRequest(let value):
+      if case .object(let arguments) = value.arguments { arguments["sense"]?.stringValue } else { nil }
+    default: nil
+    }
+  }
+
+  var senseID: String? { sense }
+
+  var senseDirection: String? {
+    if case .senseRequest(let value) = payload { value.direction.rawValue } else { nil }
+  }
+
+  var availability: String? {
+    if case .capabilityStatus(let value) = payload { value.status } else { nil }
+  }
+
+  var permissionState: String? {
+    if case .capabilityStatus(let value) = payload { value.permissionState } else { nil }
+  }
+
+  var statusReason: String? { reason }
+
+  var observedAt: String? {
+    if case .senseObservation(let value) = payload { value.observedAt } else { nil }
+  }
+
+  var terminal: Bool? {
+    if case .actionResult = payload { true } else { nil }
+  }
+
+  var eyes: String? {
+    switch payload {
+    case .expression(let value):
+      value.eyes
+    case .actionRequest(let value):
+      if case .object(let arguments) = value.arguments { arguments["eyes"]?.stringValue } else { nil }
+    default:
+      nil
+    }
+  }
+
+  var mouth: String? {
+    switch payload {
+    case .expression(let value):
+      value.mouth
+    case .actionRequest(let value):
+      if case .object(let arguments) = value.arguments { arguments["mouth"]?.stringValue } else { nil }
+    default:
+      nil
+    }
+  }
+
+  var durationMS: Int? {
+    if case .expression(let value) = payload { value.durationMS } else { nil }
+  }
+
+  var mediaKind: String? {
+    switch payload {
+    case .experience(let value): value.media.first?.kind.rawValue
+    case .senseObservation(let value): value.media.first?.kind.rawValue
+    case .expression(let value): value.media.first?.kind.rawValue
+    default: nil
+    }
+  }
+
+  var path: String? {
+    switch payload {
+    case .experience(let value): value.media.first?.path
+    case .senseObservation(let value): value.media.first?.path
+    case .expression(let value): value.media.first?.path
+    default: nil
+    }
+  }
+
+  var url: String? {
+    switch payload {
+    case .experience(let value): value.media.first?.url
+    case .senseObservation(let value): value.media.first?.url
+    case .expression(let value): value.media.first?.url
+    default: nil
+    }
+  }
+
+  var mimeType: String? {
+    switch payload {
+    case .experience(let value): value.media.first?.mimeType
+    case .senseObservation(let value): value.media.first?.mimeType
+    case .expression(let value): value.media.first?.mimeType
+    default: nil
+    }
+  }
+
+  var caption: String? {
+    switch payload {
+    case .experience(let value): value.media.first?.caption
+    case .senseObservation(let value): value.media.first?.caption
+    case .expression(let value): value.media.first?.caption
+    default: nil
+    }
+  }
+
+  var responsePresentation: String? {
+    if case .senseRequest(let value) = payload { value.responsePresentation.rawValue } else { nil }
+  }
+
+  var awaitResponse: Bool? {
+    switch payload {
+    case .actionRequest(let value): value.awaitResponse
+    case .senseRequest(let value): value.timeoutMS != nil
+    default: nil
+    }
+  }
+
+  var timeoutMS: Int? {
+    if case .senseRequest(let value) = payload { value.timeoutMS } else { nil }
   }
 }
 

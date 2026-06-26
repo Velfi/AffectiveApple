@@ -442,7 +442,7 @@ struct TypingIndicatorBubble: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(AppTheme.accent)
             }
-            .overlay(Circle().stroke(.white.opacity(0.08)))
+            .overlay(Circle().stroke(AppTheme.separator))
     }
 }
 
@@ -524,7 +524,7 @@ struct ChatBubbleView: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(entry.kind == .error ? AppTheme.danger : AppTheme.accent)
             }
-            .overlay(Circle().stroke(.white.opacity(0.08)))
+            .overlay(Circle().stroke(AppTheme.separator))
     }
 
     var bubbleShape: RoundedRectangle {
@@ -613,7 +613,7 @@ struct ChatImageAttachmentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(.white.opacity(0.10))
+                .stroke(AppTheme.separator)
         )
         .accessibilityLabel(attachment.caption ?? "Image attachment")
     }
@@ -835,7 +835,7 @@ struct LogEntryView: View {
         .background(entry.kind.entryBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.07))
+                .stroke(AppTheme.separator)
         )
         .shadow(color: .black.opacity(0.14), radius: 18, y: 10)
         .padding(entry.kind == .user || entry.kind == .sent ? .trailing : .leading, horizontalSizeClass == .compact ? 0 : 34)
@@ -972,7 +972,7 @@ struct CommandImageThumbnailView: View {
             .background(.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(.white.opacity(0.08))
+                    .stroke(AppTheme.separator)
             )
         }
         .buttonStyle(.plain)
@@ -1006,7 +1006,7 @@ struct MetadataChip: View {
         .padding(.horizontal, 7)
         .padding(.vertical, 4)
         .background(.black.opacity(0.16), in: Capsule())
-        .overlay(Capsule().stroke(.white.opacity(0.08)))
+        .overlay(Capsule().stroke(AppTheme.separator))
         .help("\(key): \(value)")
     }
 }

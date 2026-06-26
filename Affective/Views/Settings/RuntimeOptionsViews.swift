@@ -70,7 +70,7 @@ struct OptionsView: View {
                         .background(AppTheme.controlBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                         .overlay(
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .stroke(.white.opacity(0.07))
+                                .stroke(AppTheme.separator)
                         )
                     }
 
@@ -81,6 +81,10 @@ struct OptionsView: View {
                         .padding(.horizontal, 2)
 
                     avatarEditorButton
+
+                    if model.selectedSettingsScope == .brain {
+                        BiometricPolicyCard(model: model)
+                    }
 
                     DonationSupportCard()
 
@@ -95,7 +99,7 @@ struct OptionsView: View {
             }
 
             Divider()
-                .overlay(.white.opacity(0.06))
+                .overlay(AppTheme.softSeparator)
 
             ApplyOptionsBar(model: model)
                 .padding(.horizontal, horizontalSizeClass == .compact ? 16 : 24)
@@ -131,6 +135,10 @@ struct OptionsView: View {
 
                     avatarEditorButton
 
+                    if model.selectedSettingsScope == .brain {
+                        BiometricPolicyCard(model: model)
+                    }
+
                     DonationSupportCard()
 
                     ForEach(model.optionGroups.indices.filter { model.optionGroups[$0].scope == model.selectedSettingsScope }, id: \.self) { index in
@@ -142,9 +150,11 @@ struct OptionsView: View {
                 .padding(.bottom, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .frame(maxHeight: .infinity)
+            .layoutPriority(1)
 
             Divider()
-                .overlay(.white.opacity(0.06))
+                .overlay(AppTheme.softSeparator)
 
             ApplyOptionsBar(model: model)
                 .padding(.horizontal, 12)
@@ -257,25 +267,12 @@ struct DonationSupportCard: View {
                     }
                 }
             }
-
-            Button {
-                Task {
-                    await store.loadProducts(forceRefresh: true)
-                }
-            } label: {
-                Label("Refresh Tip Options", systemImage: "arrow.clockwise")
-            }
-            .buttonStyle(.borderless)
-            .controlSize(.small)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(AppTheme.accent)
-            .disabled(store.isLoading)
         }
         .padding(14)
         .background(AppTheme.controlBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.07))
+                .stroke(AppTheme.separator)
         )
         .shadow(color: .black.opacity(0.18), radius: 10, x: 0, y: 2)
         .task {
@@ -286,6 +283,155 @@ struct DonationSupportCard: View {
     private func productButtonTitle(_ product: Product) -> String {
         "\(product.displayName) \(product.displayPrice)"
     }
+}
+
+struct BiometricPolicyCard: View {
+    @ObservedObject var model: AffectiveViewModel
+    @State private var confirmDeleteAll = false
+    @State private var confirmDisableAndDelete = false
+
+    var summaries: [BiometricTemplateSummary] {
+        model.biometricTemplateSummaries
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "person.crop.circle.badge.shield.checkmark")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Biometric Data Policy")
+                        .font(.headline.weight(.semibold))
+                    Text("People memory stays separate from biometric records. Face templates stay on this device unless you choose to export them. Affective does not collect them on a server, sell them, or send them to model providers. Enrollment is owner-managed: record consent before adding another person's biometric records.")
+                        .font(.callout)
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                policyLine("Collected", "biometric records, face templates, and optional labels")
+                policyLine("Purpose", "local recognition and comparison for this brain")
+                policyLine("Stored", "memory/face_embeddings/ and local biometric records")
+                policyLine("Retention", retentionText)
+                policyLine("Export", exportText)
+            }
+            .font(.caption)
+
+            Divider()
+                .overlay(AppTheme.softSeparator)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Biometric Records")
+                    .font(.subheadline.weight(.semibold))
+
+                if summaries.isEmpty {
+                    Text("No local biometric templates were found for this brain.")
+                        .font(.caption)
+                        .foregroundStyle(AppTheme.secondaryText)
+                } else {
+                    ForEach(summaries) { summary in
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Text(summary.name)
+                                .font(.caption.weight(.semibold))
+                                .lineLimit(1)
+                            Spacer(minLength: 8)
+                            Text("\(summary.templateCount) records")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(AppTheme.secondaryText)
+                            Text(summary.consentStatus)
+                                .font(.caption)
+                                .foregroundStyle(AppTheme.secondaryText)
+                        }
+                        .help(summaryHelp(summary))
+                    }
+                }
+            }
+
+            FlowLayout(spacing: 8) {
+                Button(role: .destructive) {
+                    confirmDeleteAll = true
+                } label: {
+                    Label("Delete Biometric Data", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button(role: .destructive) {
+                    confirmDisableAndDelete = true
+                } label: {
+                    Label("Disable and Delete", systemImage: "person.crop.circle.badge.xmark")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding(14)
+        .background(AppTheme.controlBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(AppTheme.separator)
+        )
+        .shadow(color: .black.opacity(0.14), radius: 10, x: 0, y: 2)
+        .confirmationDialog("Delete all biometric data for this brain?", isPresented: $confirmDeleteAll, titleVisibility: .visible) {
+            Button("Delete Biometric Data", role: .destructive) {
+                model.deleteAllBiometricData()
+            }
+        } message: {
+            Text("This removes face templates and local biometric records, but keeps the rest of the brain.")
+        }
+        .confirmationDialog("Disable recognition and delete biometric data?", isPresented: $confirmDisableAndDelete, titleVisibility: .visible) {
+            Button("Disable and Delete", role: .destructive) {
+                model.disableRecognitionAndDeleteBiometricData()
+            }
+        } message: {
+            Text("This turns recognition and enrollment off, excludes biometrics from future exports and iCloud uploads, and removes stored templates.")
+        }
+    }
+
+    var retentionText: String {
+        switch model.biometricPolicy.retentionPeriod {
+        case "30_days": "30 days"
+        case "1_year": "1 year"
+        case "3_years": "3 years"
+        case "delete_when_not_seen": "delete when a person has not been seen"
+        default: "until deleted"
+        }
+    }
+
+    var exportText: String {
+        model.biometricPolicy.exportIncluded
+            ? "included in exports and iCloud uploads after confirmation"
+            : "excluded from exports and iCloud uploads"
+    }
+
+    func policyLine(_ title: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title)
+                .fontWeight(.semibold)
+                .frame(width: 74, alignment: .leading)
+            Text(value)
+                .foregroundStyle(AppTheme.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    func summaryHelp(_ summary: BiometricTemplateSummary) -> String {
+        let created = summary.createdAt.map { Self.dateFormatter.string(from: $0) } ?? "unknown"
+        let lastMatched = summary.lastMatchedAt.map { Self.dateFormatter.string(from: $0) } ?? "unknown"
+        return "Created: \(created)\nLast matched: \(lastMatched)"
+    }
+
+    static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
 }
 
 @MainActor
@@ -406,7 +552,7 @@ struct RuntimeOptionGroupView: View {
                     RuntimeOptionRow(model: model, option: $option)
                     if option.id != group.options.last?.id {
                         Divider()
-                            .overlay(.white.opacity(0.05))
+                            .overlay(AppTheme.softSeparator)
                     }
                 }
             }
@@ -465,7 +611,7 @@ struct RuntimeOptionGroupView: View {
         .background(AppTheme.controlBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.07))
+                .stroke(AppTheme.separator)
         )
         .shadow(color: .black.opacity(0.14), radius: 10, x: 0, y: 2)
     }
@@ -852,7 +998,7 @@ struct OptionBadge: View {
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(.black.opacity(0.13), in: Capsule())
-            .overlay(Capsule().stroke(.white.opacity(0.08)))
+            .overlay(Capsule().stroke(AppTheme.separator))
     }
 }
 
@@ -891,7 +1037,7 @@ struct ApplyOptionsBar: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
             .background(AppTheme.panelBackground.opacity(0.7), in: Capsule())
-            .overlay(Capsule().stroke(.white.opacity(0.07)))
+            .overlay(Capsule().stroke(AppTheme.separator))
     }
 
     var applyButton: some View {

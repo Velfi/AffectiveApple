@@ -45,9 +45,9 @@ struct ComposerPanel: View {
         .background(AppTheme.composerBackground, in: RoundedRectangle(cornerRadius: isCompact ? 22 : 24, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: isCompact ? 22 : 24, style: .continuous)
-                .stroke(composerFocused.wrappedValue ? AppTheme.accent.opacity(0.34) : .white.opacity(0.10), lineWidth: 1)
+                .stroke(composerFocused.wrappedValue ? AppTheme.accent.opacity(0.34) : AppTheme.separator, lineWidth: 1)
         )
-        .shadow(color: .black.opacity(0.22), radius: 18, y: 8)
+        .shadow(color: AppTheme.ambientShadow, radius: 18, y: 8)
         #if canImport(PhotosUI)
         .onChange(of: selectedPhotoItem) { _, item in
             guard let item else { return }
@@ -67,9 +67,9 @@ struct ComposerPanel: View {
                 .frame(width: controlSize, height: controlSize)
                 .background(AppTheme.panelBackground, in: Circle())
                 .foregroundStyle(AppTheme.secondaryText)
-                .overlay(Circle().stroke(.white.opacity(0.08)))
+                .overlay(Circle().stroke(AppTheme.separator))
+                .hitTarget()
         }
-        .disabled(false)
         .accessibilityLabel("Send picture")
         #else
         EmptyView()
@@ -127,7 +127,8 @@ struct ComposerPanel: View {
                     .frame(width: controlSize, height: controlSize)
                     .background(canSubmit ? AppTheme.activePanelBackground : AppTheme.panelBackground, in: Circle())
                     .foregroundStyle(canSubmit ? AppTheme.accent : AppTheme.secondaryText)
-                    .overlay(Circle().stroke(.white.opacity(0.10)))
+                    .overlay(Circle().stroke(AppTheme.separator))
+                    .hitTarget()
             }
             .buttonStyle(.plain)
             .disabled(!canSubmit)
@@ -145,7 +146,8 @@ struct ComposerPanel: View {
                 .font(.system(size: isCompact ? 16 : 17, weight: .bold))
                 .frame(width: controlSize, height: controlSize)
                 .background(canSubmit ? AppTheme.accent : AppTheme.panelBackground, in: Circle())
-                .foregroundStyle(canSubmit ? AppTheme.background : AppTheme.secondaryText)
+                .foregroundStyle(canSubmit ? AppTheme.textOnAccent : AppTheme.secondaryText)
+                .hitTarget()
         }
         .buttonStyle(.plain)
         .disabled(!canSubmit)
@@ -308,6 +310,7 @@ struct PokeButton: View {
 
     var body: some View {
         pokeIcon
+            .frame(width: 44, height: 44)
             .contentShape(Circle())
             .gesture(pokeGesture)
             .opacity(!model.canSend && !model.isPoking ? 0.56 : 1)

@@ -59,7 +59,7 @@ struct BrainCreationSheet: View {
             .padding(24)
 
             Divider()
-                .overlay(.white.opacity(0.06))
+                .overlay(AppTheme.softSeparator)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
@@ -107,7 +107,7 @@ struct BrainCreationSheet: View {
             #endif
 
             Divider()
-                .overlay(.white.opacity(0.06))
+                .overlay(AppTheme.softSeparator)
 
             ViewThatFits(in: .horizontal) {
                 footerButtons(isStacked: false)
@@ -218,7 +218,7 @@ struct BrainRenameSheet: View {
             .padding(24)
 
             Divider()
-                .overlay(.white.opacity(0.06))
+                .overlay(AppTheme.softSeparator)
 
             VStack(alignment: .leading, spacing: 18) {
                 BrainCreationTextField(title: "Name", text: $name, prompt: brain.displayName)
@@ -236,7 +236,7 @@ struct BrainRenameSheet: View {
             .padding(24)
 
             Divider()
-                .overlay(.white.opacity(0.06))
+                .overlay(AppTheme.softSeparator)
 
             ViewThatFits(in: .horizontal) {
                 footerButtons(isStacked: false)
@@ -568,7 +568,7 @@ struct BrainCreationEditor: View {
                 .background(AppTheme.editorBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(.white.opacity(0.10))
+                        .stroke(AppTheme.separator)
                 )
         }
     }
