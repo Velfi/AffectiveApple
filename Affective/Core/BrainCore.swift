@@ -774,7 +774,7 @@ actor BrainCore {
         arguments: ["text": .string(conversationText)]
       )
       let responseText = envelope.displayText
-      var metadata = ["state": envelope.awaitingHostSense ? "awaiting host sense" : "mutating turn"]
+      var metadata = ["state": envelope.awaitingHostSenseStateLabel]
       metadata.merge(envelope.metadata()) { current, _ in current }
       metadata["display_source"] = responseText.isEmpty
         ? (envelope.awaitingHostSense ? "awaiting_host_sense" : "empty")

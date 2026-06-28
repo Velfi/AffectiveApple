@@ -1016,6 +1016,60 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
     userTextOutcomePayload?["awaiting_host_sense"]?.boolValue ?? false
   }
 
+  var awaitedHostSenseLabel: String? {
+    Self.trimmedOutcomeString(userTextOutcomePayload?["awaited_host_sense"]?.stringValue)
+  }
+
+  var awaitedHostPurposeLabel: String? {
+    Self.trimmedOutcomeString(userTextOutcomePayload?["awaited_host_purpose"]?.stringValue)
+  }
+
+  var awaitedHostTimeoutMS: Int? {
+    guard let value = userTextOutcomePayload?["awaited_host_timeout_ms"] else { return nil }
+    switch value {
+    case .number(let number):
+      return Int(number)
+    case .string(let text):
+      return Int(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    default:
+      return nil
+    }
+  }
+
+  private static func hostSenseTimeoutSuffix(timeoutMS: Int?) -> String {
+    guard let timeoutMS, timeoutMS > 0 else { return "" }
+    return " (\(timeoutMS)ms)"
+  }
+
+  var awaitingHostSenseStateLabel: String {
+    guard awaitingHostSense else { return "mutating turn" }
+    let timeoutSuffix = Self.hostSenseTimeoutSuffix(timeoutMS: awaitedHostTimeoutMS)
+    if let sense = awaitedHostSenseLabel, let purpose = awaitedHostPurposeLabel {
+      return "awaiting host sense: \(sense)/\(purpose)\(timeoutSuffix)"
+    }
+    if let sense = awaitedHostSenseLabel {
+      return "awaiting host sense: \(sense)\(timeoutSuffix)"
+    }
+    return "awaiting host sense\(timeoutSuffix)"
+  }
+
+  var pausedForHostSenseLabel: String {
+    let timeoutSuffix = Self.hostSenseTimeoutSuffix(timeoutMS: awaitedHostTimeoutMS)
+    if let sense = awaitedHostSenseLabel, let purpose = awaitedHostPurposeLabel {
+      return "paused for host sense: \(sense)/\(purpose)\(timeoutSuffix)"
+    }
+    if let sense = awaitedHostSenseLabel {
+      return "paused for host sense: \(sense)\(timeoutSuffix)"
+    }
+    return "paused for host sense\(timeoutSuffix)"
+  }
+
+  private static func trimmedOutcomeString(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
   var spokenTextFromResult: String {
     userTextOutcomePayload?["spoken_text"]?.stringValue?
       .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -1079,6 +1133,15 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
     }
     if awaitingHostSense {
       values["awaiting_host_sense"] = "true"
+      if let sense = awaitedHostSenseLabel {
+        values["awaited_host_sense"] = sense
+      }
+      if let purpose = awaitedHostPurposeLabel {
+        values["awaited_host_purpose"] = purpose
+      }
+      if let timeoutMS = awaitedHostTimeoutMS {
+        values["awaited_host_timeout_ms"] = "\(timeoutMS)"
+      }
     }
     if let spoken = userTextOutcomePayload?["spoken_text"]?.stringValue {
       values["spoken_text_present"] = spoken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "false" : "true"

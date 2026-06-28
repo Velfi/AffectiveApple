@@ -121,12 +121,23 @@ extension AffectiveViewModel {
             isBrainConnected = true
             statusText = "Zig core ready"
             appendEventLog(kind: .state, title: "core", body: "Brain core is ready.")
+            if !SystemBrainSpeechNotificationService.didRequestAuthorizationThisLaunch {
+                SystemBrainSpeechNotificationService.didRequestAuthorizationThisLaunch = true
+                brainSpeechNotifications.registerDelegateIfNeeded()
+                let notificationStatus = await brainSpeechNotifications.requestAuthorizationIfNeeded()
+                appendEventLog(
+                    kind: .state,
+                    title: "notification permission",
+                    body: notificationStatus.rawValue
+                )
+            }
             _ = await applyCoreEvents(envelope.events, mirrorChatMessages: false, speak: false, handleHostRequests: false)
             refreshBoredomSense()
 
             await refreshBrainMode()
             await refreshReadModelsSnapshot()
             refreshKnowledgeEntries()
+            await collectMailboxItems()
 
             await enterDreamOnLoadIfNeeded()
             if motionGestureOptionEnabled {
@@ -665,7 +676,7 @@ extension AffectiveViewModel {
                     appendEventLog(
                         kind: .result,
                         title: response.toolName,
-                        body: "paused for host sense",
+                        body: Self.pausedForHostSenseLabel(metadata: response.metadata),
                         metadata: response.metadata
                     )
                 }
@@ -680,7 +691,7 @@ extension AffectiveViewModel {
                     metadata: response.metadata
                 )
             } else {
-                statusText = "Waiting for camera"
+                statusText = Self.awaitingHostSenseStatusText(metadata: response.metadata)
             }
             if responseText.isEmpty, response.metadata["awaiting_host_sense"] != "true" {
                 canSend = true

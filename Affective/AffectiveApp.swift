@@ -15,6 +15,7 @@ import ImageIO
 @main
 struct AffectiveApp: App {
     init() {
+        SystemBrainSpeechNotificationService.shared.registerDelegateIfNeeded()
         #if DEBUG
         AffectiveSmokeTestHarness.prepareLaunchIfNeeded()
         AffectiveUITestHarness.prepareLaunchIfNeeded()

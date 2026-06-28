@@ -150,6 +150,7 @@ private struct AffectiveShellView: View {
     @FocusState private var composerFocused: Bool
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.scenePhase) private var scenePhase
 
     init(brain: BrainDescriptor) {
         self.brain = brain
@@ -188,6 +189,15 @@ private struct AffectiveShellView: View {
             }
             .task {
                 await model.connectToBrain()
+            }
+            .onAppear {
+                model.refreshAppIsForeground()
+                #if os(macOS)
+                model.installMacForegroundObserversIfNeeded()
+                #endif
+            }
+            .onChange(of: scenePhase) { _, phase in
+                model.setScenePhaseActive(phase == .active)
             }
     }
 

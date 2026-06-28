@@ -2153,6 +2153,9 @@ final class AffectiveTests: XCTestCase {
             "brain_summary": .string("Requested camera capture."),
             "interrupted_by": .null,
             "awaiting_host_sense": .bool(true),
+            "awaited_host_sense": .string("camera"),
+            "awaited_host_purpose": .string("recognize"),
+            "awaited_host_timeout_ms": .number(15_000),
           ]),
         ]),
       ])
@@ -2730,6 +2733,65 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(turns.filter { $0.text == "Speech-only hello." }.count, 1)
   }
 
+  func testBrainSpeechNotificationPolicy() {
+    XCTAssertFalse(BrainSpeechNotificationPolicy.shouldNotify(isForeground: true, text: "Hello"))
+    XCTAssertTrue(BrainSpeechNotificationPolicy.shouldNotify(isForeground: false, text: "Hello"))
+    XCTAssertFalse(BrainSpeechNotificationPolicy.shouldNotify(isForeground: false, text: "  "))
+    XCTAssertTrue(BrainSpeechNotificationPolicy.shouldSpeakAloud(isForeground: true, brainVoiceEnabled: true))
+    XCTAssertFalse(BrainSpeechNotificationPolicy.shouldSpeakAloud(isForeground: false, brainVoiceEnabled: true))
+    XCTAssertFalse(BrainSpeechNotificationPolicy.shouldSpeakAloud(isForeground: true, brainVoiceEnabled: false))
+  }
+
+  @MainActor
+  func testBackgroundSpeakPostsNotificationInsteadOfSpeech() async throws {
+    let mock = MockBrainSpeechNotificationClient()
+    mock.authorizationStatusResult = .authorized
+    let model = AffectiveViewModel(brain: try makeBrain(), brainSpeechNotifications: mock)
+    model.appIsForeground = false
+
+    let result = await model.applyCoreEvents([
+      speechRequestedEvent(text: "Background hello.")
+    ], mirrorChatMessages: true, speak: true)
+
+    XCTAssertFalse(result.didRequestSpeech)
+    XCTAssertEqual(mock.postCalls.count, 1)
+    XCTAssertEqual(mock.postCalls.first?.brainID, model.brain.id)
+    XCTAssertEqual(mock.postCalls.first?.text, "Background hello.")
+  }
+
+  @MainActor
+  func testForegroundSpeakDoesNotPostNotification() async throws {
+    let mock = MockBrainSpeechNotificationClient()
+    let model = AffectiveViewModel(brain: try makeBrain(), brainSpeechNotifications: mock)
+    model.appIsForeground = true
+    model.brainVoiceEnabled = false
+
+    _ = await model.applyCoreEvents([
+      speechRequestedEvent(text: "Foreground hello.")
+    ], mirrorChatMessages: true, speak: true)
+
+    XCTAssertEqual(mock.postCalls.count, 0)
+  }
+
+  @MainActor
+  func testBackgroundSpeakDeniedAuthorizationLogsEvent() async throws {
+    let mock = MockBrainSpeechNotificationClient()
+    mock.authorizationStatusResult = .denied
+    let model = AffectiveViewModel(brain: try makeBrain(), brainSpeechNotifications: mock)
+    model.appIsForeground = false
+
+    _ = await model.applyCoreEvents([
+      speechRequestedEvent(text: "Denied hello.")
+    ], mirrorChatMessages: true, speak: true)
+
+    XCTAssertEqual(mock.postCalls.count, 0)
+    XCTAssertTrue(model.eventEntries.contains { $0.title == "brain speech notification" && $0.body == "not delivered" })
+    XCTAssertEqual(
+      model.eventEntries.last { $0.title == "brain speech notification" }?.metadata["authorization"],
+      "denied"
+    )
+  }
+
   @MainActor
   func testBotActionClickSoundSurvivesRapidPlayback() {
     for _ in 0..<8 {
@@ -2956,6 +3018,21 @@ final class AffectiveTests: XCTestCase {
     ], mirrorChatMessages: true, speak: false)
 
     XCTAssertEqual(model.chatEntries.last?.title, "A brain")
+  }
+
+  @MainActor
+  func testRefreshMailboxItemsSkipsCoreWhenBrainIsNotConnected() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "mailbox_list"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+
+    model.refreshMailboxItems()
+    try await Task.sleep(nanoseconds: 50_000_000)
+
+    let callCount = await core.mailboxListCallCount
+    XCTAssertEqual(callCount, 0)
   }
 
   @MainActor
@@ -3291,6 +3368,9 @@ final class AffectiveTests: XCTestCase {
             "brain_summary": .string("Requested camera capture."),
             "interrupted_by": .null,
             "awaiting_host_sense": .bool(true),
+            "awaited_host_sense": .string("camera"),
+            "awaited_host_purpose": .string("recognize"),
+            "awaited_host_timeout_ms": .number(15_000),
           ]),
         ]),
       ]),
@@ -3306,6 +3386,10 @@ final class AffectiveTests: XCTestCase {
     XCTAssertTrue(paused.awaitingHostSense)
     XCTAssertEqual(paused.displayText, "")
     XCTAssertEqual(paused.metadata()["awaiting_host_sense"], "true")
+    XCTAssertEqual(paused.metadata()["awaited_host_sense"], "camera")
+    XCTAssertEqual(paused.metadata()["awaited_host_purpose"], "recognize")
+    XCTAssertEqual(paused.metadata()["awaited_host_timeout_ms"], "15000")
+    XCTAssertEqual(paused.awaitingHostSenseStateLabel, "awaiting host sense: camera/recognize (15000ms)")
     XCTAssertEqual(paused.metadata()["user_summary_present"], "true")
 
     let drain = try BrainDispatchEnvelope.decode(from: encodedEnvelopeText(
@@ -6215,6 +6299,7 @@ private actor ScriptedBrainCore: BrainCoreClient {
   private(set) var senseCatalogRequests: [String?] = []
   private(set) var pullSenseStatuses: [PullSenseStatusCall] = []
   private(set) var mailboxMarkReadIDs: [String] = []
+  private(set) var mailboxListCallCount = 0
 
   init(
     toolResponse: BrainToolResponse,
@@ -6483,7 +6568,8 @@ private actor ScriptedBrainCore: BrainCoreClient {
   }
 
   func mailboxList() async throws -> BrainMailboxListResponse {
-    BrainMailboxListResponse(toolName: "mailbox_list", items: mailboxItems, metadata: [:])
+    mailboxListCallCount += 1
+    return BrainMailboxListResponse(toolName: "mailbox_list", items: mailboxItems, metadata: [:])
   }
 
   func mailboxMarkRead(mailboxID: String) async throws -> BrainMailboxListResponse {
@@ -6658,6 +6744,32 @@ private final class FakeBrainCloudArchiveStore: BrainCloudArchiveStore {
     archives[manifest.brainID] = try Data(contentsOf: localURL)
     uploads.append(manifest)
   }
+}
+
+@MainActor
+private final class MockBrainSpeechNotificationClient: BrainSpeechNotificationClient {
+  var authorizationStatusResult: BrainSpeechNotificationAuthorizationStatus = .authorized
+  var postCalls: [(brainID: String, brainName: String, text: String)] = []
+
+  func requestAuthorizationIfNeeded() async -> BrainSpeechNotificationAuthorizationStatus {
+    authorizationStatusResult
+  }
+
+  func authorizationStatus() async -> BrainSpeechNotificationAuthorizationStatus {
+    authorizationStatusResult
+  }
+
+  func postIfAuthorized(brainID: String, brainName: String, text: String) async -> Bool {
+    guard authorizationStatusResult == .authorized
+      || authorizationStatusResult == .provisional
+      || authorizationStatusResult == .ephemeral else {
+      return false
+    }
+    postCalls.append((brainID: brainID, brainName: brainName, text: text))
+    return true
+  }
+
+  func registerDelegateIfNeeded() {}
 }
 
 #if os(macOS)

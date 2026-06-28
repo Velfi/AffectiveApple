@@ -81,6 +81,30 @@ extension AffectiveViewModel {
     }
 
     func speakBrainResponse(_ text: String) {
+        if BrainSpeechNotificationPolicy.shouldNotify(isForeground: appIsForeground, text: text) {
+            Task {
+                let posted = await brainSpeechNotifications.postIfAuthorized(
+                    brainID: brain.id,
+                    brainName: brain.displayName,
+                    text: text
+                )
+                if !posted {
+                    let status = await brainSpeechNotifications.authorizationStatus()
+                    appendEventLog(
+                        kind: .state,
+                        title: "brain speech notification",
+                        body: "not delivered",
+                        metadata: [
+                            "brain": brain.id,
+                            "authorization": status.rawValue,
+                        ]
+                    )
+                }
+            }
+            canSend = true
+            statusText = "Ready"
+            return
+        }
         guard brainVoiceEnabled else {
             canSend = true
             statusText = "Ready"
@@ -101,6 +125,28 @@ extension AffectiveViewModel {
     }
 
     func speakBrainResponseAndWait(_ text: String) async {
+        if BrainSpeechNotificationPolicy.shouldNotify(isForeground: appIsForeground, text: text) {
+            let posted = await brainSpeechNotifications.postIfAuthorized(
+                brainID: brain.id,
+                brainName: brain.displayName,
+                text: text
+            )
+            if !posted {
+                let status = await brainSpeechNotifications.authorizationStatus()
+                appendEventLog(
+                    kind: .state,
+                    title: "brain speech notification",
+                    body: "not delivered",
+                    metadata: [
+                        "brain": brain.id,
+                        "authorization": status.rawValue,
+                    ]
+                )
+            }
+            canSend = true
+            statusText = "Ready"
+            return
+        }
         guard brainVoiceEnabled else {
             canSend = true
             statusText = "Ready"

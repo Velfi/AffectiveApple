@@ -40,6 +40,7 @@ final class AffectiveViewModel: ObservableObject {
     let brainCore: any BrainCoreClient
     let speechSpeaker = AppleSpeechSpeaker()
     let notificationSounds = BrainNotificationSounds.shared
+    let brainSpeechNotifications: any BrainSpeechNotificationClient
     var pokeStartedAt: Date?
     var lastPokeEndedAt: Date?
     var pendingPokePulses: [PokePulse] = []
@@ -121,10 +122,20 @@ final class AffectiveViewModel: ObservableObject {
     var applyingQueuedFacialExpression = false
     @Published var autonomyControlCapacity: Double = 1.0
     @Published var autonomyMaxCapacity: Double = 1.0
+    @Published var appIsForeground = true
+    var scenePhaseIsActive = true
+    #if os(macOS)
+    var macForegroundObservers: [NSObject] = []
+    #endif
 
-    init(brain: BrainDescriptor, brainCore: (any BrainCoreClient)? = nil) {
+    init(
+        brain: BrainDescriptor,
+        brainCore: (any BrainCoreClient)? = nil,
+        brainSpeechNotifications: (any BrainSpeechNotificationClient)? = nil
+    ) {
         self.brain = brain
         self.brainCore = brainCore ?? BrainCore(brain: brain)
+        self.brainSpeechNotifications = brainSpeechNotifications ?? SystemBrainSpeechNotificationService.shared
         let storedValues = Self.storedValuesForLaunch(brain: brain)
         brainVoiceEnabled = UserDefaults.standard.object(forKey: Self.brainVoiceEnabledKey) as? Bool ?? true
         autonomyMode = Self.normalizeAutonomyMode(storedValues["autonomy_mode"] ?? "off")
@@ -140,7 +151,6 @@ final class AffectiveViewModel: ObservableObject {
         loadBrainStats()
         loadMailboxItems()
         recordBrainSizeSnapshotIfNeeded()
-        refreshMailboxItems()
         refreshKnowledgeEntries()
         resetAvatarFacialExpression()
     }
@@ -155,7 +165,30 @@ final class AffectiveViewModel: ObservableObject {
     deinit {
         boredomSenseTask?.cancel()
         motionGestureMonitor?.stop()
+        #if os(macOS)
+        for observer in macForegroundObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        #endif
     }
+
+    func setScenePhaseActive(_ active: Bool) {
+        scenePhaseIsActive = active
+        refreshAppIsForeground()
+    }
+
+    func refreshAppIsForeground() {
+        appIsForeground = AppForegroundMonitor.isForeground(scenePhaseActive: scenePhaseIsActive)
+    }
+
+    #if os(macOS)
+    func installMacForegroundObserversIfNeeded() {
+        guard macForegroundObservers.isEmpty else { return }
+        macForegroundObservers = AppForegroundMonitor.installMacActiveStateHandler { [weak self] _ in
+            self?.refreshAppIsForeground()
+        }
+    }
+    #endif
 
     var workspaceBrainTitle: String {
         brainPresentationName ?? brain.displayName
@@ -391,6 +424,7 @@ final class AffectiveViewModel: ObservableObject {
     }
 
     func refreshMailboxItems() {
+        guard isBrainConnected, !isBrainConnectionInFlight else { return }
         Task {
             await collectMailboxItems()
         }

@@ -206,6 +206,41 @@ extension AffectiveViewModel {
         }
     }
 
+    static func pausedForHostSenseLabel(metadata: [String: String]) -> String {
+        let sense = metadata["awaited_host_sense"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let purpose = metadata["awaited_host_purpose"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let timeoutSuffix = hostSenseTimeoutSuffix(metadata: metadata)
+        if !sense.isEmpty, !purpose.isEmpty {
+            return "paused for host sense: \(sense)/\(purpose)\(timeoutSuffix)"
+        }
+        if !sense.isEmpty {
+            return "paused for host sense: \(sense)\(timeoutSuffix)"
+        }
+        return "paused for host sense\(timeoutSuffix)"
+    }
+
+    static func awaitingHostSenseStatusText(metadata: [String: String]) -> String {
+        let sense = metadata["awaited_host_sense"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let purpose = metadata["awaited_host_purpose"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let timeoutSuffix = hostSenseTimeoutSuffix(metadata: metadata)
+        if !sense.isEmpty, !purpose.isEmpty {
+            return "Waiting for \(sense) (\(purpose))\(timeoutSuffix)"
+        }
+        if !sense.isEmpty {
+            return "Waiting for \(sense)\(timeoutSuffix)"
+        }
+        return "Waiting for host sense\(timeoutSuffix)"
+    }
+
+    private static func hostSenseTimeoutSuffix(metadata: [String: String]) -> String {
+        guard let raw = metadata["awaited_host_timeout_ms"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let timeoutMS = Int(raw),
+              timeoutMS > 0
+        else { return "" }
+        return " (\(timeoutMS)ms)"
+    }
+
     func conversationDisplaySummary(responseText: String, metadata: [String: String]) -> String {
         let spoken = metadata["spoken_text_present"] ?? "unknown"
         let brainSummary = metadata["brain_summary_present"] ?? "unknown"
@@ -387,6 +422,29 @@ extension AffectiveViewModel {
             if !didRecordBrainTurn {
                 recordConversationTurn(role: "self", text: speechText, source: "capability_request", metadata: [:])
                 didRecordBrainTurn = true
+            }
+            if BrainSpeechNotificationPolicy.shouldNotify(isForeground: appIsForeground, text: speechText) {
+                let posted = await brainSpeechNotifications.postIfAuthorized(
+                    brainID: brain.id,
+                    brainName: brain.displayName,
+                    text: speechText
+                )
+                if !posted {
+                    let status = await brainSpeechNotifications.authorizationStatus()
+                    appendEventLog(
+                        kind: .state,
+                        title: "brain speech notification",
+                        body: "not delivered",
+                        metadata: [
+                            "brain": brain.id,
+                            "authorization": status.rawValue,
+                        ]
+                    )
+                }
+                if didEmitSocialSignal {
+                    markAwaitingSocialResponse()
+                }
+                return (didAppendBrainChat, false, didApplyActivityStatus, didRecordBrainTurn, resolvedBrainText)
             }
             await speakBrainResponseAndWait(speechText)
             return (didAppendBrainChat, true, didApplyActivityStatus, didRecordBrainTurn, resolvedBrainText)
