@@ -116,7 +116,7 @@ Current foothold:
 
 - AffectiveCore now has `src/affective_core_embedded.zig`, a C ABI entrypoint for Affective.
 - `zig build embedded` builds `libaffective-core-embedded.a`.
-- The ABI currently supports local runtime create/destroy plus the embedded API v2 dispatch, drain, and introspection JSON routes. Affective sends typed text, touch, poke, and tool events through the v2 envelope.
+- The ABI currently supports local runtime create/destroy plus embedded API v2 typed operation dispatch and event draining. Affective sends host binding, experience events, conversation turns, touch, poke, brain mode, read-model, mailbox, import/export, and capability status operations through that envelope.
 - Affective has a `BrainCore` wrapper that creates the Zig handle from a selected brain's local paths and routes brain actions through that embedded ABI.
 - Affective has an iOS-only Xcode build phase that runs `scripts/build_affective_core.sh`, compiling the Zig library into DerivedData for `iphoneos` and `iphonesimulator`.
 - Affective links the embedded Zig library and `sqlite3` only for iOS SDKs. macOS remains on the `affective-core-mcp` process bridge.
@@ -174,8 +174,8 @@ Start with a local iOS core requirement and design toward either Option 1 or Opt
 Phase 1:
 
 - macOS app launches or connects to the existing Zig core.
-- iOS app uses the same typed brain contract, backed by the embedded Zig target for typed conversation, introspection, and current Affective live tools.
-- Shared contracts are command schemas, observation schemas, provider account metadata, and brain export format.
+- iOS app uses the same typed brain contract, backed by the embedded Zig target for typed conversation, read-model snapshots, mailbox, Dream Time, and current Affective live capabilities.
+- Shared contracts are experience events, capability status, read-model snapshots, provider account metadata, and brain export format.
 
 Phase 2:
 

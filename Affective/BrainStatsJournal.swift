@@ -172,7 +172,7 @@ extension JSONEncoder {
 }
 
 extension FileManager {
-    func approximateDirectorySize(at rootURL: URL, maximumFiles: Int = 400) -> Int64 {
+    nonisolated func approximateDirectorySize(at rootURL: URL, maximumFiles: Int = 400) -> Int64 {
         guard let enumerator = enumerator(
             at: rootURL,
             includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey],

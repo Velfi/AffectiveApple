@@ -57,12 +57,12 @@ nonisolated struct BrainCloudImport: Equatable, Sendable {
     var state: BrainCloudImportState
 }
 
-nonisolated protocol BrainCloudCheckpointStore {
+nonisolated protocol BrainCloudArchiveStore {
     func listManifests() async throws -> [BrainCloudManifest]
     func loadManifest(brainID: String) async throws -> BrainCloudManifest?
     func importState(for manifest: BrainCloudManifest) async throws -> BrainCloudImportState
-    func downloadCheckpoint(brainID: String, to localURL: URL) async throws -> BrainCloudManifest
-    func uploadCheckpoint(from localURL: URL, manifest: BrainCloudManifest) async throws
+    func downloadArchive(brainID: String, to localURL: URL) async throws -> BrainCloudManifest
+    func uploadArchive(from localURL: URL, manifest: BrainCloudManifest) async throws
 }
 
 nonisolated enum BrainSyncState: Equatable {
@@ -114,21 +114,21 @@ nonisolated enum BrainSyncState: Equatable {
 
 nonisolated enum BrainSyncError: Error, LocalizedError {
     case unavailableICloudContainer
-    case missingCheckpoint
-    case invalidCheckpointPath(String)
-    case invalidCheckpoint
+    case missingArchive
+    case invalidArchivePath(String)
+    case invalidArchive
     case conflictRequiresChoice
 
     var errorDescription: String? {
         switch self {
         case .unavailableICloudContainer:
             return "iCloud Drive is unavailable for this Apple ID or app container."
-        case .missingCheckpoint:
-            return "The iCloud brain checkpoint is missing."
-        case .invalidCheckpointPath(let path):
-            return "The brain checkpoint contains an unsafe path: \(path)."
-        case .invalidCheckpoint:
-            return "The brain checkpoint is invalid."
+        case .missingArchive:
+            return "The iCloud brain archive is missing."
+        case .invalidArchivePath(let path):
+            return "The brain archive contains an unsafe path: \(path)."
+        case .invalidArchive:
+            return "The brain archive is invalid."
         case .conflictRequiresChoice:
             return "Choose whether to keep the local brain or the iCloud brain."
         }
@@ -138,9 +138,9 @@ nonisolated enum BrainSyncError: Error, LocalizedError {
         switch self {
         case .unavailableICloudContainer:
             return "Open System Settings, make sure iCloud Drive is enabled for this Apple ID, then reopen Affective and try again."
-        case .missingCheckpoint:
+        case .missingArchive:
             return "Wait for iCloud Drive to finish syncing, then try Import Brain (iCloud) again. If it still is not available, export the brain from the other device and use Import Brain."
-        case .invalidCheckpointPath, .invalidCheckpoint:
+        case .invalidArchivePath, .invalidArchive:
             return "The iCloud copy looks damaged or incompatible. Re-export the brain from the source device, then import that file locally."
         case .conflictRequiresChoice:
             return "Pick the local brain or the iCloud brain before importing another copy."
@@ -159,14 +159,14 @@ final class BrainSyncManager: ObservableObject {
     @Published private(set) var importableCloudBrains: [BrainCloudManifest] = []
     @Published private(set) var unavailableCloudImports: [BrainCloudImport] = []
 
-    private let store: BrainCloudCheckpointStore
+    private let store: BrainCloudArchiveStore
     private let fileManager: FileManager
     private let userDefaults: UserDefaults
     private let deviceID: String
     private var inFlightTasks: [BrainDescriptor.ID: Task<Void, Never>] = [:]
 
     init(
-        store: BrainCloudCheckpointStore = ICloudBrainCheckpointStore(),
+        store: BrainCloudArchiveStore = ICloudBrainArchiveStore(),
         fileManager: FileManager = .default,
         userDefaults: UserDefaults = .standard,
         deviceID: String = HostDeviceID.current(userDefaults: .standard)
@@ -219,13 +219,13 @@ final class BrainSyncManager: ObservableObject {
         let scratch = fileManager.temporaryDirectory.appendingPathComponent("AffectiveCloudImport-\(UUID().uuidString)", isDirectory: true)
         defer { try? fileManager.removeItem(at: scratch) }
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
-        let archiveURL = scratch.appendingPathComponent(BrainCheckpointArchive.archiveFileName(for: manifest.brainID))
-        let downloadedManifest = try await store.downloadCheckpoint(brainID: manifest.brainID, to: archiveURL)
+        let archiveURL = scratch.appendingPathComponent(BrainCloudArchive.archiveFileName(for: manifest.brainID))
+        let downloadedManifest = try await store.downloadArchive(brainID: manifest.brainID, to: archiveURL)
         guard downloadedManifest.archiveHash == manifest.archiveHash else {
-            throw BrainSyncError.invalidCheckpoint
+            throw BrainSyncError.invalidArchive
         }
 
-        let brain = try library.importBrainArchive(from: archiveURL, preservingBrainID: manifest.brainID)
+        let brain = try await library.importBrainFileWithCore(from: archiveURL)
         syncedBrainID = brain.id
         userDefaults.set(brain.id, forKey: Self.syncedBrainIDKey)
         saveMetadata(.init(
@@ -300,45 +300,42 @@ final class BrainSyncManager: ObservableObject {
         setState(.checking, for: brain.id)
         do {
             let includeBiometricData = BiometricDataPolicy.load(for: brain).shouldIncludeInExport
-            let localCheckpoint = try BrainCheckpointArchive.createCheckpoint(
+            let localArchive = try await createCloudArchive(
                 for: brain,
-                schemaVersion: Self.schemaVersion,
-                deviceID: deviceID,
                 revision: nil,
-                includeBiometricData: includeBiometricData,
-                fileManager: fileManager
+                includeBiometricData: includeBiometricData
             )
-            defer { try? fileManager.removeItem(at: localCheckpoint.archiveURL.deletingLastPathComponent()) }
+            defer { try? fileManager.removeItem(at: localArchive.scratchRoot) }
 
             let cloudManifest = try await store.loadManifest(brainID: brain.id)
             guard let cloudManifest else {
                 setState(.uploading, for: brain.id)
-                var manifest = localCheckpoint.manifest
+                var manifest = localArchive.manifest
                 manifest.revision = 1
                 manifest.uploadedAt = Date()
-                try await store.uploadCheckpoint(from: localCheckpoint.archiveURL, manifest: manifest)
+                try await store.uploadArchive(from: localArchive.archiveURL, manifest: manifest)
                 saveMetadata(.init(archiveHash: manifest.archiveHash, cloudArchiveHash: manifest.archiveHash, revision: manifest.revision, cloudModifiedAt: manifest.uploadedAt), for: brain.id)
                 setState(.synced, for: brain.id)
                 return
             }
 
             let metadata = loadMetadata(for: brain.id)
-            let localChanged = metadata.map { $0.archiveHash != localCheckpoint.manifest.archiveHash } ?? (localCheckpoint.manifest.archiveHash != cloudManifest.archiveHash)
-            let cloudChanged = metadata.map { $0.cloudArchiveHash != cloudManifest.archiveHash || $0.revision != cloudManifest.revision } ?? (localCheckpoint.manifest.archiveHash != cloudManifest.archiveHash)
+            let localChanged = metadata.map { $0.archiveHash != localArchive.manifest.archiveHash } ?? (localArchive.manifest.archiveHash != cloudManifest.archiveHash)
+            let cloudChanged = metadata.map { $0.cloudArchiveHash != cloudManifest.archiveHash || $0.revision != cloudManifest.revision } ?? (localArchive.manifest.archiveHash != cloudManifest.archiveHash)
 
-            if localCheckpoint.manifest.archiveHash == cloudManifest.archiveHash {
-                saveMetadata(.init(archiveHash: localCheckpoint.manifest.archiveHash, cloudArchiveHash: cloudManifest.archiveHash, revision: cloudManifest.revision, cloudModifiedAt: cloudManifest.uploadedAt), for: brain.id)
+            if localArchive.manifest.archiveHash == cloudManifest.archiveHash {
+                saveMetadata(.init(archiveHash: localArchive.manifest.archiveHash, cloudArchiveHash: cloudManifest.archiveHash, revision: cloudManifest.revision, cloudModifiedAt: cloudManifest.uploadedAt), for: brain.id)
                 setState(.synced, for: brain.id)
             } else if localChanged && cloudChanged {
                 setState(.conflict, for: brain.id)
             } else if cloudChanged {
-                try await downloadCloudCheckpoint(brain: brain, cloudManifest: cloudManifest)
+                try await downloadCloudArchive(brain: brain, cloudManifest: cloudManifest)
             } else {
                 setState(.uploading, for: brain.id)
-                var manifest = localCheckpoint.manifest
+                var manifest = localArchive.manifest
                 manifest.revision = cloudManifest.revision + 1
                 manifest.uploadedAt = Date()
-                try await store.uploadCheckpoint(from: localCheckpoint.archiveURL, manifest: manifest)
+                try await store.uploadArchive(from: localArchive.archiveURL, manifest: manifest)
                 saveMetadata(.init(archiveHash: manifest.archiveHash, cloudArchiveHash: manifest.archiveHash, revision: manifest.revision, cloudModifiedAt: manifest.uploadedAt), for: brain.id)
                 setState(.synced, for: brain.id)
             }
@@ -352,17 +349,14 @@ final class BrainSyncManager: ObservableObject {
         do {
             let cloudManifest = try await store.loadManifest(brainID: brain.id)
             let includeBiometricData = BiometricDataPolicy.load(for: brain).shouldIncludeInExport
-            let localCheckpoint = try BrainCheckpointArchive.createCheckpoint(
+            let localArchive = try await createCloudArchive(
                 for: brain,
-                schemaVersion: Self.schemaVersion,
-                deviceID: deviceID,
                 revision: (cloudManifest?.revision ?? 0) + 1,
-                includeBiometricData: includeBiometricData,
-                fileManager: fileManager
+                includeBiometricData: includeBiometricData
             )
-            defer { try? fileManager.removeItem(at: localCheckpoint.archiveURL.deletingLastPathComponent()) }
-            try await store.uploadCheckpoint(from: localCheckpoint.archiveURL, manifest: localCheckpoint.manifest)
-            saveMetadata(.init(archiveHash: localCheckpoint.manifest.archiveHash, cloudArchiveHash: localCheckpoint.manifest.archiveHash, revision: localCheckpoint.manifest.revision, cloudModifiedAt: localCheckpoint.manifest.uploadedAt), for: brain.id)
+            defer { try? fileManager.removeItem(at: localArchive.scratchRoot) }
+            try await store.uploadArchive(from: localArchive.archiveURL, manifest: localArchive.manifest)
+            saveMetadata(.init(archiveHash: localArchive.manifest.archiveHash, cloudArchiveHash: localArchive.manifest.archiveHash, revision: localArchive.manifest.revision, cloudModifiedAt: localArchive.manifest.uploadedAt), for: brain.id)
             setState(.synced, for: brain.id)
         } catch {
             setState(.failed(error.localizedDescription), for: brain.id)
@@ -373,27 +367,27 @@ final class BrainSyncManager: ObservableObject {
         setState(.downloading, for: brain.id)
         do {
             let manifest = try await store.loadManifest(brainID: brain.id) ?? {
-                throw BrainSyncError.missingCheckpoint
+                throw BrainSyncError.missingArchive
             }()
-            try await downloadCloudCheckpoint(brain: brain, cloudManifest: manifest)
+            try await downloadCloudArchive(brain: brain, cloudManifest: manifest)
             library.refresh()
         } catch {
             setState(.failed(error.localizedDescription), for: brain.id)
         }
     }
 
-    private func downloadCloudCheckpoint(brain: BrainDescriptor, cloudManifest: BrainCloudManifest) async throws {
+    private func downloadCloudArchive(brain: BrainDescriptor, cloudManifest: BrainCloudManifest) async throws {
         setState(.downloading, for: brain.id)
         let scratch = fileManager.temporaryDirectory.appendingPathComponent("AffectiveCloudDownload-\(UUID().uuidString)", isDirectory: true)
         defer { try? fileManager.removeItem(at: scratch) }
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
-        let archiveURL = scratch.appendingPathComponent(BrainCheckpointArchive.archiveFileName(for: brain.id))
-        let manifest = try await store.downloadCheckpoint(brainID: brain.id, to: archiveURL)
+        let archiveURL = scratch.appendingPathComponent(BrainCloudArchive.archiveFileName(for: brain.id))
+        let manifest = try await store.downloadArchive(brainID: brain.id, to: archiveURL)
         guard manifest.archiveHash == cloudManifest.archiveHash else {
-            throw BrainSyncError.invalidCheckpoint
+            throw BrainSyncError.invalidArchive
         }
         let restoredRoot = scratch.appendingPathComponent(brain.id, isDirectory: true)
-        try BrainCheckpointArchive.restoreCheckpoint(at: archiveURL, to: restoredRoot, fileManager: fileManager)
+        _ = try await BrainLibrary.importBrainFileWithCore(from: archiveURL, to: restoredRoot, expectedBrainID: brain.id)
         let restored = BrainDescriptor(
             id: brain.id,
             displayName: brain.displayName,
@@ -407,6 +401,67 @@ final class BrainSyncManager: ObservableObject {
         try replaceBrainRoot(at: brain.rootURL, with: restoredRoot)
         saveMetadata(.init(archiveHash: manifest.archiveHash, cloudArchiveHash: manifest.archiveHash, revision: manifest.revision, cloudModifiedAt: manifest.uploadedAt), for: brain.id)
         setState(.synced, for: brain.id)
+    }
+
+    private func createCloudArchive(
+        for brain: BrainDescriptor,
+        revision: Int?,
+        includeBiometricData: Bool
+    ) async throws -> BrainCloudArchive.Created {
+        let scratch = fileManager.temporaryDirectory.appendingPathComponent("AffectiveBrainArchive-\(UUID().uuidString)", isDirectory: true)
+        let archiveURL = scratch.appendingPathComponent(BrainCloudArchive.archiveFileName(for: brain.id))
+        try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
+
+        let exportBrain: BrainDescriptor
+        if includeBiometricData {
+            exportBrain = brain
+        } else {
+            let scrubbedRoot = scratch.appendingPathComponent("scrubbed", isDirectory: true)
+            try BrainLibrary.copyBrain(
+                from: brain.rootURL,
+                to: scrubbedRoot,
+                includeBiometricData: false,
+                fileManager: fileManager
+            )
+            exportBrain = BrainDescriptor(
+                id: brain.id,
+                displayName: brain.displayName,
+                rootURL: scrubbedRoot,
+                avatarURL: nil,
+                avatarManifest: nil,
+                modifiedAt: brain.modifiedAt,
+                isRecent: brain.isRecent
+            )
+        }
+
+        let core = BrainCore(brain: exportBrain)
+        do {
+            _ = try await BrainArchiveOperationGate.shared.run {
+                try await core.exportBrain(to: archiveURL)
+            }
+            await core.disconnect()
+        } catch {
+            await core.disconnect()
+            throw error
+        }
+
+        let archiveHash = try BrainCloudArchive.archiveHash(at: archiveURL)
+        let modifiedAt = brain.modifiedAt ?? Date()
+        return BrainCloudArchive.Created(
+            archiveURL: archiveURL,
+            scratchRoot: scratch,
+            manifest: BrainCloudManifest(
+                brainID: brain.id,
+                displayName: brain.displayName,
+                schemaVersion: Self.schemaVersion,
+                archiveHash: archiveHash,
+                createdAt: modifiedAt,
+                modifiedAt: modifiedAt,
+                uploadedAt: Date(),
+                deviceID: deviceID,
+                revision: revision ?? 0
+            )
+        )
     }
 
     private func replaceBrainRoot(at destination: URL, with restoredRoot: URL) throws {
@@ -447,7 +502,7 @@ final class BrainSyncManager: ObservableObject {
     }
 }
 
-nonisolated struct ICloudBrainCheckpointStore: BrainCloudCheckpointStore {
+nonisolated struct ICloudBrainArchiveStore: BrainCloudArchiveStore {
     var containerIdentifier: String?
     var fileManager: FileManager = .default
 
@@ -479,7 +534,7 @@ nonisolated struct ICloudBrainCheckpointStore: BrainCloudCheckpointStore {
     func importState(for manifest: BrainCloudManifest) async throws -> BrainCloudImportState {
         try await performFileAccess { root, fileManager in
             let manifestURL = root.appendingPathComponent("\(manifest.brainID).manifest.json")
-            let archiveURL = root.appendingPathComponent(BrainCheckpointArchive.archiveFileName(for: manifest.brainID))
+            let archiveURL = root.appendingPathComponent(BrainCloudArchive.archiveFileName(for: manifest.brainID))
             guard fileManager.fileExists(atPath: manifestURL.path),
                   fileManager.fileExists(atPath: archiveURL.path) else {
                 return .syncing
@@ -490,11 +545,11 @@ nonisolated struct ICloudBrainCheckpointStore: BrainCloudCheckpointStore {
 
             do {
                 let data = try Data(contentsOf: archiveURL)
-                let hash = BrainCheckpointArchive.sha256Hex(data)
+                let hash = BrainCloudArchive.sha256Hex(data)
                 guard hash == manifest.archiveHash else {
                     return .invalid("The archive checksum does not match its manifest.")
                 }
-                try BrainCheckpointArchive.validateCheckpointPayload(data, expectedBrainID: manifest.brainID)
+                try BrainCloudArchive.validateArchiveData(data)
                 return .available
             } catch let error as BrainSyncError {
                 return .invalid(error.localizedDescription)
@@ -504,17 +559,17 @@ nonisolated struct ICloudBrainCheckpointStore: BrainCloudCheckpointStore {
         }
     }
 
-    func downloadCheckpoint(brainID: String, to localURL: URL) async throws -> BrainCloudManifest {
+    func downloadArchive(brainID: String, to localURL: URL) async throws -> BrainCloudManifest {
         try await performFileAccess { root, fileManager in
             let manifestURL = root.appendingPathComponent("\(brainID).manifest.json")
             guard fileManager.fileExists(atPath: manifestURL.path) else {
-                throw BrainSyncError.missingCheckpoint
+                throw BrainSyncError.missingArchive
             }
             let data = try Data(contentsOf: manifestURL)
             let manifest = try JSONDecoder.brainSync.decode(BrainCloudManifest.self, from: data)
-            let archiveURL = root.appendingPathComponent(BrainCheckpointArchive.archiveFileName(for: brainID))
+            let archiveURL = root.appendingPathComponent(BrainCloudArchive.archiveFileName(for: brainID))
             guard fileManager.fileExists(atPath: archiveURL.path) else {
-                throw BrainSyncError.missingCheckpoint
+                throw BrainSyncError.missingArchive
             }
             if fileManager.fileExists(atPath: localURL.path) {
                 try fileManager.removeItem(at: localURL)
@@ -524,12 +579,12 @@ nonisolated struct ICloudBrainCheckpointStore: BrainCloudCheckpointStore {
         }
     }
 
-    func uploadCheckpoint(from localURL: URL, manifest: BrainCloudManifest) async throws {
+    func uploadArchive(from localURL: URL, manifest: BrainCloudManifest) async throws {
         try await performFileAccess { root, fileManager in
             try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
-            let archiveURL = root.appendingPathComponent(BrainCheckpointArchive.archiveFileName(for: manifest.brainID))
+            let archiveURL = root.appendingPathComponent(BrainCloudArchive.archiveFileName(for: manifest.brainID))
             let manifestURL = root.appendingPathComponent("\(manifest.brainID).manifest.json")
-            let archiveTempURL = root.appendingPathComponent(".\(manifest.brainID).affectivebrain.uploading-\(UUID().uuidString)")
+            let archiveTempURL = root.appendingPathComponent(".\(manifest.brainID).brain.uploading-\(UUID().uuidString)")
             let manifestTempURL = root.appendingPathComponent(".\(manifest.brainID).manifest.uploading-\(UUID().uuidString)")
             if fileManager.fileExists(atPath: archiveTempURL.path) {
                 try fileManager.removeItem(at: archiveTempURL)
@@ -582,91 +637,15 @@ nonisolated struct ICloudBrainCheckpointStore: BrainCloudCheckpointStore {
     }
 }
 
-nonisolated enum BrainCheckpointArchive {
-    private static let formatVersion = 1
-    private static let excludedNames: Set<String> = [
-        ".DS_Store",
-        "provider_credentials.json",
-        "secrets.json",
-        "pairing_secrets.json",
-        "host_permissions.json",
-    ]
-
+nonisolated enum BrainCloudArchive {
     struct Created {
         var archiveURL: URL
+        var scratchRoot: URL
         var manifest: BrainCloudManifest
     }
 
     static func archiveFileName(for brainID: String) -> String {
-        "\(brainID).affectivebrain.zip"
-    }
-
-    static func createCheckpoint(
-        for brain: BrainDescriptor,
-        schemaVersion: Int,
-        deviceID: String,
-        revision: Int?,
-        includeBiometricData: Bool,
-        fileManager: FileManager = .default
-    ) throws -> Created {
-        let scratch = fileManager.temporaryDirectory.appendingPathComponent("AffectiveBrainCheckpoint-\(UUID().uuidString)", isDirectory: true)
-        try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
-        let archiveURL = scratch.appendingPathComponent(archiveFileName(for: brain.id))
-        let components = try collectComponents(
-            from: brain.rootURL,
-            includeBiometricData: includeBiometricData,
-            fileManager: fileManager
-        )
-        let payload = Payload(
-            formatVersion: formatVersion,
-            brainID: brain.id,
-            containsBiometricData: includeBiometricData,
-            components: components
-        )
-        let data = try JSONEncoder.brainSync.encode(payload)
-        try data.write(to: archiveURL, options: .atomic)
-        let hash = sha256Hex(data)
-        let modifiedAt = brain.modifiedAt ?? Date()
-        let now = Date()
-        return Created(
-            archiveURL: archiveURL,
-            manifest: BrainCloudManifest(
-                brainID: brain.id,
-                displayName: brain.displayName,
-                schemaVersion: schemaVersion,
-                archiveHash: hash,
-                createdAt: modifiedAt,
-                modifiedAt: modifiedAt,
-                uploadedAt: now,
-                deviceID: deviceID,
-                revision: revision ?? 0
-            )
-        )
-    }
-
-    static func restoreCheckpoint(at archiveURL: URL, to destinationRoot: URL, fileManager: FileManager = .default) throws {
-        let data = try Data(contentsOf: archiveURL)
-        let payload = try JSONDecoder.brainSync.decode(Payload.self, from: data)
-        guard payload.formatVersion == formatVersion, !payload.brainID.isEmpty else {
-            throw BrainSyncError.invalidCheckpoint
-        }
-        if fileManager.fileExists(atPath: destinationRoot.path) {
-            try fileManager.removeItem(at: destinationRoot)
-        }
-        try fileManager.createDirectory(at: destinationRoot, withIntermediateDirectories: true)
-        for component in payload.components {
-            try validateRelativePath(component.path)
-            let destination = destinationRoot.appendingPathComponent(component.path)
-            if component.isDirectory {
-                try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
-            } else {
-                guard let dataBase64 = component.dataBase64, let bytes = Data(base64Encoded: dataBase64) else {
-                    throw BrainSyncError.invalidCheckpoint
-                }
-                try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try bytes.write(to: destination, options: .atomic)
-            }
-        }
+        "\(brainID).brain"
     }
 
     static func archiveHash(at archiveURL: URL) throws -> String {
@@ -677,118 +656,10 @@ nonisolated enum BrainCheckpointArchive {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    static func validateCheckpointPayload(_ data: Data, expectedBrainID: String) throws {
-        let payload = try JSONDecoder.brainSync.decode(Payload.self, from: data)
-        guard payload.formatVersion == formatVersion, payload.brainID == expectedBrainID else {
-            throw BrainSyncError.invalidCheckpoint
+    static func validateArchiveData(_ data: Data) throws {
+        guard data.starts(with: Data([0x41, 0x46, 0x46, 0x45, 0x43, 0x54, 0x49, 0x56, 0x45, 0x5F, 0x42, 0x52, 0x41, 0x49, 0x4E, 0x00, 0x01])) else {
+            throw BrainSyncError.invalidArchive
         }
-        for component in payload.components {
-            try validateRelativePath(component.path)
-            if !component.isDirectory {
-                guard let dataBase64 = component.dataBase64, Data(base64Encoded: dataBase64) != nil else {
-                    throw BrainSyncError.invalidCheckpoint
-                }
-            }
-        }
-    }
-
-    private static func collectComponents(
-        from rootURL: URL,
-        includeBiometricData: Bool,
-        fileManager: FileManager
-    ) throws -> [Component] {
-        guard let enumerator = fileManager.enumerator(
-            at: rootURL,
-            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-        var components: [Component] = []
-        for case let url as URL in enumerator {
-            let name = url.lastPathComponent
-            if excludedNames.contains(name) {
-                if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
-                    enumerator.skipDescendants()
-                }
-                continue
-            }
-            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
-            let relativePath = try relativePath(for: url, root: rootURL)
-            if BrainLibrary.shouldExcludeFromExport(
-                relativePath: relativePath,
-                includeBiometricData: includeBiometricData
-            ) {
-                if values.isDirectory == true {
-                    enumerator.skipDescendants()
-                }
-                continue
-            }
-            try validateRelativePath(relativePath)
-            if values.isDirectory == true {
-                components.append(Component(path: relativePath, isDirectory: true, dataBase64: nil))
-            } else if values.isRegularFile == true {
-                let data: Data
-                if !includeBiometricData,
-                   relativePath == "memory/people.sqlite",
-                   let scrubbedData = try BiometricCognitiveMemoryScrubber.scrubbedDatabaseData(from: url, fileManager: fileManager) {
-                    data = scrubbedData
-                } else {
-                    data = try Data(contentsOf: url)
-                }
-                components.append(Component(path: relativePath, isDirectory: false, dataBase64: data.base64EncodedString()))
-            }
-        }
-        let manifestData = try BrainLibrary.biometricExportManifestData(containsBiometricData: includeBiometricData)
-        components.append(Component(
-            path: "export_manifest.json",
-            isDirectory: false,
-            dataBase64: manifestData.base64EncodedString()
-        ))
-        return components.sorted {
-            if $0.isDirectory != $1.isDirectory { return $0.isDirectory && !$1.isDirectory }
-            return $0.path < $1.path
-        }
-    }
-
-    private static func relativePath(for url: URL, root: URL) throws -> String {
-        let rootPath = root.standardizedFileURL.path
-        let path = url.standardizedFileURL.path
-        guard path.hasPrefix(rootPath + "/") else {
-            throw BrainSyncError.invalidCheckpointPath(path)
-        }
-        return String(path.dropFirst(rootPath.count + 1))
-    }
-
-    private static func validateRelativePath(_ path: String) throws {
-        guard !path.isEmpty, !path.hasPrefix("/") else {
-            throw BrainSyncError.invalidCheckpointPath(path)
-        }
-        let parts = path.split(separator: "/", omittingEmptySubsequences: false)
-        guard !parts.isEmpty else {
-            throw BrainSyncError.invalidCheckpointPath(path)
-        }
-        for part in parts {
-            guard !part.isEmpty, part != ".", part != ".." else {
-                throw BrainSyncError.invalidCheckpointPath(path)
-            }
-        }
-        guard !path.contains("\n"), !path.contains("\r") else {
-            throw BrainSyncError.invalidCheckpointPath(path)
-        }
-    }
-
-    private struct Payload: Codable {
-        var formatVersion: Int
-        var brainID: String
-        var containsBiometricData: Bool?
-        var components: [Component]
-    }
-
-    private struct Component: Codable {
-        var path: String
-        var isDirectory: Bool
-        var dataBase64: String?
     }
 }
 

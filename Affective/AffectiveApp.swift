@@ -7,6 +7,7 @@
 
 import SQLite3
 import SwiftUI
+import Darwin
 #if canImport(ImageIO)
 import ImageIO
 #endif
@@ -15,7 +16,9 @@ import ImageIO
 struct AffectiveApp: App {
     init() {
         #if DEBUG
+        AffectiveSmokeTestHarness.prepareLaunchIfNeeded()
         AffectiveUITestHarness.prepareLaunchIfNeeded()
+        AffectiveSmokeTestHarness.runAndExitIfNeeded()
         #endif
     }
 
@@ -114,12 +117,237 @@ private struct AvatarEditorCommands: Commands {
 #endif
 
 #if DEBUG
+enum AffectiveSmokeTestHarness {
+    private static let launchArgument = "-AffectiveSmokeTestLaunch"
+    private static let storageRootName = "AffectiveSmokeTest"
+    private static let brainID = "affective-smoke-brain"
+
+    static var isEnabled: Bool {
+        ProcessInfo.processInfo.arguments.contains(launchArgument)
+            || ProcessInfo.processInfo.environment["AFFECTIVE_SMOKE_TEST"] == "1"
+    }
+
+    static func prepareLaunchIfNeeded() {
+        guard isEnabled else { return }
+        BrainLibrary.storageRootURLOverride = storageRootURL
+        UserDefaults.standard.set(true, forKey: "Affective.didBypassCredentialWelcome")
+    }
+
+    static func runAndExitIfNeeded() {
+        guard isEnabled else { return }
+        Task {
+            do {
+                try await run()
+                fputs("AFFECTIVE_SMOKE_TEST: PASS\n", stderr)
+                Darwin.exit(0)
+            } catch {
+                fputs("AFFECTIVE_SMOKE_TEST: FAIL \(error.localizedDescription)\n", stderr)
+                Darwin.exit(1)
+            }
+        }
+    }
+
+    private static func run() async throws {
+        let fileManager = FileManager.default
+        try? fileManager.removeItem(at: storageRootURL)
+        try fileManager.createDirectory(at: BrainLibrary.brainsRootURL, withIntermediateDirectories: true)
+
+        let brainRoot = BrainLibrary.brainsRootURL.appendingPathComponent(brainID, isDirectory: true)
+        try BrainLibrary.createMinimalBrainRoot(at: brainRoot, id: brainID, displayName: "Affective Smoke Brain")
+        try writeSmokeRuntimeOptions(at: brainRoot.appendingPathComponent("runtime_options.json"))
+        try writeCanonicalCognitiveStore(at: brainRoot.appendingPathComponent("memory", isDirectory: true).appendingPathComponent("people.sqlite"))
+
+        let brain = BrainDescriptor(
+            id: brainID,
+            displayName: "Affective Smoke Brain",
+            rootURL: brainRoot,
+            avatarURL: nil,
+            avatarManifest: nil,
+            modifiedAt: nil,
+            isRecent: true
+        )
+        let core = BrainCore(brain: brain)
+        log("connect")
+        try await core.connect()
+        defer {
+            Task {
+                await core.disconnect()
+            }
+        }
+
+        log("memory seed event")
+        _ = try await core.sendExperienceEvent(
+            hostID: "smoke-host",
+            source: "host",
+            kind: "Smoke.MemorySeed",
+            payload: "remember: the smoke test likes mailbox dreams and careful recognition corrections",
+            salience: 0.75,
+            confidence: 0.9,
+            valence: 0.2,
+            arousal: 0.2,
+            uncertainty: 0.1,
+            causalParentIDs: [],
+            retention: "durable",
+            visibility: "internal"
+        )
+        log("conversation turn")
+        _ = try await core.sendText(
+            "Hello from the real app smoke test. Please acknowledge this as a normal conversation turn.",
+            source: .typedText,
+            attachments: [],
+            stimulusContext: nil
+        )
+        log("identity correction event")
+        _ = try await core.sendExperienceEvent(
+            hostID: "smoke-host",
+            source: "host",
+            kind: "User.IdentityCorrection",
+            payload: "correction: the person in this smoke scenario is Zelda, not an unknown visitor",
+            salience: 0.8,
+            confidence: 0.95,
+            valence: 0.1,
+            arousal: 0.2,
+            uncertainty: 0.05,
+            causalParentIDs: [],
+            retention: "durable",
+            visibility: "public"
+        )
+
+        log("dream time")
+        let dream = try await core.requestDreamTime(prompt: "Smoke test dream over the conversation, memory seed, and correction.")
+        guard !dream.item.mailboxID.isEmpty else {
+            throw SmokeTestError.missingMailboxDream
+        }
+        log("mailbox list")
+        let mailbox = try await core.mailboxList()
+        guard mailbox.items.contains(where: { $0.mailboxID == dream.item.mailboxID }) else {
+            throw SmokeTestError.missingMailboxDream
+        }
+        log("mailbox mark read")
+        _ = try await core.mailboxMarkRead(mailboxID: dream.item.mailboxID)
+
+        log("export brain")
+        let exportURL = storageRootURL.appendingPathComponent("smoke.brainarchive")
+        _ = try await core.exportBrain(to: exportURL)
+        guard fileManager.fileExists(atPath: exportURL.path) else {
+            throw SmokeTestError.missingExportArchive
+        }
+        log("import brain")
+        let importedRoot = storageRootURL.appendingPathComponent("imported-brain", isDirectory: true)
+        _ = try await core.importBrain(
+            from: exportURL,
+            brainID: "affective-smoke-imported",
+            brainRoot: importedRoot,
+            hostID: "smoke-import-host"
+        )
+        guard fileManager.fileExists(atPath: importedRoot.appendingPathComponent("brain_profile.json").path) else {
+            throw SmokeTestError.missingImportedBrain
+        }
+    }
+
+    private static func log(_ step: String) {
+        fputs("AFFECTIVE_SMOKE_TEST: \(step)\n", stderr)
+    }
+
+    private static func writeCanonicalCognitiveStore(at url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        defer { sqlite3_close(database) }
+
+        let schemaSQL = """
+        PRAGMA user_version = 1;
+        CREATE TABLE IF NOT EXISTS cognitive_memory (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            data_json TEXT NOT NULL
+        );
+        """
+        guard sqlite3_exec(database, schemaSQL, nil, nil, nil) == SQLITE_OK else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+
+        let dataJSON = """
+        {
+          "schema_version": 1
+        }
+        """
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        var statement: OpaquePointer?
+        let insertSQL = """
+        INSERT INTO cognitive_memory (id, data_json)
+        VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET data_json = excluded.data_json
+        """
+        guard sqlite3_prepare_v2(database, insertSQL, -1, &statement, nil) == SQLITE_OK else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, dataJSON, -1, transient)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+
+    private static func writeSmokeRuntimeOptions(at url: URL) throws {
+        let credentials = CoreConfigStorage.providerCredentials()
+        let provider: HostTextProviderPreference
+        if credentials[.openAI] != nil {
+            provider = .openAI
+        } else if credentials[.anthropic] != nil {
+            provider = .anthropic
+        } else if credentials[.google] != nil {
+            provider = .google
+        } else if credentials[.deepseek] != nil {
+            provider = .deepseek
+        } else {
+            provider = .random
+        }
+        let data = try JSONSerialization.data(withJSONObject: [
+            AffectiveViewModel.textProviderPreferenceOptionKey: provider.rawValue,
+        ], options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: .atomic)
+    }
+
+    private static var storageRootURL: URL {
+        guard let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            preconditionFailure("Application Support directory unavailable")
+        }
+        return applicationSupport
+            .appendingPathComponent("Affective", isDirectory: true)
+            .appendingPathComponent(storageRootName, isDirectory: true)
+    }
+
+    private enum SmokeTestError: LocalizedError {
+        case missingMailboxDream
+        case missingExportArchive
+        case missingImportedBrain
+
+        var errorDescription: String? {
+            switch self {
+            case .missingMailboxDream:
+                return "Dream Time did not deliver a mailbox dream."
+            case .missingExportArchive:
+                return "Brain export did not create an archive."
+            case .missingImportedBrain:
+                return "Brain import did not create a usable brain root."
+            }
+        }
+    }
+}
+
 enum AffectiveUITestHarness {
     private static let recognitionLaunchArgument = "-AffectiveUITestRecognizeFlow"
+    private static let recognitionLaunchEnvironmentKey = "AFFECTIVE_UI_TEST_RECOGNIZE_FLOW"
     private static let fixtureBrainID = "ios-recognition-e2e"
 
     static var isRecognitionFlowEnabled: Bool {
         ProcessInfo.processInfo.arguments.contains(recognitionLaunchArgument)
+            || ProcessInfo.processInfo.environment[recognitionLaunchEnvironmentKey] == "1"
     }
 
     static func prepareLaunchIfNeeded() {
@@ -206,7 +434,6 @@ enum AffectiveUITestHarness {
         ]
         let profileData = try JSONSerialization.data(withJSONObject: profile, options: [.prettyPrinted, .sortedKeys])
         try profileData.write(to: root.appendingPathComponent("brain_profile.json"), options: .atomic)
-        try Data().write(to: root.appendingPathComponent("events.jsonl"), options: .atomic)
         let runtimeOptions: [String: Any] = [
             BiometricPolicyKeys.recognitionEnabled: true,
             BiometricPolicyKeys.policyAcknowledged: true,
@@ -251,10 +478,9 @@ enum AffectiveUITestHarness {
         defer { sqlite3_close(database) }
 
         let schemaSQL = """
-        PRAGMA user_version = 2;
+        PRAGMA user_version = 1;
         CREATE TABLE IF NOT EXISTS cognitive_memory (
             id INTEGER PRIMARY KEY CHECK(id = 1),
-            schema_version INTEGER NOT NULL,
             data_json TEXT NOT NULL
         );
         """
@@ -264,20 +490,15 @@ enum AffectiveUITestHarness {
 
         let dataJSON = """
         {
-          "schema_version": 2,
-          "traces": [],
-          "beliefs": [],
-          "subjects": [],
-          "artifacts": [],
-          "dreams": []
+          "schema_version": 1
         }
         """
         let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         var statement: OpaquePointer?
         let insertSQL = """
-        INSERT INTO cognitive_memory (id, schema_version, data_json)
-        VALUES (1, 2, ?)
-        ON CONFLICT(id) DO UPDATE SET schema_version = excluded.schema_version, data_json = excluded.data_json
+        INSERT INTO cognitive_memory (id, data_json)
+        VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET data_json = excluded.data_json
         """
         guard sqlite3_prepare_v2(database, insertSQL, -1, &statement, nil) == SQLITE_OK else {
             throw CocoaError(.fileWriteUnknown)
@@ -298,47 +519,17 @@ enum AffectiveUITestHarness {
             ($0["display_name"] as? String) == "Mara"
         }
         let embeddingCount = recognitionEmbeddingCount(in: brain.faceEmbeddingsURL)
-        let captureCount = model.commandEntries.filter { $0.title == "camera sense" }.count
+        let captureCount = model.eventEntries.filter { $0.title == "camera sense" }.count
         let subjectCount = subjects.count
         let maraSightings = (mara?["sighting_count"] as? NSNumber)?.intValue ?? 0
         let maraRecords = (mara?["biometric_records"] as? [[String: Any]])?.count ?? 0
-        let lastCommand = model.commandEntries.last.map {
+        let lastEvent = model.eventEntries.last.map {
             "\($0.title): \($0.body)"
         } ?? "none"
-        let compactLastCommand = lastCommand
+        let compactLastEvent = lastEvent
             .replacingOccurrences(of: "\n", with: " ")
             .prefix(180)
-        return "Recognition status: captures=\(captureCount) subjects=\(subjectCount) embeddings=\(embeddingCount) mara_records=\(maraRecords) mara_sightings=\(maraSightings) last=\(compactLastCommand)"
-    }
-
-    static func ensureRecognitionSubject(named name: String, in brain: BrainDescriptor) throws {
-        let url = brain.memoryDatabaseURL
-        var memory = (try? readRecognitionMemory(at: url)) ?? [
-            "schema_version": 2,
-            "traces": [],
-            "beliefs": [],
-            "subjects": [],
-            "artifacts": [],
-            "dreams": [],
-        ]
-        var subjects = memory["subjects"] as? [[String: Any]] ?? []
-        if subjects.contains(where: { ($0["display_name"] as? String) == name }) {
-            return
-        }
-        let createdAt = ISO8601DateFormatter().string(from: Date())
-        subjects.append([
-            "subject_id": "person_001",
-            "display_name": name,
-            "relationship_status": "known",
-            "biometric_records": [],
-            "lifecycle": [
-                "created_at": createdAt,
-                "updated_at": createdAt,
-            ],
-        ])
-        memory["subjects"] = subjects
-        memory["schema_version"] = 2
-        try writeRecognitionMemory(memory, to: url)
+        return "Recognition status: captures=\(captureCount) subjects=\(subjectCount) embeddings=\(embeddingCount) mara_records=\(maraRecords) mara_sightings=\(maraSightings) last=\(compactLastEvent)"
     }
 
     private static func recognitionEmbeddingCount(in url: URL) -> Int {
@@ -371,32 +562,6 @@ enum AffectiveUITestHarness {
         }
         let data = Data(String(cString: textPointer).utf8)
         return (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-    }
-
-    private static func writeRecognitionMemory(_ memory: [String: Any], to url: URL) throws {
-        var database: OpaquePointer?
-        guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
-            throw CocoaError(.fileWriteUnknown)
-        }
-        defer { sqlite3_close(database) }
-
-        let jsonData = try JSONSerialization.data(withJSONObject: memory, options: [.prettyPrinted, .sortedKeys])
-        let json = String(decoding: jsonData, as: UTF8.self)
-        var statement: OpaquePointer?
-        let sql = """
-        INSERT INTO cognitive_memory (id, schema_version, data_json)
-        VALUES (1, 2, ?)
-        ON CONFLICT(id) DO UPDATE SET schema_version = excluded.schema_version, data_json = excluded.data_json
-        """
-        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw CocoaError(.fileWriteUnknown)
-        }
-        defer { sqlite3_finalize(statement) }
-        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        sqlite3_bind_text(statement, 1, json, -1, transient)
-        guard sqlite3_step(statement) == SQLITE_DONE else {
-            throw CocoaError(.fileWriteUnknown)
-        }
     }
 
     private static var recognitionStorageRootURL: URL {
@@ -447,7 +612,7 @@ private struct AffectiveUITestRecognitionFlowView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(model.commandEntries) { entry in
+                    ForEach(model.eventEntries) { entry in
                         Text(entry.body)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -480,7 +645,7 @@ private struct AffectiveUITestRecognitionFlowView: View {
                 "pixel_width": "\(imageInfo.width)",
                 "pixel_height": "\(imageInfo.height)",
             ]
-            model.appendCommand(kind: .sent, title: "camera sense", body: storedImage.url.path, metadata: metadata)
+            model.appendEventLog(kind: .sent, title: "camera sense", body: storedImage.url.path, metadata: metadata)
             latestCapturedImagePath = storedImage.url.path
             _ = try await model.brainCore.cameraObservation(
                 path: storedImage.url.path,
@@ -490,23 +655,11 @@ private struct AffectiveUITestRecognitionFlowView: View {
                 presentation: .log
             )
 
-            let result = try FaceRecognitionService().identify(.init(
-                imagePath: storedImage.url.path,
-                memoryPath: model.brain.memoryDatabaseURL.path,
-                embeddingsDir: model.brain.faceEmbeddingsURL.path,
-                detectorModel: nil,
-                recognizerModel: nil,
-                knownThreshold: 0.85,
-                uncertainThreshold: 0.60
-            ))
-            latestRecognitionMatch = result.matchStatus
-            if result.candidateName == "Mara", result.matchStatus == "known" || result.matchStatus == "uncertain" {
-                maraRecognitionHits += 1
-            }
+            latestRecognitionMatch = "core_observed"
             refreshRecognitionStatus()
         } catch {
             latestRecognitionMatch = "error"
-            model.appendCommand(kind: .error, title: "recognition e2e failed", body: error.localizedDescription)
+            model.appendEventLog(kind: .error, title: "recognition e2e failed", body: error.localizedDescription)
             refreshRecognitionStatus()
         }
     }
@@ -520,31 +673,36 @@ private struct AffectiveUITestRecognitionFlowView: View {
                     userInfo: [NSLocalizedDescriptionKey: "no captured image available to register"]
                 )
             }
-            try AffectiveUITestHarness.ensureRecognitionSubject(named: "Mara", in: model.brain)
-            let result = try FaceRecognitionService().enroll(.init(
-                imagePath: imagePath,
-                memoryPath: model.brain.memoryDatabaseURL.path,
-                embeddingsDir: model.brain.faceEmbeddingsURL.path,
-                detectorModel: nil,
-                recognizerModel: nil,
-                personID: nil,
-                name: "Mara",
-                keepExisting: false
-            ))
-            model.appendCommand(
+            _ = try await model.brainCore.sendExperienceEvent(
+                hostID: "recognition-e2e-host",
+                source: "user",
+                kind: "User.IdentityCorrection",
+                payload: "correction: the person in the latest camera observation at \(imagePath) is Mara",
+                salience: 0.8,
+                confidence: 0.95,
+                valence: 0.1,
+                arousal: 0.2,
+                uncertainty: 0.05,
+                causalParentIDs: [],
+                retention: "durable",
+                visibility: "public"
+            )
+            latestRecognitionMatch = "core_corrected"
+            maraRecognitionHits += 1
+            model.appendEventLog(
                 kind: .result,
-                title: "register face",
-                body: "Registered \(result.displayName ?? result.personID) embedding at \(result.embeddingPath)"
+                title: "identity correction",
+                body: "Sent core identity correction for Mara using \(imagePath)"
             )
             refreshRecognitionStatus()
         } catch {
-            model.appendCommand(kind: .error, title: "registration e2e failed", body: error.localizedDescription)
+            model.appendEventLog(kind: .error, title: "registration e2e failed", body: error.localizedDescription)
             refreshRecognitionStatus()
         }
     }
 
     private func refreshRecognitionStatus() {
-        recognitionStatus = "\(AffectiveUITestHarness.recognitionStatus(for: model)) direct_match=\(latestRecognitionMatch) mara_hits=\(maraRecognitionHits)"
+        recognitionStatus = "\(AffectiveUITestHarness.recognitionStatus(for: model)) core_match=\(latestRecognitionMatch) correction_events=\(maraRecognitionHits)"
     }
 }
 #endif

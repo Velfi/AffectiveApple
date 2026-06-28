@@ -84,13 +84,14 @@ extension AffectiveViewModel {
         guard brainVoiceEnabled else {
             canSend = true
             statusText = "Ready"
-            appendCommand(kind: .state, title: "speech output", body: "apple_speech=false", metadata: ["reason": "brain_voice_disabled"])
+            appendEventLog(kind: .state, title: "speech output", body: "apple_speech=false", metadata: ["reason": "brain_voice_disabled"])
             return
         }
         canSend = false
         statusText = "Affective is speaking"
         let preferredVoice = runtimeOptionStringValue(for: Self.speechVoiceOptionKey)
-        appendCommand(kind: .state, title: "speech output", body: "apple_speech=true", metadata: ["voice": preferredVoice ?? "system"])
+        appendEventLog(kind: .state, title: "speech output", body: "apple_speech=true", metadata: ["voice": preferredVoice ?? "system"])
+        notificationSounds.playSpeechNotification()
         speechSpeaker.speak(text, preferredVoiceName: preferredVoice) { [weak self] in
             guard let self else { return }
             self.markAwaitingSocialResponse()
@@ -103,13 +104,14 @@ extension AffectiveViewModel {
         guard brainVoiceEnabled else {
             canSend = true
             statusText = "Ready"
-            appendCommand(kind: .state, title: "speech output", body: "apple_speech=false", metadata: ["reason": "brain_voice_disabled"])
+            appendEventLog(kind: .state, title: "speech output", body: "apple_speech=false", metadata: ["reason": "brain_voice_disabled"])
             return
         }
         setHostPipelineHold(.speechOutput)
         canSend = false
         let preferredVoice = runtimeOptionStringValue(for: Self.speechVoiceOptionKey)
-        appendCommand(kind: .state, title: "speech output", body: "apple_speech=true", metadata: ["voice": preferredVoice ?? "system"])
+        appendEventLog(kind: .state, title: "speech output", body: "apple_speech=true", metadata: ["voice": preferredVoice ?? "system"])
+        notificationSounds.playSpeechNotification()
         await withCheckedContinuation { continuation in
             speechSpeaker.speak(text, preferredVoiceName: preferredVoice) { [weak self] in
                 guard let self else {
@@ -132,7 +134,7 @@ extension AffectiveViewModel {
         let requestID = requestID ?? pullSenseRequestID(for: event)
         if let pendingCameraRequestID {
             if !didLogCoalescedCameraRequest {
-                appendCommand(
+                appendEventLog(
                     kind: .state,
                     title: "camera request coalesced",
                     body: "Camera request already pending for \(pendingCameraRequestID).",
@@ -165,7 +167,7 @@ extension AffectiveViewModel {
         guard status == .available else {
             guard !isPullSenseRequestClosed(requestID) else { return }
             statusText = "Camera unavailable"
-            await sendHostCapabilityStatus(capability: "camera", status: status.rawValue, requestID: requestID, reason: "OS camera permission prompt")
+            await sendCapabilityStatus(capability: "camera", status: status.rawValue, requestID: requestID, reason: "OS camera permission prompt")
             await sendPullSenseStatus(
                 sense: "camera",
                 status: pullSenseStatus(for: status),
@@ -203,7 +205,7 @@ extension AffectiveViewModel {
                 "pixel_height": "\(imageInfo.height)",
             ]
             failureMetadata.merge(metadata) { _, new in new }
-            appendCommand(kind: .sent, title: "camera sense", body: storedImage.url.path, metadata: metadata)
+            appendEventLog(kind: .sent, title: "camera sense", body: storedImage.url.path, metadata: metadata)
             recordRecentStimulus(
                 kind: "camera_observation",
                 summary: "Camera captured an image: \(imageInfo.width)x\(imageInfo.height).",
@@ -218,7 +220,7 @@ extension AffectiveViewModel {
                 presentation: observationResponsePresentation
             )
             let responseText = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            appendCommand(
+            appendEventLog(
                 kind: .result,
                 title: response.toolName,
                 body: responseText.isEmpty ? storedImage.url.path : response.text,
@@ -231,13 +233,21 @@ extension AffectiveViewModel {
                 handleHostRequests: false
             )
             _ = eventResult
+            if observationResponsePresentation.mirrorsToChat, !responseText.isEmpty {
+                appendEventLog(
+                    kind: .state,
+                    title: "chat display",
+                    body: conversationDisplaySummary(responseText: responseText, metadata: response.metadata),
+                    metadata: response.metadata
+                )
+            }
         } catch {
             setHostPipelineHold(.none)
             guard !isPullSenseRequestClosed(requestID) else { return }
             statusText = "Camera sense failed"
             failureMetadata["phase"] = phase
             failureMetadata.merge(cameraCaptureErrorMetadata(error)) { current, _ in current }
-            appendCommand(kind: .error, title: "camera sense failed", body: error.localizedDescription, metadata: failureMetadata)
+            appendEventLog(kind: .error, title: "camera sense failed", body: error.localizedDescription, metadata: failureMetadata)
             await sendPullSenseStatus(
                 sense: "camera",
                 status: pullSenseFailureStatus(for: error),
@@ -251,7 +261,7 @@ extension AffectiveViewModel {
         }
     }
 
-    func ensureCameraPermissionForCaptureCommand(title: String) async -> Bool {
+    func ensureCameraPermissionForCaptureEvent(title: String) async -> Bool {
         let status = await requestCameraPermissionIfNeeded(requestID: nil)
         await recordCameraPermissionStatus(status, requestID: nil)
         await synchronizeCoreCameraCapabilityIfNeeded(status)
@@ -264,7 +274,7 @@ extension AffectiveViewModel {
 
     func recordCameraPermissionStatus(_ status: HostCameraPermissionStatus, requestID: String?) async {
         let metadata = cameraPermissionMetadata(status: status, requestID: requestID)
-        appendCommand(
+        appendEventLog(
             kind: status == .available ? .state : .error,
             title: "camera permission",
             body: "camera=\(status.rawValue)",
@@ -280,11 +290,11 @@ extension AffectiveViewModel {
         #if canImport(AVFoundation)
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
-            await sendHostCapabilityStatus(capability: "camera", status: HostCameraPermissionStatus.available.rawValue, requestID: requestID, reason: "Camera permission already granted")
+            await sendCapabilityStatus(capability: "camera", status: HostCameraPermissionStatus.available.rawValue, requestID: requestID, reason: "Camera permission already granted")
             return .available
         case .notDetermined:
             setHostPipelineHold(.cameraPermission)
-            await sendHostCapabilityStatus(capability: "camera", status: "pending", requestID: requestID, reason: "OS camera permission prompt")
+            await sendCapabilityStatus(capability: "camera", status: "pending", requestID: requestID, reason: "OS camera permission prompt")
             let task = Task { await Self.requestSystemCameraPermission() }
             cameraPermissionRequestTask = task
             let status = await task.value
@@ -293,13 +303,13 @@ extension AffectiveViewModel {
                 await Self.waitForSystemCameraAuthorization()
             }
             setHostPipelineHold(.none)
-            await sendHostCapabilityStatus(capability: "camera", status: status.rawValue, requestID: requestID, reason: "OS camera permission prompt")
+            await sendCapabilityStatus(capability: "camera", status: status.rawValue, requestID: requestID, reason: "OS camera permission prompt")
             return status
         case .denied, .restricted:
-            await sendHostCapabilityStatus(capability: "camera", status: HostCameraPermissionStatus.denied.rawValue, requestID: requestID, reason: "OS camera permission prompt")
+            await sendCapabilityStatus(capability: "camera", status: HostCameraPermissionStatus.denied.rawValue, requestID: requestID, reason: "OS camera permission prompt")
             return .denied
         @unknown default:
-            await sendHostCapabilityStatus(capability: "camera", status: HostCameraPermissionStatus.unavailable.rawValue, requestID: requestID, reason: "OS camera permission prompt")
+            await sendCapabilityStatus(capability: "camera", status: HostCameraPermissionStatus.unavailable.rawValue, requestID: requestID, reason: "OS camera permission prompt")
             return .unavailable
         }
         #else
@@ -311,7 +321,7 @@ extension AffectiveViewModel {
         guard status != .available, isBrainConnected else { return }
         await brainCore.disconnect()
         isBrainConnected = false
-        appendCommand(
+        appendEventLog(
             kind: .state,
             title: "core camera capability",
             body: "Reconnecting core with camera=\(status.rawValue).",
@@ -381,7 +391,7 @@ extension AffectiveViewModel {
         guard status == .available else {
             guard !isPullSenseRequestClosed(requestID) else { return }
             statusText = "Orientation unavailable"
-            await sendHostCapabilityStatus(
+            await sendCapabilityStatus(
                 capability: "orientation",
                 status: status.rawValue,
                 requestID: requestID,
@@ -405,7 +415,7 @@ extension AffectiveViewModel {
             let observation = try await observeOrientation()
             guard closePullSenseForObservationDispatch(requestID: requestID) else { return }
             let metadata = orientationObservationMetadata(observation, requestID: requestID)
-            appendCommand(kind: .sent, title: "orientation sense", body: observation.summary, metadata: metadata)
+            appendEventLog(kind: .sent, title: "orientation sense", body: observation.summary, metadata: metadata)
             recordRecentStimulus(
                 kind: "orientation_observation",
                 summary: observation.summary,
@@ -417,7 +427,7 @@ extension AffectiveViewModel {
                 presentation: observationResponsePresentation
             )
             let responseText = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            appendCommand(
+            appendEventLog(
                 kind: .result,
                 title: "sense_observation",
                 body: responseText.isEmpty ? observation.summary : response.text,
@@ -434,7 +444,7 @@ extension AffectiveViewModel {
         } catch {
             guard !isPullSenseRequestClosed(requestID) else { return }
             statusText = "Orientation sense failed"
-            appendCommand(kind: .error, title: "orientation sense failed", body: error.localizedDescription)
+            appendEventLog(kind: .error, title: "orientation sense failed", body: error.localizedDescription)
             await sendPullSenseStatus(
                 sense: "orientation",
                 status: pullSenseFailureStatus(for: error),
@@ -543,14 +553,14 @@ extension AffectiveViewModel {
                 senses: pullSenseCatalog(),
                 requestID: requestID
             )
-            appendCommand(
+            appendEventLog(
                 kind: .state,
                 title: "sense catalog",
                 body: "host senses=\(pullSenseCatalog().map(\.senseID).joined(separator: ","))",
                 metadata: response.metadata
             )
         } catch {
-            appendCommand(kind: .error, title: "sense catalog failed", body: error.localizedDescription)
+            appendEventLog(kind: .error, title: "sense catalog failed", body: error.localizedDescription)
         }
     }
 
@@ -632,7 +642,7 @@ extension AffectiveViewModel {
             terminal: true
         )
         guard didDeliverTimeout else { return }
-        appendCommand(
+        appendEventLog(
             kind: .error,
             title: "\(sense) sense timed out",
             body: "Pull sense timed out before host fulfillment completed.",
@@ -713,7 +723,7 @@ extension AffectiveViewModel {
                 permissionState: permissionState,
                 terminal: terminal
             )
-            appendCommand(
+            appendEventLog(
                 kind: status == .fulfilled || !terminal ? .state : .error,
                 title: "sense status",
                 body: "\(sense)=\(status.rawValue)",
@@ -727,7 +737,7 @@ extension AffectiveViewModel {
             if let terminalRequestID {
                 closedPullSenseRequestIDs.remove(terminalRequestID)
             }
-            appendCommand(kind: .error, title: "sense status failed", body: error.localizedDescription)
+            appendEventLog(kind: .error, title: "sense status failed", body: error.localizedDescription)
             return false
         }
     }
@@ -797,7 +807,7 @@ extension AffectiveViewModel {
         setHostPipelineHold(.none)
     }
 
-    func sendHostCapabilityStatus(
+    func sendCapabilityStatus(
         capability: String,
         status: String,
         requestID: String?,
@@ -814,7 +824,7 @@ extension AffectiveViewModel {
                 await connectToBrain()
             }
             guard isBrainConnected else { return }
-            let response = try await brainCore.hostCapabilityStatus(
+            let response = try await brainCore.capabilityStatus(
                 capability: capability,
                 status: status,
                 requestID: requestID,
@@ -822,14 +832,14 @@ extension AffectiveViewModel {
                 pendingElapsedMS: elapsedMS,
                 reason: reason
             )
-            appendCommand(
+            appendEventLog(
                 kind: status == "denied" || status == "unavailable" ? .error : .state,
                 title: "host capability",
                 body: "\(capability)=\(status)",
                 metadata: response.metadata
             )
         } catch {
-            appendCommand(kind: .error, title: "host capability failed", body: error.localizedDescription)
+            appendEventLog(kind: .error, title: "host capability failed", body: error.localizedDescription)
         }
 
         if status != "pending" {
@@ -838,7 +848,7 @@ extension AffectiveViewModel {
     }
 
     func recordOrientationPermissionStatus(_ status: HostOrientationPermissionStatus, requestID: String?) async {
-        appendCommand(
+        appendEventLog(
             kind: status == .available ? .state : .error,
             title: "orientation permission",
             body: "orientation=\(status.rawValue)",
@@ -850,7 +860,7 @@ extension AffectiveViewModel {
         guard isBrainConnected else { return }
         await brainCore.disconnect()
         isBrainConnected = false
-        appendCommand(
+        appendEventLog(
             kind: .state,
             title: "core orientation capability",
             body: "Reconnecting core with orientation=\(status.rawValue).",

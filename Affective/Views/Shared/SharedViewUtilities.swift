@@ -367,14 +367,31 @@ enum AppTheme {
     private static let accentBlueKey = "Affective.activeThemeColor.blue"
     private static let defaultAccent = AdaptiveColorComponents(red: 0.070, green: 0.560, blue: 0.250)
 
-    static func applyTheme(for brain: BrainDescriptor) {
-        guard let favoriteColor = brain.favoriteThemeColor else {
+    static func applyThemeColor(_ themeColor: String?) {
+        guard let themeColor, let color = BrainThemeColor.color(fromString: themeColor) else {
             clearBrainThemeColor()
             return
         }
-        UserDefaults.standard.set(favoriteColor.red, forKey: accentRedKey)
-        UserDefaults.standard.set(favoriteColor.green, forKey: accentGreenKey)
-        UserDefaults.standard.set(favoriteColor.blue, forKey: accentBlueKey)
+        UserDefaults.standard.set(color.red, forKey: accentRedKey)
+        UserDefaults.standard.set(color.green, forKey: accentGreenKey)
+        UserDefaults.standard.set(color.blue, forKey: accentBlueKey)
+    }
+
+    static func applyTheme(for brain: BrainDescriptor) {
+        applyThemeColor(brain.favoriteThemeColor.map { themeColorString(for: $0) })
+    }
+
+    static func applyMiseEnScene(name: String, themeColor: String?) {
+        applyThemeColor(themeColor)
+    }
+
+    private static func themeColorString(for color: BrainThemeColor) -> String {
+        String(
+            format: "#%02X%02X%02X",
+            Int((color.red * 255).rounded()),
+            Int((color.green * 255).rounded()),
+            Int((color.blue * 255).rounded())
+        )
     }
 
     static func clearBrainThemeColor() {
@@ -546,7 +563,7 @@ private extension Color {
         self = Color(nsColor: NSColor(name: nil) { appearance in
             let match = appearance.bestMatch(from: [.aqua, .darkAqua])
             return NSColor(themeComponents: match == .darkAqua ? dark : light)
-        } ?? NSColor(themeComponents: light))
+        })
         #elseif canImport(UIKit)
         self = Color(uiColor: UIColor { traits in
             UIColor(themeComponents: traits.userInterfaceStyle == .dark ? dark : light)

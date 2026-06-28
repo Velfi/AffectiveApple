@@ -264,7 +264,6 @@
 /* Begin PBXShellScriptBuildPhase section */
 		C0D3F0012FF0000000000001 /* Build AffectiveCore Core */ = {
 			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
 			files = (
 			);
@@ -285,22 +284,23 @@
 		};
 		C0D3F0022FF0000000000002 /* Stamp Build Metadata */ = {
 			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
 			files = (
 			);
 			inputFileListPaths = (
 			);
 			inputPaths = (
+				"$(SRCROOT)/Affective/Info.plist",
 			);
 			name = "Stamp Build Metadata";
 			outputFileListPaths = (
 			);
 			outputPaths = (
+				"$(DERIVED_FILE_DIR)/affective-build-metadata.stamp",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -eu\nINFO_PLIST=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\n[ -f \"${INFO_PLIST}\" ] || exit 0\nHASH=\"\"\nif command -v git >/dev/null 2>&1 && git -C \"${SRCROOT}\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n    HASH=\"$(git -C \"${SRCROOT}\" rev-parse --short=12 HEAD 2>/dev/null || true)\"\n    if [ -n \"${HASH}\" ] && ! git -C \"${SRCROOT}\" diff --quiet --ignore-submodules HEAD -- 2>/dev/null; then\n        HASH=\"${HASH}-dirty\"\n    fi\nfi\nTIMESTAMP=\"$(/bin/date -u +\"%Y-%m-%dT%H:%M:%SZ\")\"\n/usr/libexec/PlistBuddy -c \"Set :AffectiveBuildTimestamp ${TIMESTAMP}\" \"${INFO_PLIST}\" 2>/dev/null || /usr/libexec/PlistBuddy -c \"Add :AffectiveBuildTimestamp string ${TIMESTAMP}\" \"${INFO_PLIST}\"\nif [ -n \"${HASH}\" ]; then\n    /usr/libexec/PlistBuddy -c \"Set :AffectiveBuildHash ${HASH}\" \"${INFO_PLIST}\" 2>/dev/null || /usr/libexec/PlistBuddy -c \"Add :AffectiveBuildHash string ${HASH}\" \"${INFO_PLIST}\"\nfi\n";
+			shellScript = "set -eu\nINFO_PLIST=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\n[ -f \"${INFO_PLIST}\" ] || exit 0\nHASH=\"\"\nif command -v git >/dev/null 2>&1 && git -C \"${SRCROOT}\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n    HASH=\"$(git -C \"${SRCROOT}\" rev-parse --short=12 HEAD 2>/dev/null || true)\"\n    if [ -n \"${HASH}\" ] && ! git -C \"${SRCROOT}\" diff --quiet --ignore-submodules HEAD -- 2>/dev/null; then\n        HASH=\"${HASH}-dirty\"\n    fi\nfi\nTIMESTAMP=\"$(/bin/date -u +\"%Y-%m-%dT%H:%M:%SZ\")\"\n/usr/libexec/PlistBuddy -c \"Set :AffectiveBuildTimestamp ${TIMESTAMP}\" \"${INFO_PLIST}\" 2>/dev/null || /usr/libexec/PlistBuddy -c \"Add :AffectiveBuildTimestamp string ${TIMESTAMP}\" \"${INFO_PLIST}\"\nif [ -n \"${HASH}\" ]; then\n    /usr/libexec/PlistBuddy -c \"Set :AffectiveBuildHash ${HASH}\" \"${INFO_PLIST}\" 2>/dev/null || /usr/libexec/PlistBuddy -c \"Add :AffectiveBuildHash string ${HASH}\" \"${INFO_PLIST}\"\nfi\n/usr/bin/touch \"${DERIVED_FILE_DIR}/affective-build-metadata.stamp\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -464,7 +464,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Affective/Affective.entitlements;
-				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = Affective/Affective.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "Affective/Affective-macOS.entitlements";
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -553,7 +553,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Affective/Affective.entitlements;
-				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = Affective/Affective.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "Affective/Affective-macOS.entitlements";
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;

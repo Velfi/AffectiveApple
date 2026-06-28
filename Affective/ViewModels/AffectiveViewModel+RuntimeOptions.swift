@@ -16,27 +16,55 @@ extension AffectiveViewModel {
     }
 
     func deleteAllBiometricData() {
-        do {
-            let library = BrainLibrary()
-            try library.deleteBiometricData(for: brain)
-            statusText = "Deleted biometric data"
-            appendCommand(kind: .sent, title: "delete biometric data", body: "Deleted face templates and biometric metadata.")
-        } catch {
-            statusText = "Could not delete biometric data"
-            appendCommand(kind: .error, title: "delete biometric data failed", body: error.localizedDescription)
+        Task {
+            guard !isToolRunning else {
+                statusText = "Core call already running"
+                return
+            }
+
+            isToolRunning = true
+            defer { isToolRunning = false }
+
+            await brainCore.disconnect()
+            isBrainConnected = false
+            stopBoredomSense()
+
+            do {
+                let library = BrainLibrary()
+                try library.deleteBiometricData(for: brain)
+                statusText = "Deleted biometric data"
+                appendEventLog(kind: .sent, title: "delete biometric data", body: "Deleted face templates and biometric metadata.")
+            } catch {
+                statusText = "Could not delete biometric data"
+                appendEventLog(kind: .error, title: "delete biometric data failed", body: error.localizedDescription)
+            }
         }
     }
 
     func disableRecognitionAndDeleteBiometricData() {
-        do {
-            let library = BrainLibrary()
-            try library.disableRecognitionAndDeleteBiometricData(for: brain)
-            optionGroups = Self.loadOptionGroups(storedValues: Self.storedValuesForLaunch(brain: brain), brain: brain)
-            statusText = "Recognition disabled and biometric data deleted"
-            appendCommand(kind: .sent, title: "disable biometric recognition", body: "Disabled recognition and deleted biometric data.")
-        } catch {
-            statusText = "Could not disable recognition"
-            appendCommand(kind: .error, title: "disable biometric recognition failed", body: error.localizedDescription)
+        Task {
+            guard !isToolRunning else {
+                statusText = "Core call already running"
+                return
+            }
+
+            isToolRunning = true
+            defer { isToolRunning = false }
+
+            await brainCore.disconnect()
+            isBrainConnected = false
+            stopBoredomSense()
+
+            do {
+                let library = BrainLibrary()
+                try library.disableRecognitionAndDeleteBiometricData(for: brain)
+                optionGroups = Self.loadOptionGroups(storedValues: Self.storedValuesForLaunch(brain: brain), brain: brain)
+                statusText = "Recognition disabled and biometric data deleted"
+                appendEventLog(kind: .sent, title: "disable biometric recognition", body: "Disabled recognition and deleted biometric data.")
+            } catch {
+                statusText = "Could not disable recognition"
+                appendEventLog(kind: .error, title: "disable biometric recognition failed", body: error.localizedDescription)
+            }
         }
     }
 
@@ -46,18 +74,18 @@ extension AffectiveViewModel {
 
     func testCredential(_ key: ProviderCredentialKey, candidate: String) async {
         credentialTestResults[key] = .testing
-        appendCommand(kind: .sent, title: "test \(key.displayName) key", body: "<redacted>")
+        appendEventLog(kind: .sent, title: "test \(key.displayName) key", body: "<redacted>")
 
         do {
             let credential = try credentialToTest(key: key, candidate: candidate)
             try await ProviderCredentialTester.test(key: key, credential: credential)
             credentialTestResults[key] = .valid
             statusText = "\(key.displayName) key works"
-            appendCommand(kind: .result, title: "test \(key.displayName) key", body: "Credential accepted.")
+            appendEventLog(kind: .result, title: "test \(key.displayName) key", body: "Credential accepted.")
         } catch {
             credentialTestResults[key] = .invalid(error.localizedDescription)
             statusText = "\(key.displayName) key failed"
-            appendCommand(kind: .error, title: "test \(key.displayName) key failed", body: error.localizedDescription)
+            appendEventLog(kind: .error, title: "test \(key.displayName) key failed", body: error.localizedDescription)
         }
     }
 
@@ -72,96 +100,6 @@ extension AffectiveViewModel {
             throw CredentialTestError.missingCredential(key.displayName)
         }
         return storedCredential
-    }
-
-    func callCoreTool(name: String, title: String, arguments: [String: JSONValue], mirrorToChat: Bool, requiresCamera: Bool = false) async {
-        guard !isToolRunning else {
-            statusText = "Core call already running"
-            return
-        }
-
-        isToolRunning = true
-        defer { isToolRunning = false }
-
-        do {
-            if requiresCamera {
-                guard await ensureCameraPermissionForCaptureCommand(title: title) else {
-                    appendCommand(
-                        kind: .error,
-                        title: "\(title) disabled",
-                        body: "Camera permission is denied or unavailable.",
-                        metadata: toolMetadata(name: name, mirrorToChat: mirrorToChat)
-                    )
-                    return
-                }
-            }
-
-            if !isBrainConnected {
-                await connectToBrain()
-            }
-            guard isBrainConnected else {
-                throw BrainCoreError.unavailable("The core is not connected.")
-            }
-
-            statusText = "Calling \(title)"
-            appendCommand(kind: .sent, title: title, body: argumentSummary(arguments), metadata: toolMetadata(name: name, mirrorToChat: mirrorToChat))
-            let response = try await brainCore.sendEvent(
-                brainRequestEvent(name: name, arguments: arguments, mirrorToChat: mirrorToChat)
-            )
-            let responseText = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let displayText = responseText.isEmpty ? "\(title) complete" : response.text
-            let eventResult = await applyCoreEvents(response.events, mirrorChatMessages: mirrorToChat, speak: response.shouldSpeak)
-            statusText = "\(title) complete"
-            appendCommand(kind: .result, title: title, body: displayText, metadata: response.metadata.merging(toolMetadata(name: name, mirrorToChat: mirrorToChat)) { current, _ in current })
-            _ = eventResult
-            refreshDreamReports()
-        } catch {
-            isBrainConnected = false
-            statusText = "\(title) failed"
-            appendCommand(kind: .error, title: "\(title) failed", body: error.localizedDescription, metadata: toolMetadata(name: name, mirrorToChat: mirrorToChat))
-        }
-    }
-
-    func brainRequestEvent(name: String, arguments: [String: JSONValue], mirrorToChat: Bool) -> BrainEvent {
-        let presentation: BrainEventPresentation = mirrorToChat ? .chat : .internalOnly
-        switch name {
-        case "remember_memory":
-            return BrainEvent.hostEvent(
-                payload: .memoryRequest(BrainMemoryRequestPayload(
-                    operation: .remember,
-                    layers: [.episodic, .semantic, .affective],
-                    query: nil,
-                    text: arguments["text"]?.stringValue,
-                    tags: arguments["tags"]?.arrayValue?.compactMap(\.stringValue) ?? []
-                )),
-                visibility: .diagnostic,
-                presentation: presentation
-            )
-        case "recall_memory":
-            return BrainEvent.hostEvent(
-                payload: .memoryRequest(BrainMemoryRequestPayload(
-                    operation: .recall,
-                    layers: [.working, .episodic, .semantic, .affective, .relational],
-                    query: arguments["query"]?.stringValue,
-                    text: nil,
-                    tags: arguments["tags"]?.arrayValue?.compactMap(\.stringValue) ?? []
-                )),
-                visibility: .diagnostic,
-                presentation: presentation
-            )
-        default:
-            return BrainEvent.hostEvent(
-                payload: .actionRequest(BrainActionRequestPayload(
-                    actionID: UUID().uuidString,
-                    action: name,
-                    arguments: .object(arguments),
-                    requires: [],
-                    awaitResponse: true
-                )),
-                visibility: .diagnostic,
-                presentation: presentation
-            )
-        }
     }
 
     func callCoreTouch(name: String, title: String) async {
@@ -250,7 +188,7 @@ extension AffectiveViewModel {
             }
 
             statusText = inProgressStatus
-            appendCommand(kind: .sent, title: title, body: sentBody, metadata: metadata)
+            appendEventLog(kind: .sent, title: title, body: sentBody, metadata: metadata)
             let response = try await send()
             let responseText = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
             let displayText = responseText.isEmpty
@@ -258,13 +196,13 @@ extension AffectiveViewModel {
                 : response.text
             let eventResult = await applyCoreEvents(response.events, mirrorChatMessages: true, speak: response.shouldSpeak)
             statusText = completeStatus
-            appendCommand(kind: .result, title: title, body: displayText, metadata: response.metadata.merging(metadata) { current, _ in current })
+            appendEventLog(kind: .result, title: title, body: displayText, metadata: response.metadata.merging(metadata) { current, _ in current })
             _ = eventResult
-            refreshDreamReports()
+            refreshMailboxItems()
         } catch {
             isBrainConnected = false
             statusText = failedStatus
-            appendCommand(kind: .error, title: "\(title) failed", body: error.localizedDescription, metadata: metadata)
+            appendEventLog(kind: .error, title: "\(title) failed", body: error.localizedDescription, metadata: metadata)
         }
     }
 
@@ -287,25 +225,38 @@ extension AffectiveViewModel {
         mirrorChatMessages: Bool,
         speak: Bool,
         handleHostRequests: Bool = true
-    ) async -> (didAppendBrainChat: Bool, didRequestSpeech: Bool, didApplyActivityStatus: Bool, didRecordBrainTurn: Bool) {
+    ) async -> (
+        didAppendBrainChat: Bool,
+        didRequestSpeech: Bool,
+        didApplyActivityStatus: Bool,
+        didRecordBrainTurn: Bool,
+        resolvedBrainText: String?
+    ) {
         var didAppendBrainChat = false
         var speechText: String?
+        var resolvedBrainText: String?
         var didApplyActivityStatus = false
         var didRecordBrainTurn = false
         var didEmitSocialSignal = false
         let coreEvents = normalizedCoreEvents(events)
-        let hasExpressionStream = coreEvents.contains { $0.type == "expression" }
 
         for event in coreEvents {
             let metadata = coreEventMetadata(event)
+            if shouldPlayBotActionClick(for: event) {
+                notificationSounds.playBotActionClick()
+            }
             switch event.type {
             case "control":
                 if event.state == "send_enabled", let enabled = event.enabled {
                     canSend = enabled
                     statusText = enabled ? "Ready" : (brainVoiceEnabled ? "Affective is speaking" : "Affective is thinking")
                 }
-            case "thought", "appraisal", "need_state", "attention_state", "intention", "memory_request", "memory_result", "memory_mutation":
-                appendCommand(
+            case "mise_en_scene":
+                if case .miseEnScene(let payload) = event.payload {
+                    applyMiseEnScene(name: payload.name, themeColor: payload.themeColor)
+                }
+            case "thought", "appraisal", "need_state", "attention_state", "intention", "memory_result", "memory_mutation":
+                appendEventLog(
                     kind: logKind(for: event.kind),
                     title: event.title ?? event.state ?? "core state",
                     body: event.text ?? event.body ?? "",
@@ -319,6 +270,14 @@ extension AffectiveViewModel {
                     }
                 }
             case "expression":
+                if expressionIsPublic(event), isSelfEventRole(event.role ?? "self") {
+                    switch expressionModality(for: event) {
+                    case "face", "facial_expression":
+                        applyFacialExpressionFromEvent(event)
+                    default:
+                        break
+                    }
+                }
                 guard mirrorChatMessages else { continue }
                 guard expressionIsPublic(event) else { continue }
                 let role = event.role ?? "self"
@@ -328,6 +287,7 @@ extension AffectiveViewModel {
                     let body = event.text ?? event.body ?? event.caption ?? ""
                     let hasMedia = event.path != nil || event.url != nil
                     guard hasMedia || !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                    resolvedBrainText = body
                     chatEntries.append(.init(
                         kind: .brain,
                         title: chatSenderTitle(for: event.title),
@@ -342,26 +302,27 @@ extension AffectiveViewModel {
                     if !facialExpressionSummary(for: event).isEmpty {
                         didEmitSocialSignal = true
                     }
-                    appendCommand(
+                    appendEventLog(
                         kind: .state,
                         title: "facial expression",
                         body: [event.eyes, event.mouth].compactMap { $0 }.joined(separator: " / "),
                         metadata: metadata
                     )
                 default:
-                    appendCommand(
+                    appendEventLog(
                         kind: .state,
                         title: event.title ?? "expression",
                         body: event.text ?? event.body ?? event.caption ?? "",
                         metadata: metadata
                     )
                 }
-            case "action_request":
+            case "capability_request":
                 if event.capability == "speak",
                    eventPresentation(for: event).mirrorsToChat,
                    let text = event.text,
                    !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     speechText = text
+                    resolvedBrainText = text
                     didEmitSocialSignal = true
                 }
                 if event.capability == "show_expression",
@@ -370,14 +331,15 @@ extension AffectiveViewModel {
                     didEmitSocialSignal = true
                 }
                 if event.capability == "show_expression" {
-                    appendCommand(
+                    applyFacialExpressionFromEvent(event)
+                    appendEventLog(
                         kind: .state,
                         title: "facial expression",
                         body: [event.eyes, event.mouth].compactMap { $0 }.joined(separator: " / "),
                         metadata: metadata
                     )
                 } else if event.capability == "sense_catalog" {
-                    appendCommand(
+                    appendEventLog(
                         kind: .state,
                         title: event.title ?? "sense catalog",
                         body: event.body ?? event.text ?? "sense catalog requested",
@@ -387,7 +349,7 @@ extension AffectiveViewModel {
                         await sendSenseCatalog(requestID: event.requestID)
                     }
                 } else if event.capability == "sense_status" {
-                    appendCommand(
+                    appendEventLog(
                         kind: .state,
                         title: event.title ?? "sense status",
                         body: event.body ?? event.text ?? "sense status requested",
@@ -398,23 +360,21 @@ extension AffectiveViewModel {
                     }
                 }
             case "sense_request":
-                appendCommand(
+                appendEventLog(
                     kind: .state,
                     title: event.title ?? event.type,
                     body: event.body ?? event.text ?? "",
                     metadata: metadata
                 )
                 if handleHostRequests {
-                    let responsePresentation = observationResponsePresentation(for: event)
+                    let observationPresentation: BrainEventPresentation = mirrorChatMessages ? .chat : .internalOnly
                     await fulfillSenseRequest(
                         event,
-                        observationResponsePresentation: mirrorChatMessages
-                            ? responsePresentation
-                            : .internalOnly
+                        observationResponsePresentation: observationPresentation
                     )
                 }
             default:
-                appendCommand(
+                appendEventLog(
                     kind: .state,
                     title: event.title ?? event.type,
                     body: event.body ?? event.text ?? "",
@@ -425,20 +385,39 @@ extension AffectiveViewModel {
 
         if speak, let speechText {
             if !didRecordBrainTurn {
-                recordConversationTurn(role: "self", text: speechText, source: "action_request", metadata: [:])
+                recordConversationTurn(role: "self", text: speechText, source: "capability_request", metadata: [:])
                 didRecordBrainTurn = true
             }
             await speakBrainResponseAndWait(speechText)
-            return (didAppendBrainChat, true, didApplyActivityStatus, didRecordBrainTurn)
+            return (didAppendBrainChat, true, didApplyActivityStatus, didRecordBrainTurn, resolvedBrainText)
         }
         if let speechText, !didRecordBrainTurn {
-            recordConversationTurn(role: "self", text: speechText, source: "action_request", metadata: [:])
+            recordConversationTurn(role: "self", text: speechText, source: "capability_request", metadata: [:])
             didRecordBrainTurn = true
         }
         if didEmitSocialSignal {
             markAwaitingSocialResponse()
         }
-        return (didAppendBrainChat, false, didApplyActivityStatus, didRecordBrainTurn)
+        return (didAppendBrainChat, false, didApplyActivityStatus, didRecordBrainTurn, resolvedBrainText)
+    }
+
+    func shouldPlayBotActionClick(for event: BrainEvent) -> Bool {
+        guard event.source == .brain else { return false }
+        if event.enabled != nil { return false }
+        guard event.type == "control" else { return false }
+        let marker = [
+            event.title,
+            event.status,
+            event.text,
+            event.body,
+        ]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        guard let marker else { return false }
+        if marker == "Brain" { return false }
+        if marker == "send_enabled" { return false }
+        // Host control events for executed skills use snake_case action ids.
+        return marker.range(of: #"^[a-z][a-z0-9_]*$"#, options: .regularExpression) != nil
     }
 
     func normalizedCoreEvents(_ events: [BrainEvent]) -> [BrainEvent] {
@@ -467,7 +446,17 @@ extension AffectiveViewModel {
         if let presentation = event.responsePresentation.flatMap(BrainEventPresentation.init(rawValue:)) {
             return presentation
         }
-        return legacyObservationResponsePresentation
+        guard let currentHostPipelineAction else { return .chat }
+        switch currentHostPipelineAction {
+        case .typedText, .imageText, .interrupt:
+            return .internalOnly
+        case .coreTouch, .pokeSequence:
+            return .chat
+        case .pushedMotionGesture, .boredomStimulus:
+            return .internalOnly
+        case .refreshBrainState:
+            return .internalOnly
+        }
     }
 
     func eventPresentation(for event: BrainEvent) -> BrainEventPresentation {
@@ -480,22 +469,6 @@ extension AffectiveViewModel {
 
     func expressionModality(for event: BrainEvent) -> String {
         event.modality?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? event.mediaKind ?? "text"
-    }
-
-    var legacyObservationResponsePresentation: BrainEventPresentation {
-        guard let currentHostPipelineAction else { return .chat }
-        switch currentHostPipelineAction {
-        case .typedText, .imageText, .interrupt:
-            return .internalOnly
-        case .coreTool(_, _, _, let mirrorToChat, _):
-            return mirrorToChat ? .chat : .internalOnly
-        case .coreTouch, .pokeSequence:
-            return .chat
-        case .pushedMotionGesture:
-            return .internalOnly
-        case .refreshBrainState:
-            return .internalOnly
-        }
     }
 
     func fulfillSenseRequest(_ event: BrainEvent, observationResponsePresentation: BrainEventPresentation) async {
@@ -532,7 +505,7 @@ extension AffectiveViewModel {
     }
 
     var avatarDisplaysExpressions: Bool {
-        brain.avatarManifest?.expressions.isEmpty == false
+        supportsAvatarFacialExpressions
     }
 
     func facialExpressionSummary(for event: BrainEvent) -> String {
@@ -563,8 +536,8 @@ extension AffectiveViewModel {
         if let status = event.status { metadata["status"] = status }
         if let reason = event.reason { metadata["reason"] = reason }
         if let availability = event.availability { metadata["availability"] = availability }
-        if let permissionState = event.permissionState { metadata["permission_state"] = permissionState }
-        if let statusReason = event.statusReason { metadata["status_reason"] = statusReason }
+        if let permissionState = event.permissionState { metadata["permission"] = permissionState }
+        if let statusReason = event.statusReason { metadata["unavailable_reason"] = statusReason }
         if let observedAt = event.observedAt { metadata["observed_at"] = observedAt }
         if let terminal = event.terminal { metadata["terminal"] = String(terminal) }
         if let awaitResponse = event.awaitResponse { metadata["await_response"] = String(awaitResponse) }
@@ -603,84 +576,28 @@ extension AffectiveViewModel {
     }
 
     var brainSenderName: String {
-        if let factName = factDatabaseBrainName() {
-            return factName
-        }
-        return "A brain"
+        brainPresentationName ?? "A brain"
+    }
+
+    func applyMiseEnScene(name: String, themeColor: String?) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return }
+        brainPresentationName = trimmedName
+        AppTheme.applyMiseEnScene(name: trimmedName, themeColor: themeColor)
+        appendEventLog(
+            kind: .state,
+            title: "mise en scene",
+            body: themeColor.map { "\(trimmedName) · \($0)" } ?? trimmedName,
+            metadata: [
+                "event_type": "mise_en_scene",
+                "brain_name": trimmedName,
+                "theme_color": themeColor ?? "",
+            ]
+        )
     }
 
     func chatSenderTitle(for _: String?) -> String {
         brainSenderName
-    }
-
-    private func factDatabaseBrainName() -> String? {
-        guard
-            let dataJSON = try? CognitiveStoreReader.readCognitiveJSON(from: brain.memoryDatabaseURL),
-            let data = dataJSON.data(using: .utf8),
-            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            return nil
-        }
-        return Self.explicitBrainIdentityName(in: object)
-    }
-
-    private static func explicitBrainIdentityName(in object: [String: Any]) -> String? {
-        let directNameKeys = ["brain_name", "self_name"]
-        for key in directNameKeys {
-            if let name = cleanIdentityName(object[key] as? String) {
-                return name
-            }
-        }
-
-        let objectKeys = ["self", "brain", "agent", "identity", "profile"]
-        for key in objectKeys {
-            if let nested = object[key] as? [String: Any],
-               let name = identityName(from: nested, requiresSelfMarker: false) {
-                return name
-            }
-        }
-
-        if let subjects = object["subjects"] as? [[String: Any]] {
-            for subject in subjects {
-                if let name = identityName(from: subject, requiresSelfMarker: true) {
-                    return name
-                }
-            }
-        }
-
-        return nil
-    }
-
-    private static func identityName(
-        from object: [String: Any],
-        requiresSelfMarker: Bool
-    ) -> String? {
-        if requiresSelfMarker, !hasBrainSelfMarker(object) {
-            return nil
-        }
-        for key in ["display_name", "name", "preferred_name"] {
-            if let name = cleanIdentityName(object[key] as? String) {
-                return name
-            }
-        }
-        return nil
-    }
-
-    private static func hasBrainSelfMarker(_ object: [String: Any]) -> Bool {
-        let markerKeys = ["subject_id", "relationship_status", "kind", "type", "entity", "role"]
-        return markerKeys.contains { key in
-            guard let value = object[key] as? String else { return false }
-            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return ["self", "brain", "agent", "assistant"].contains(normalized)
-                || normalized.hasPrefix("self_")
-                || normalized.hasPrefix("brain_")
-        }
-    }
-
-    private static func cleanIdentityName(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 
     func logKind(for coreKind: String?) -> LogKind {
@@ -708,10 +625,10 @@ extension AffectiveViewModel {
         return metadata
     }
 
-    func appendCommand(kind: LogKind, title: String, body: String, metadata: [String: String] = [:]) {
+    func appendEventLog(kind: LogKind, title: String, body: String, metadata: [String: String] = [:]) {
         var entryMetadata = metadata
-        entryMetadata["stream"] = "commands"
-        commandEntries.append(.init(kind: kind, title: title, body: body, metadata: entryMetadata))
+        entryMetadata["stream"] = "events"
+        eventEntries.append(.init(kind: kind, title: title, body: body, metadata: entryMetadata))
     }
 
     func filtered(entries: [LogEntry], query: String, kind: LogKind?) -> [LogEntry] {
@@ -845,13 +762,7 @@ extension AffectiveViewModel {
     }
 
     static func storedValuesForLaunch(brain: BrainDescriptor?) -> [String: String] {
-        try? migrateLegacyPlaintextCredentials(brain: brain)
-        return (try? loadStoredOptionValues(brain: brain)) ?? legacyStoredOptionValues()
-    }
-
-    static func legacyStoredOptionValues() -> [String: String] {
-        let storedValues = UserDefaults.standard.dictionary(forKey: legacyStoredOptionsKey) as? [String: String] ?? [:]
-        return storedValues.filter { !secretOptionKeys.contains($0.key) }
+        return (try? loadStoredOptionValues(brain: brain)) ?? [:]
     }
 
     static func loadStoredOptionValues(brain: BrainDescriptor?) throws -> [String: String] {
@@ -885,7 +796,7 @@ extension AffectiveViewModel {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
 
         var storedValues = try Self.loadRuntimeOptionsObject(brain: brain)
-        storedValues["autonomy_mode"] = autonomyMode
+        storedValues["autonomy_mode"] = normalizedAutonomyMode
         Self.removeStoredSecrets(from: &storedValues)
         for option in optionGroups.flatMap(\.options) where !option.isReadOnly {
             if let credentialKey = ProviderCredentialKey(rawValue: option.key) {
@@ -917,7 +828,7 @@ extension AffectiveViewModel {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
 
         var storedValues = try Self.loadRuntimeOptionsObject(brain: brain)
-        storedValues["autonomy_mode"] = autonomyMode
+        storedValues["autonomy_mode"] = normalizedAutonomyMode
         Self.removeStoredSecrets(from: &storedValues)
 
         let data = try JSONSerialization.data(withJSONObject: storedValues, options: [.prettyPrinted, .sortedKeys])
@@ -953,36 +864,6 @@ extension AffectiveViewModel {
         for key in ProviderCredentialKey.allCases {
             storedValues.removeValue(forKey: key.rawValue)
         }
-    }
-
-    static func migrateLegacyPlaintextCredentials(brain: BrainDescriptor?) throws {
-        let url = runtimeOptionsURL(brain: brain)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            return
-        }
-
-        var storedValues = try loadRuntimeOptionsObject(brain: brain)
-        var didMigrate = false
-        for key in ProviderCredentialKey.allCases {
-            guard let credential = storedValues[key.rawValue] as? String else { continue }
-            if let existingCredential = try credentialStore.credential(for: key),
-               !existingCredential.isEmpty {
-                storedValues.removeValue(forKey: key.rawValue)
-                didMigrate = true
-                continue
-            }
-
-            let trimmedCredential = credential.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmedCredential.isEmpty {
-                try credentialStore.saveCredential(trimmedCredential, for: key)
-            }
-            storedValues.removeValue(forKey: key.rawValue)
-            didMigrate = true
-        }
-
-        guard didMigrate else { return }
-        let data = try JSONSerialization.data(withJSONObject: storedValues, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: url, options: .atomic)
     }
 
     static func keychainCredentialValues() -> [String: String] {

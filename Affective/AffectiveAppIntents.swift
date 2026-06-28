@@ -44,18 +44,8 @@ enum AffectiveAppIntentBridge {
         requestedID: String?,
         defaults: UserDefaults = .standard
     ) -> BrainDescriptor? {
-        if let requestedID, !requestedID.isEmpty {
-            return brains.first { $0.id == requestedID }
-        }
-
-        if
-            let lastOpenedBrainID = defaults.string(forKey: AffectiveViewModel.lastOpenedBrainIDKey),
-            let brain = brains.first(where: { $0.id == lastOpenedBrainID })
-        {
-            return brain
-        }
-
-        return brains.first
+        guard let requestedID, !requestedID.isEmpty else { return nil }
+        return brains.first { $0.id == requestedID }
     }
 
     private static func notifyRequest() {

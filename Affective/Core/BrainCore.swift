@@ -7,10 +7,34 @@ import Foundation
 import os
 
 protocol BrainCoreClient {
-  func connect() async throws
+  func connect() async throws -> BrainDispatchEnvelope
   func disconnect() async
   func sendEvent(_ event: BrainEvent) async throws -> BrainToolResponse
   func sendEvents(_ events: [BrainEvent]) async throws -> BrainToolResponse
+  func hostAttach(
+    hostID: String,
+    platform: String,
+    permissions: [String],
+    capabilityIDs: [String],
+    providerAvailability: String,
+    sensorQuality: String,
+    localPolicy: String
+  ) async throws -> BrainToolResponse
+  func hostCapabilityManifest(hostID: String, capabilityIDs: [String]) async throws -> BrainToolResponse
+  func sendExperienceEvent(
+    hostID: String?,
+    source: String,
+    kind: String,
+    payload: String,
+    salience: Double,
+    confidence: Double,
+    valence: Double,
+    arousal: Double,
+    uncertainty: Double,
+    causalParentIDs: [String],
+    retention: String,
+    visibility: String
+  ) async throws -> BrainToolResponse
   func shortTouch() async throws -> BrainToolResponse
   func longTouch() async throws -> BrainToolResponse
   func pokeSequence(_ pulses: [PokePulse]) async throws -> BrainToolResponse
@@ -45,7 +69,7 @@ protocol BrainCoreClient {
     permissionState: String?,
     terminal: Bool
   ) async throws -> BrainToolResponse
-  func hostCapabilityStatus(
+  func capabilityStatus(
     capability: String,
     status: String,
     requestID: String?,
@@ -65,7 +89,13 @@ protocol BrainCoreClient {
     attachments: [[String: JSONValue]],
     stimulusContext: StimulusContext?
   ) async throws -> BrainTextResponse
-  func refreshState() async throws -> BrainStateSnapshot
+  func brainMode() async throws -> BrainModeResponse
+  func readModelsSnapshot() async throws -> BrainReadModelsSnapshotResponse
+  func requestDreamTime(prompt: String?) async throws -> BrainMailboxResponse
+  func mailboxList() async throws -> BrainMailboxListResponse
+  func mailboxMarkRead(mailboxID: String) async throws -> BrainMailboxListResponse
+  func exportBrain(to fileURL: URL) async throws -> BrainArchiveResponse
+  func importBrain(from fileURL: URL, brainID: String?, brainRoot: URL, hostID: String?) async throws -> BrainArchiveResponse
 }
 
 actor BrainCore {
@@ -78,24 +108,84 @@ actor BrainCore {
   // thread that way risks starving the pool (and trips the runtime's
   // "unsafeForcedSync called from Swift Concurrent context" diagnostic), so the
   // blocking FFI work runs here instead of on the actor's executor.
-  nonisolated static let ffiQueue = DispatchQueue(label: "com.zelda-built-this.AMBI.brain-core.ffi")
+  // GCD worker threads use a ~512 KiB stack; conversation turns can exceed that
+  // once memory, observations, and runtime actors are composed, so this thread
+  // uses an explicit 8 MiB stack.
+  nonisolated private static let ffiWorker = FFIWorker()
+
+  private final class FFIWorker: @unchecked Sendable {
+    private static let stackSize = 8 * 1024 * 1024
+
+    private final class Bootstrap: @unchecked Sendable {
+      weak var worker: FFIWorker?
+    }
+
+    private let thread: Thread
+    private let bootstrap = Bootstrap()
+    private var blocks: [() -> Void] = []
+    private let lock = NSLock()
+    private let workAvailable = DispatchSemaphore(value: 0)
+
+    init() {
+      let bootstrap = self.bootstrap
+      let thread = Thread {
+        guard let worker = bootstrap.worker else { return }
+        while true {
+          worker.workAvailable.wait()
+          worker.lock.lock()
+          if worker.blocks.isEmpty {
+            worker.lock.unlock()
+            continue
+          }
+          let block = worker.blocks.removeFirst()
+          worker.lock.unlock()
+          block()
+        }
+      }
+      thread.stackSize = Self.stackSize
+      thread.name = "com.zelda-built-this.AMBI.brain-core.ffi"
+      self.thread = thread
+      bootstrap.worker = self
+      thread.start()
+    }
+
+    var isOnWorkerThread: Bool {
+      Thread.current === thread
+    }
+
+    func async(_ block: @escaping () -> Void) {
+      lock.lock()
+      blocks.append(block)
+      lock.unlock()
+      workAvailable.signal()
+    }
+
+    func sync<T>(_ block: @escaping () -> T) -> T {
+      if isOnWorkerThread {
+        return block()
+      }
+      var result: T!
+      let done = DispatchSemaphore(value: 0)
+      async {
+        result = block()
+        done.signal()
+      }
+      done.wait()
+      return result
+    }
+  }
+
   let brain: BrainDescriptor
 
   nonisolated static func iso8601Now() -> String {
     ISO8601DateFormatter().string(from: Date())
   }
 
-  #if os(iOS) || os(macOS)
-    private final class CoreSession: @unchecked Sendable {
-      private let queue: DispatchQueue
+  private final class CoreSession: @unchecked Sendable {
       private var handle: AffectiveCoreHandle?
       private var hostServices: EmbeddedHostServices?
-      private static let queueKey = DispatchSpecificKey<Bool>()
 
-      init(queue: DispatchQueue = BrainCore.ffiQueue) {
-        self.queue = queue
-        self.queue.setSpecific(key: Self.queueKey, value: true)
-      }
+      init() {}
 
       deinit {
         disconnect()
@@ -122,28 +212,22 @@ actor BrainCore {
           self.handle = nil
           hostServices = nil
         }
-        if DispatchQueue.getSpecific(key: Self.queueKey) == true {
+        if BrainCore.ffiWorker.isOnWorkerThread {
           destroy()
         } else {
-          queue.sync(execute: destroy)
-        }
-      }
-
-      func introspect() -> AffectiveCoreCopiedResult {
-        queue.sync { [self] in
-          BrainCore.introspect(handle)
+          BrainCore.ffiWorker.sync(destroy)
         }
       }
 
       func drainEventsJSON() -> AffectiveCoreCopiedResult {
-        queue.sync { [self] in
+        BrainCore.ffiWorker.sync { [self] in
           BrainCore.drainEventsJSON(handle)
         }
       }
 
       func dispatchJSON(requestData: Data) async -> AffectiveCoreCopiedResult {
         await withCheckedContinuation { (continuation: CheckedContinuation<AffectiveCoreCopiedResult, Never>) in
-          queue.async { [self, requestData] in
+          BrainCore.ffiWorker.async { [self, requestData] in
             let output = requestData.withUnsafeBytes { requestBuffer in
               let requestPointer = requestBuffer.bindMemory(to: UInt8.self).baseAddress
               return BrainCore.dispatchJSON(handle, requestJSON: requestPointer, requestJSONLength: requestData.count)
@@ -152,22 +236,26 @@ actor BrainCore {
           }
         }
       }
+
     }
 
     private let coreSession = CoreSession()
-  #endif
+    private var isConnecting = false
 
   init(brain: BrainDescriptor) {
     self.brain = brain
   }
 
-  func connect() async throws {
-    try brain.validateForCoreConnection()
-
-    #if os(iOS) || os(macOS)
+  func connect() async throws -> BrainDispatchEnvelope {
+      try brain.validateForCoreConnection()
       if coreSession.isConnected {
-        return
+        return BrainDispatchEnvelope(requestID: "", ok: true, events: [], result: nil, error: nil)
       }
+      if isConnecting {
+        return BrainDispatchEnvelope(requestID: "", ok: true, events: [], result: nil, error: nil)
+      }
+      isConnecting = true
+      defer { isConnecting = false }
 
       let textProviderPreference = CoreConfigStorage.textProviderPreference(brain: brain)
       let storage = CoreConfigStorage(
@@ -186,60 +274,172 @@ actor BrainCore {
       }
       guard created.status == 0, let handle = created.handle else {
         throw BrainCoreError.unavailable(created.errorMessage)
-      }
-      coreSession.install(handle: handle, hostServices: hostServices)
-    #else
-      throw unavailable()
-    #endif
-  }
+	      }
+	      coreSession.install(handle: handle, hostServices: hostServices)
+	      let envelope = try await dispatchOperation("connect", arguments: [:])
+	      try await attachCurrentHostBinding(manifestJSON: String(decoding: storage.hostManifestJSON, as: UTF8.self))
+	      return envelope
+	  }
 
   func disconnect() async {
-    #if os(iOS) || os(macOS)
       coreSession.disconnect()
-    #endif
   }
 
   func sendEvent(_ event: BrainEvent) async throws -> BrainToolResponse {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
       let envelope = try await dispatch(event: event, operation: event.type)
       return BrainToolResponse(toolName: event.type, envelope: envelope, rawText: envelope.rawText)
-    #else
-      throw unavailable(operation: event.type)
-    #endif
   }
 
   func sendEvents(_ events: [BrainEvent]) async throws -> BrainToolResponse {
-    #if os(iOS) || os(macOS)
-      guard let first = events.first else {
+      guard !events.isEmpty else {
         throw BrainCoreError.unavailable("sendEvents requires at least one event.")
       }
-      try await ensureConnected()
-      let eventValues = try events.map { try $0.encodedJSONValue() }
-      let batch = BrainEvent.hostEvent(
-        payload: .actionRequest(BrainActionRequestPayload(
-          actionID: UUID().uuidString,
-          action: "event_batch",
-          arguments: .object(["events": .array(eventValues)]),
-          requires: [],
-          awaitResponse: true
-        )),
-        target: first.target,
-        visibility: first.visibility,
-        presentation: first.presentation,
-        traceID: first.traceID,
-        turnID: first.turnID,
-        loopID: first.loopID
+      var mergedEvents: [BrainEvent] = []
+      var mergedMetadata: [String: String] = ["event_batch_count": "\(events.count)"]
+      var rawText = ""
+      for event in events {
+        let response = try await sendEvent(event)
+        mergedEvents.append(contentsOf: response.events)
+        mergedMetadata.merge(response.metadata) { current, _ in current }
+        rawText = response.rawText
+      }
+      return BrainToolResponse(
+        toolName: "event_batch",
+        text: "",
+        metadata: mergedMetadata,
+        events: mergedEvents,
+        rawText: rawText
       )
-      let envelope = try await dispatch(event: batch, operation: "event_batch")
-      return BrainToolResponse(toolName: "event_batch", envelope: envelope, rawText: envelope.rawText)
-    #else
-      throw unavailable(operation: "event_batch")
-    #endif
+  }
+
+  func hostAttach(
+    hostID: String,
+    platform: String,
+    permissions: [String],
+    capabilityIDs: [String],
+    providerAvailability: String,
+    sensorQuality: String,
+    localPolicy: String
+  ) async throws -> BrainToolResponse {
+      let envelope = try await dispatchOperation("host_attach", arguments: [
+        "host_id": .string(hostID),
+        "platform": .string(platform),
+        "permissions": .array(permissions.map(JSONValue.string)),
+        "capability_ids": .array(capabilityIDs.map(JSONValue.string)),
+        "provider_availability": .string(providerAvailability),
+        "sensor_quality": .string(sensorQuality),
+        "local_policy": .string(localPolicy),
+      ])
+      return BrainToolResponse(toolName: "host_attach", envelope: envelope, rawText: envelope.rawText)
+  }
+
+  func hostCapabilityManifest(hostID: String, capabilityIDs: [String]) async throws -> BrainToolResponse {
+      let envelope = try await dispatchOperation("host_capability_manifest", arguments: [
+        "host_id": .string(hostID),
+        "capability_ids": .array(capabilityIDs.map(JSONValue.string)),
+      ])
+      return BrainToolResponse(toolName: "host_capability_manifest", envelope: envelope, rawText: envelope.rawText)
+  }
+
+  func sendExperienceEvent(
+    hostID: String? = nil,
+    source: String = "host",
+    kind: String,
+    payload: String,
+    salience: Double = 0.4,
+    confidence: Double = 0.7,
+    valence: Double = 0.0,
+    arousal: Double = 0.0,
+    uncertainty: Double = 0.3,
+    causalParentIDs: [String] = [],
+    retention: String = "episode",
+    visibility: String = "internal"
+  ) async throws -> BrainToolResponse {
+      var arguments: [String: JSONValue] = [
+        "source": .string(source),
+        "kind": .string(kind),
+        "payload": .string(payload),
+        "salience": .number(salience),
+        "confidence": .number(confidence),
+        "valence": .number(valence),
+        "arousal": .number(arousal),
+        "uncertainty": .number(uncertainty),
+        "causal_parent_ids": .array(causalParentIDs.map(JSONValue.string)),
+        "retention": .string(retention),
+        "visibility": .string(visibility),
+      ]
+      if let hostID, !hostID.isEmpty {
+        arguments["host_id"] = .string(hostID)
+      }
+      let envelope = try await dispatchOperation("send_experience_event", arguments: arguments)
+      return BrainToolResponse(toolName: "send_experience_event", envelope: envelope, rawText: envelope.rawText)
+  }
+
+  private func attachCurrentHostBinding(manifestJSON: String) async throws {
+    let manifest = try JSONValue.decodedObject(from: Data(manifestJSON.utf8))
+    let hostID = Self.currentHostID()
+    let platform = manifest["platform"]?.stringValue ?? "unknown"
+    let capabilityIDs = manifest["capabilities"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    let permissions = Self.hostPermissionSummary(from: manifest)
+    let providerAvailability = Self.compactJSONString(manifest["host_provider_routing"])
+    let sensorQuality = Self.compactJSONString(.object([
+      "sense_catalog": manifest["sense_catalog"] ?? .array([]),
+      "capability_status": manifest["capability_status"] ?? .object([:]),
+    ]))
+    let localPolicy = Self.compactJSONString(.object([
+      "biometric_policy": manifest["biometric_policy"] ?? .object([:]),
+      "feature_flags": manifest["feature_flags"] ?? .object([:]),
+    ]))
+
+    _ = try await hostAttach(
+      hostID: hostID,
+      platform: platform,
+      permissions: permissions,
+      capabilityIDs: capabilityIDs,
+      providerAvailability: providerAvailability,
+      sensorQuality: sensorQuality,
+      localPolicy: localPolicy
+    )
+    _ = try await hostCapabilityManifest(hostID: hostID, capabilityIDs: capabilityIDs)
+    let statuses = manifest["capability_status"]?.objectValue ?? [:]
+    for capability in statuses.keys.sorted() {
+      let status = statuses[capability]?.stringValue ?? "unavailable"
+      _ = try await capabilityStatus(
+        capability: capability,
+        status: status,
+        requestID: "host-attach-\(capability)",
+        pendingSince: nil,
+        pendingElapsedMS: 0,
+        reason: "host capability manifest"
+      )
+    }
+  }
+
+  private nonisolated static func currentHostID() -> String {
+    let key = "Affective.hostBindingID"
+    if let existing = UserDefaults.standard.string(forKey: key), !existing.isEmpty {
+      return existing
+    }
+    let created = "affective-host-\(UUID().uuidString)"
+    UserDefaults.standard.set(created, forKey: key)
+    return created
+  }
+
+  private nonisolated static func hostPermissionSummary(from manifest: [String: JSONValue]) -> [String] {
+    let statuses = manifest["capability_status"]?.objectValue ?? [:]
+    return statuses.keys.sorted().map { key in
+      let value = statuses[key]?.stringValue ?? "unknown"
+      return "\(key)=\(value)"
+    }
+  }
+
+  private nonisolated static func compactJSONString(_ value: JSONValue?) -> String {
+    guard let value, let data = try? value.encodedData() else { return "{}" }
+    return String(data: data, encoding: .utf8) ?? "{}"
   }
 
   func shortTouch() async throws -> BrainToolResponse {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
       let event = BrainEvent.hostEvent(
         payload: .experience(BrainExperiencePayload(
@@ -255,13 +455,9 @@ actor BrainCore {
       )
       let envelope = try await dispatch(event: event, operation: "short_touch")
       return BrainToolResponse(toolName: "short_touch", envelope: envelope, rawText: envelope.rawText)
-    #else
-      throw unavailable(operation: "short_touch")
-    #endif
   }
 
   func longTouch() async throws -> BrainToolResponse {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
       let event = BrainEvent.hostEvent(
         payload: .experience(BrainExperiencePayload(
@@ -277,13 +473,9 @@ actor BrainCore {
       )
       let envelope = try await dispatch(event: event, operation: "long_touch")
       return BrainToolResponse(toolName: "long_touch", envelope: envelope, rawText: envelope.rawText)
-    #else
-      throw unavailable(operation: "long_touch")
-    #endif
   }
 
   func pokeSequence(_ pulses: [PokePulse]) async throws -> BrainToolResponse {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
       let pulseValues = pulses.map { pulse in
         JSONValue.object([
@@ -305,9 +497,6 @@ actor BrainCore {
       )
       let envelope = try await dispatch(event: event, operation: "poke_sequence")
       return BrainToolResponse(toolName: "poke_sequence", envelope: envelope, rawText: envelope.rawText)
-    #else
-      throw unavailable(operation: "poke_sequence")
-    #endif
   }
 
   func orientationObservation(
@@ -315,7 +504,6 @@ actor BrainCore {
     requestID: String? = nil,
     presentation: BrainEventPresentation = .internalOnly
   ) async throws -> BrainToolResponse {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
       let observedAt = Self.iso8601Now()
       var observationPayload = observation.eventArguments
@@ -336,16 +524,12 @@ actor BrainCore {
       )
       let envelope = try await dispatch(event: event, operation: "sense_observation")
       return BrainToolResponse(toolName: "sense_observation", envelope: envelope, rawText: envelope.rawText)
-    #else
-      throw unavailable(operation: "sense_observation")
-    #endif
   }
 
   func pushedMotionGestureObservation(
     _ observation: MotionGestureObservation,
     presentation: BrainEventPresentation = .internalOnly
   ) async throws -> BrainToolResponse {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
       let observedAt = Self.iso8601Now()
       var observationPayload = observation.eventArguments
@@ -364,9 +548,6 @@ actor BrainCore {
       )
       let envelope = try await dispatch(event: event, operation: "sense_observation")
       return BrainToolResponse(toolName: "sense_observation", envelope: envelope, rawText: envelope.rawText)
-    #else
-      throw unavailable(operation: "sense_observation")
-    #endif
   }
 
   func cameraObservation(
@@ -376,7 +557,6 @@ actor BrainCore {
     requestID: String?,
     presentation: BrainEventPresentation = .internalOnly
   ) async throws -> BrainToolResponse {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
       var observation: [String: JSONValue] = [
         "path": .string(path),
@@ -404,16 +584,12 @@ actor BrainCore {
       )
       let envelope = try await dispatch(event: event, operation: "sense_observation")
       return BrainToolResponse(toolName: "sense_observation", envelope: envelope, rawText: envelope.rawText)
-    #else
-      throw unavailable(operation: "sense_observation")
-    #endif
   }
 
   func senseCatalog(
     senses: [PullSenseDescriptor],
     requestID: String?
   ) async throws -> BrainToolResponse {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
       let descriptors = senses.map {
         BrainCapabilityDescriptor(
@@ -432,9 +608,6 @@ actor BrainCore {
       )
       let envelope = try await dispatch(event: event, operation: "sense_catalog")
       return BrainToolResponse(toolName: "sense_catalog", envelope: envelope, rawText: envelope.rawText)
-    #else
-      throw unavailable(operation: "sense_catalog")
-    #endif
   }
 
   func pullSenseStatus(
@@ -448,26 +621,29 @@ actor BrainCore {
     permissionState: String?,
     terminal: Bool = true
   ) async throws -> BrainToolResponse {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
       let event = BrainEvent.hostEvent(
         payload: .capabilityStatus(BrainCapabilityStatusPayload(
           capabilityID: "\(sense)_read",
           status: status.rawValue,
           reason: [reason, timeoutMS.map { "timeout_ms=\($0)" }].compactMap { $0 }.joined(separator: " "),
-          permissionState: permissionState ?? availability
+          permission: Self.canonicalPermission(from: permissionState ?? availability),
+          availability: Self.canonicalAvailability(from: availability ?? status.rawValue),
+          quality: status == .fulfilled ? 0.85 : 0.0,
+          reliability: status == .fulfilled ? 0.80 : 0.0,
+          cost: 0.0,
+          latencyMS: timeoutMS,
+          risk: status == .fulfilled ? 0.05 : 0.40,
+          unavailableReason: status == .fulfilled ? "" : reason
         )),
         traceID: requestID ?? UUID().uuidString,
         parentID: requestID
       )
       let envelope = try await dispatch(event: event, operation: "sense_status")
       return BrainToolResponse(toolName: "sense_status", envelope: envelope, rawText: envelope.rawText)
-    #else
-      throw unavailable(operation: "sense_status")
-    #endif
   }
 
-  func hostCapabilityStatus(
+  func capabilityStatus(
     capability: String,
     status: String,
     requestID: String?,
@@ -475,26 +651,84 @@ actor BrainCore {
     pendingElapsedMS: Int,
     reason: String
   ) async throws -> BrainToolResponse {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
       let pendingReason = pendingSince.map {
         "\(reason) pending_since_unix_ms=\(($0.timeIntervalSince1970 * 1000).rounded()) pending_elapsed_ms=\(pendingElapsedMS)"
       } ?? "\(reason) pending_elapsed_ms=\(pendingElapsedMS)"
-      let event = BrainEvent.hostEvent(
-        payload: .capabilityStatus(BrainCapabilityStatusPayload(
-          capabilityID: capability,
-          status: status,
-          reason: pendingReason,
-          permissionState: status
-        )),
-        traceID: requestID ?? UUID().uuidString,
-        parentID: requestID
-      )
-      let envelope = try await dispatch(event: event, operation: "host_capability_status")
-      return BrainToolResponse(toolName: "host_capability_status", envelope: envelope, rawText: envelope.rawText)
-    #else
-      throw unavailable(operation: "host_capability_status")
-    #endif
+      let metrics = Self.hostCapabilityMetrics(for: status, pendingElapsedMS: pendingElapsedMS, reason: pendingReason)
+      var arguments: [String: JSONValue] = [
+        "capability_id": .string(capability),
+        "host_id": .string(Self.currentHostID()),
+        "permission": .string(metrics.permission),
+        "availability": .string(metrics.availability),
+        "quality": .number(metrics.quality),
+        "reliability": .number(metrics.reliability),
+        "cost": .number(metrics.cost),
+        "latency_ms": .number(Double(metrics.latencyMS)),
+        "risk": .number(metrics.risk),
+        "unavailable_reason": .string(metrics.unavailableReason),
+      ]
+      if let requestID, !requestID.isEmpty {
+        arguments["request_id"] = .string(requestID)
+      }
+      let envelope = try await dispatchOperation("capability_status", arguments: arguments)
+      return BrainToolResponse(toolName: "capability_status", envelope: envelope, rawText: envelope.rawText)
+  }
+
+	  private nonisolated static func hostCapabilityMetrics(
+	    for status: String,
+    pendingElapsedMS: Int,
+    reason: String
+  ) -> (
+    permission: String,
+    availability: String,
+    quality: Double,
+    reliability: Double,
+    cost: Double,
+    latencyMS: Int,
+    risk: Double,
+    unavailableReason: String
+  ) {
+    switch status {
+    case "available":
+      return ("granted", "available", 0.95, 0.90, 0.0, pendingElapsedMS, 0.05, "")
+    case "prompt_required", "pending":
+      return ("prompt_required", "degraded", 0.35, 0.45, 0.0, pendingElapsedMS, 0.25, reason)
+    case "denied":
+      return ("denied", "refused", 0.0, 0.0, 0.0, pendingElapsedMS, 0.70, reason)
+    case "unavailable", "disabled_by_policy":
+      return ("unknown", "unavailable", 0.0, 0.0, 0.0, pendingElapsedMS, 0.55, reason)
+    default:
+	      return ("unknown", "unavailable", 0.0, 0.0, 0.0, pendingElapsedMS, 0.50, reason)
+	    }
+	  }
+
+  private nonisolated static func canonicalPermission(from status: String?) -> String {
+    switch status {
+    case "available":
+      return "granted"
+    case "prompt_required", "pending":
+      return "prompt_required"
+    case "denied":
+      return "denied"
+    case "unavailable", "disabled_by_policy":
+      return "unknown"
+    default:
+      return "unknown"
+    }
+  }
+
+  private nonisolated static func canonicalAvailability(from status: String?) -> String {
+    switch status {
+    case "available", "fulfilled":
+      return "available"
+    case "prompt_required", "pending":
+      return "degraded"
+    case "denied", "permission_denied":
+      return "refused"
+    default:
+      return "unavailable"
+    }
   }
 
   func interrupt(
@@ -503,7 +737,6 @@ actor BrainCore {
     interruptedAction: String?,
     canceledQueuedActionCount: Int
   ) async throws -> BrainToolResponse {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
       var context: [String: JSONValue] = [
         "reason": .string(reason),
@@ -526,9 +759,6 @@ actor BrainCore {
       )
       let envelope = try await dispatch(event: event, operation: "interrupt")
       return BrainToolResponse(toolName: "interrupt", envelope: envelope, rawText: envelope.rawText)
-    #else
-      throw unavailable(operation: "interrupt")
-    #endif
   }
 
   func sendText(
@@ -537,69 +767,84 @@ actor BrainCore {
     attachments: [[String: JSONValue]] = [],
     stimulusContext: StimulusContext? = nil
   ) async throws -> BrainTextResponse {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
-      let media = attachments.compactMap { attachment -> BrainMediaRef? in
-        guard let kind = attachment["kind"]?.stringValue else { return nil }
-        let modality = BrainEventModality(rawValue: kind) ?? .media
-        return BrainMediaRef(
-          kind: modality,
-          path: attachment["path"]?.stringValue,
-          url: attachment["url"]?.stringValue,
-          mimeType: attachment["mime_type"]?.stringValue,
-          caption: attachment["caption"]?.stringValue ?? attachment["source"]?.stringValue
-        )
-      }
-      var contextObject: [String: JSONValue] = [
-        "source": .string(source.rawValue),
-        "perception": .string("heard_language"),
-      ]
-      if !attachments.isEmpty {
-        contextObject["attachments"] = .array(attachments.map { .object($0) })
-      }
-      if let stimulusContext {
-        contextObject["stimulus_context"] = .object(stimulusContext.eventArguments)
-      }
-      let event = BrainEvent.hostEvent(
-        payload: .experience(BrainExperiencePayload(
-          kind: source.eventType,
-          modality: media.isEmpty ? .text : .media,
-          role: .other,
-          text: Self.textByAppendingAttachmentMarkers(text, attachments: attachments),
-          media: media,
-          context: .object(contextObject)
-        )),
-        visibility: .public,
-        presentation: .chat,
-        turnID: UUID().uuidString
+      let conversationText = Self.textByAppendingAttachmentMarkers(text, attachments: attachments)
+      let envelope = try await dispatchOperation(
+        "user_text",
+        arguments: ["text": .string(conversationText)]
       )
-      let envelope = try await dispatch(event: event, operation: source.eventType)
-      let legacyJSON = envelope.conversationTurnJSON
-      let turn = legacyJSON.flatMap(ConversationTurnPayload.decode)
-      if turn?.isTestEchoResponse == true {
-        throw BrainCoreError.unavailable(
-          "The embedded core selected its test echo chat service instead of a configured model provider."
-        )
-      }
-      let eventText = envelope.displayTextFromEvents
-      let summaryText = envelope.resultRawResult == false ? (envelope.resultSummary ?? "") : ""
-      let responseText = eventText.isEmpty ? summaryText : eventText
-      var metadata = ["state": "mutating turn"]
+      let responseText = envelope.displayText
+      var metadata = ["state": envelope.awaitingHostSense ? "awaiting host sense" : "mutating turn"]
       metadata.merge(envelope.metadata()) { current, _ in current }
-      metadata["display_source"] = eventText.isEmpty
-        ? (summaryText.isEmpty ? "empty" : "result_summary")
-        : "event_envelope"
+      metadata["display_source"] = responseText.isEmpty
+        ? (envelope.awaitingHostSense ? "awaiting_host_sense" : "empty")
+        : (envelope.displayTextFromEvents.isEmpty ? "result_value" : "event_envelope")
       metadata["display_text_length"] = "\(responseText.count)"
-      metadata["raw_json_length"] = "\(legacyJSON?.count ?? 0)"
       return BrainTextResponse(
-        toolName: "conversation_turn",
+        toolName: "user_text",
         text: responseText,
         metadata: metadata,
         events: envelope.events
       )
-    #else
-      throw unavailable(operation: "conversation_turn")
-    #endif
+  }
+
+  func requestDreamTime(prompt: String? = nil) async throws -> BrainMailboxResponse {
+      let envelope = try await dispatchOperation(
+        "request_dream_time",
+        arguments: prompt.map { ["text": .string($0)] } ?? [:]
+      )
+      return try BrainMailboxResponse(toolName: "request_dream_time", envelope: envelope)
+  }
+
+  func brainMode() async throws -> BrainModeResponse {
+      let envelope = try await dispatchOperation("brain_mode", arguments: [:])
+      return try BrainModeResponse(toolName: "brain_mode", envelope: envelope)
+  }
+
+  func readModelsSnapshot() async throws -> BrainReadModelsSnapshotResponse {
+      let envelope = try await dispatchOperation("read_models_snapshot", arguments: [:])
+      return try BrainReadModelsSnapshotResponse(toolName: "read_models_snapshot", envelope: envelope)
+  }
+
+  func mailboxList() async throws -> BrainMailboxListResponse {
+      let envelope = try await dispatchOperation("mailbox_list", arguments: [:])
+      return try BrainMailboxListResponse(toolName: "mailbox_list", envelope: envelope)
+  }
+
+  func mailboxMarkRead(mailboxID: String) async throws -> BrainMailboxListResponse {
+      let envelope = try await dispatchOperation(
+        "mailbox_mark_read",
+        arguments: ["mailbox_id": .string(mailboxID)]
+      )
+      return try BrainMailboxListResponse(toolName: "mailbox_mark_read", envelope: envelope)
+  }
+
+  func exportBrain(to fileURL: URL) async throws -> BrainArchiveResponse {
+      let envelope = try await dispatchOperation(
+        "export_brain",
+        arguments: ["brain_file_path": .string(fileURL.path)]
+      )
+      return try BrainArchiveResponse(toolName: "export_brain", envelope: envelope)
+  }
+
+  func importBrain(
+    from fileURL: URL,
+    brainID: String? = nil,
+    brainRoot: URL,
+    hostID: String? = nil
+  ) async throws -> BrainArchiveResponse {
+      var arguments: [String: JSONValue] = [
+        "brain_file_path": .string(fileURL.path),
+        "brain_root": .string(brainRoot.path),
+      ]
+      if let brainID, !brainID.isEmpty {
+        arguments["brain_id"] = .string(brainID)
+      }
+      if let hostID, !hostID.isEmpty {
+        arguments["host_id"] = .string(hostID)
+      }
+      let envelope = try await dispatchOperation("import_brain", arguments: arguments)
+      return try BrainArchiveResponse(toolName: "import_brain", envelope: envelope)
   }
 
   nonisolated static func textByAppendingAttachmentMarkers(
@@ -630,28 +875,7 @@ actor BrainCore {
       .replacingOccurrences(of: "]", with: "\\]")
   }
 
-  func refreshState() async throws -> BrainStateSnapshot {
-    #if os(iOS) || os(macOS)
-      try await ensureConnected()
-      let result = coreSession.introspect()
-      let text = try Self.checkedCopiedString(result, operation: "introspect")
-      let envelope = try BrainDispatchEnvelope.decode(from: text)
-      let displayText = envelope.resultSummary ?? text
-      var metadata = envelope.metadata()
-      metadata["display_source"] = envelope.resultSummary == nil ? "raw_embedded_introspection" : "event_envelope"
-      metadata["display_text_length"] = "\(displayText.count)"
-      return BrainStateSnapshot(
-        toolName: "introspect",
-        text: displayText,
-        metadata: metadata
-      )
-    #else
-      throw unavailable(operation: "introspect")
-    #endif
-  }
-
   func drainEvents() async throws -> [BrainEvent] {
-    #if os(iOS) || os(macOS)
       try await ensureConnected()
       let output = coreSession.drainEventsJSON()
       let text = try Self.checkedCopiedString(output, operation: "drain_events")
@@ -661,16 +885,12 @@ actor BrainCore {
         throw BrainCoreError.unavailable(message)
       }
       return envelope.events
-    #else
-      throw unavailable(operation: "drain_events")
-    #endif
   }
 
   static func runGenerationProviderE2E(
     brain: BrainDescriptor,
     providerCredentials: [ProviderCredentialKey: String]? = nil
   ) throws -> String {
-    #if os(iOS) || os(macOS)
       try brain.validateForCoreConnection()
       let storage = CoreConfigStorage(
         brain: brain,
@@ -694,26 +914,83 @@ actor BrainCore {
         }
       }
       return try checkedCopiedString(result, operation: "api_e2e")
-    #else
-      throw BrainCoreError.unavailable(
-        "api_e2e needs the AffectiveCore Zig core linked for brain \(brain.id).")
-    #endif
   }
 
-  func unavailable(operation: String = "connect") -> BrainCoreError {
-    .unavailable("\(operation) needs the AffectiveCore Zig core linked for brain \(brain.id).")
-  }
-
-  #if os(iOS) || os(macOS)
     func ensureConnected() async throws {
       if !coreSession.isConnected {
         try await connect()
       }
     }
 
+    func dispatchOperation(_ operation: String, arguments: [String: JSONValue]) async throws -> BrainDispatchEnvelope {
+      try await ensureConnected()
+      let requestID = UUID().uuidString
+      var eventObject = arguments
+      eventObject["type"] = .string(operation)
+      let request: JSONValue = .object([
+        "request_id": .string(requestID),
+        "event": .object(eventObject),
+      ])
+      let requestData = try request.encodedData()
+      Self.brainCoreLogger.info("Dispatch operation start operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) requestBytes=\(requestData.count, privacy: .public)")
+      let output = await coreSession.dispatchJSON(requestData: requestData)
+      Self.brainCoreLogger.info("Dispatch operation result operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) status=\(output.status, privacy: .public) dataBytes=\(output.dataBytes, privacy: .public) errorBytes=\(output.errorBytes, privacy: .public)")
+      let text = try Self.checkedCopiedString(output, operation: operation)
+      let envelope = try BrainDispatchEnvelope.decode(from: text)
+      guard envelope.ok else {
+        let message = envelope.error?.message ?? "\(operation) failed"
+        Self.brainCoreLogger.error("Dispatch operation envelope error operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) code=\(envelope.error?.code ?? "unknown", privacy: .public) message=\(message, privacy: .public)")
+        throw BrainCoreError.unavailable(message)
+      }
+      return envelope
+    }
+
     func dispatch(event: BrainEvent, operation: String) async throws -> BrainDispatchEnvelope {
       let requestID = UUID().uuidString
-      let eventValue = try event.encodedJSONValue()
+      let encodedEventValue = try event.encodedJSONValue()
+      let eventValue: JSONValue
+      if case .object(var object) = encodedEventValue {
+        object["type"] = .string(operation)
+        if let payload = object["payload"]?.objectValue {
+          if let experience = payload["experience"]?.objectValue {
+            if object["text"] == nil, let text = experience["text"] {
+              object["text"] = text
+            }
+            if let context = experience["context"]?.objectValue,
+               object["pulses"] == nil,
+               let pulses = context["pulses"] {
+              object["pulses"] = pulses
+            }
+          }
+          if let actionRequest = payload["capability_request"]?.objectValue {
+            object["action"] = actionRequest["action"]
+            object["arguments"] = actionRequest["arguments"]
+            object["action_id"] = actionRequest["action_id"]
+          }
+          if let senseObservation = payload["sense_observation"]?.objectValue {
+            object["sense"] = senseObservation["sense_id"]
+            object["observation"] = senseObservation["value"]
+          }
+          if let capabilityStatus = payload["capability_status"]?.objectValue {
+            object["capability_id"] = capabilityStatus["capability_id"]
+            object["permission"] = capabilityStatus["permission"]
+            object["availability"] = capabilityStatus["availability"]
+            object["quality"] = capabilityStatus["quality"]
+            object["reliability"] = capabilityStatus["reliability"]
+            object["cost"] = capabilityStatus["cost"]
+            object["latency_ms"] = capabilityStatus["latency_ms"]
+            object["risk"] = capabilityStatus["risk"]
+            object["unavailable_reason"] = capabilityStatus["unavailable_reason"]
+            if operation == "sense_status" {
+              object["status"] = capabilityStatus["status"]
+              object["reason"] = capabilityStatus["reason"]
+            }
+          }
+        }
+        eventValue = .object(object)
+      } else {
+        eventValue = encodedEventValue
+      }
       let request: JSONValue = .object([
         "request_id": .string(requestID),
         "event": eventValue,
@@ -729,10 +1006,10 @@ actor BrainCore {
 		        Self.brainCoreLogger.error("Dispatch envelope error operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) code=\(envelope.error?.code ?? "unknown", privacy: .public) message=\(message, privacy: .public)")
 		        throw BrainCoreError.unavailable(message)
 	      }
-	      return envelope
-	    }
+      return envelope
+    }
 
-	    static func checkedCopiedString(_ result: AffectiveCoreCopiedResult, operation: String)
+		    static func checkedCopiedString(_ result: AffectiveCoreCopiedResult, operation: String)
 	      throws -> String
 	    {
       guard result.status == 0 else {
@@ -787,12 +1064,6 @@ actor BrainCore {
       }
     }
 
-    static func introspect(_ handle: AffectiveCoreHandle?) -> AffectiveCoreCopiedResult {
-      withCopiedResult(operation: "introspect") { data, errorMessage in
-        affective_core_embedded_introspect_json(handle, &data, &errorMessage)
-      }
-    }
-
     static func withCopiedResult(
       operation _: String,
       _ body: (inout AffectiveCoreEmbeddedString, inout AffectiveCoreEmbeddedString) -> Int32
@@ -822,7 +1093,6 @@ actor BrainCore {
       let buffer = UnsafeBufferPointer(start: ptr, count: value.len)
       return String(decoding: buffer, as: UTF8.self)
     }
-  #endif
 }
 
 extension BrainCore: BrainCoreClient {}

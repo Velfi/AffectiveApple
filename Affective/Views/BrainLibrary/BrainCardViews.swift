@@ -30,8 +30,7 @@ struct BrainSection: View {
     let renameBrain: (BrainDescriptor) -> Void
     let chooseAvatar: (BrainDescriptor) -> Void
     let relocateBrain: (BrainDescriptor) -> Void
-    let exportBrain: (BrainDescriptor) -> Void
-    let exportBrainZip: (BrainDescriptor) -> Void
+    let exportBrainFile: (BrainDescriptor) -> Void
     let deleteBrain: (BrainDescriptor) -> Void
 
     init(
@@ -46,8 +45,7 @@ struct BrainSection: View {
         renameBrain: @escaping (BrainDescriptor) -> Void,
         chooseAvatar: @escaping (BrainDescriptor) -> Void,
         relocateBrain: @escaping (BrainDescriptor) -> Void,
-        exportBrain: @escaping (BrainDescriptor) -> Void,
-        exportBrainZip: @escaping (BrainDescriptor) -> Void,
+        exportBrainFile: @escaping (BrainDescriptor) -> Void,
         deleteBrain: @escaping (BrainDescriptor) -> Void
     ) {
         self.title = title
@@ -61,8 +59,7 @@ struct BrainSection: View {
         self.renameBrain = renameBrain
         self.chooseAvatar = chooseAvatar
         self.relocateBrain = relocateBrain
-        self.exportBrain = exportBrain
-        self.exportBrainZip = exportBrainZip
+        self.exportBrainFile = exportBrainFile
         self.deleteBrain = deleteBrain
     }
 
@@ -97,8 +94,7 @@ struct BrainSection: View {
                             rename: { renameBrain(brain) },
                             chooseAvatar: { chooseAvatar(brain) },
                             relocate: { relocateBrain(brain) },
-                            export: { exportBrain(brain) },
-                            exportZip: { exportBrainZip(brain) },
+                            exportBrainFile: { exportBrainFile(brain) },
                             delete: { deleteBrain(brain) }
                         )
                     }
@@ -148,8 +144,7 @@ struct BrainCard: View {
     let rename: () -> Void
     let chooseAvatar: () -> Void
     let relocate: () -> Void
-    let export: () -> Void
-    let exportZip: () -> Void
+    let exportBrainFile: () -> Void
     let delete: () -> Void
 
     var body: some View {
@@ -242,20 +237,14 @@ struct BrainCard: View {
                     #if os(macOS)
                     Button {
                         select()
-                        export()
+                        exportBrainFile()
                     } label: {
-                        Label("Export Folder", systemImage: "folder")
-                    }
-                    Button {
-                        select()
-                        exportZip()
-                    } label: {
-                        Label("Export ZIP", systemImage: "doc.zipper")
+                        Label("Export Brain File", systemImage: "doc.badge.gearshape")
                     }
                     #else
                     Button {
                         select()
-                        exportZip()
+                        exportBrainFile()
                     } label: {
                         Label("Share Export", systemImage: "square.and.arrow.up")
                     }
@@ -346,8 +335,15 @@ struct BrainCard: View {
 }
 
 struct BrainAvatar: View {
+    enum Sizing {
+        case fixedHeight(CGFloat)
+        case fillContainer
+    }
+
     let brain: BrainDescriptor
-    var size: CGFloat = 58
+    var sizing: Sizing = .fixedHeight(58)
+    var eyeSprite: String? = nil
+    var mouthSprite: String? = nil
 
     var body: some View {
         ZStack {
@@ -355,7 +351,7 @@ struct BrainAvatar: View {
                 .fill(AppTheme.editorBackground)
             avatarContent
         }
-        .frame(width: avatarSize.width, height: avatarSize.height)
+        .modifier(BrainAvatarFrameModifier(sizing: sizing, aspectRatio: brain.avatarClipAspectRatio))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -364,40 +360,53 @@ struct BrainAvatar: View {
         .accessibilityLabel("\(brain.displayName) avatar")
     }
 
-    var avatarSize: CGSize {
-        let aspectRatio = brain.avatarManifest.map { manifest in
-            let clip = manifest.effectiveClip
-            let rawRatio = clip.width / max(clip.height, 1)
-            return rawRatio.isFinite && rawRatio > 0 ? rawRatio : 1
-        } ?? 1
-        let safeSize = size.isFinite && size > 0 ? size : 58
-        return CGSize(width: safeSize * aspectRatio, height: safeSize)
-    }
-
     @ViewBuilder
     var avatarContent: some View {
         if let manifest = brain.avatarManifest {
-            LayeredAvatarView(manifest: manifest)
+            LayeredAvatarView(
+                manifest: manifest,
+                expressionID: manifest.blinkExpressionID(),
+                eyeSprite: eyeSprite ?? manifest.neutralEyeSpriteName(),
+                mouthSprite: mouthSprite ?? manifest.neutralMouthSpriteName()
+            )
+            .id(brain.avatarRenderToken)
         } else if let avatarURL = brain.avatarURL {
             #if os(macOS)
-            if let image = NSImage(contentsOf: avatarURL) {
+            if let image = AvatarAssetImageLoader.loadImage(from: avatarURL, layerID: brain.id) {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFill()
+                    .id(brain.avatarRenderToken)
             } else {
-                fallbackAvatar
+                placeholderAvatar
             }
             #else
-            fallbackAvatar
+            placeholderAvatar
             #endif
         } else {
-            fallbackAvatar
+            placeholderAvatar
         }
     }
 
-    var fallbackAvatar: some View {
+    var placeholderAvatar: some View {
         Image(systemName: "brain.head.profile")
             .font(.system(size: 26, weight: .semibold))
             .foregroundStyle(AppTheme.accent)
+    }
+}
+
+private struct BrainAvatarFrameModifier: ViewModifier {
+    let sizing: BrainAvatar.Sizing
+    let aspectRatio: CGFloat
+
+    func body(content: Content) -> some View {
+        switch sizing {
+        case .fixedHeight(let height):
+            let safeHeight = height.isFinite && height > 0 ? height : 58
+            let safeRatio = aspectRatio.isFinite && aspectRatio > 0 ? aspectRatio : 1
+            content.frame(width: safeHeight * safeRatio, height: safeHeight)
+        case .fillContainer:
+            content.frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
     }
 }

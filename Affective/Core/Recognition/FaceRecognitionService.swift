@@ -206,14 +206,11 @@ nonisolated final class FaceRecognitionService: FaceRecognizing {
   private func embedding(imagePath: String, detectorModel: String?, recognizerModel: String?) throws -> FaceEmbedding {
     let detectorPath = try Self.resolveModelPath(detectorModel, name: "face_detection_yunet_2023mar_int8")
     let recognizerPath = try Self.resolveModelPath(recognizerModel, name: "face_recognition_sface_2021dec_int8")
-    var bridgeError: NSError?
-    let result = bridge.embeddingForImage(
+    let result = try bridge.embeddingForImage(
       atPath: imagePath,
       detectorModel: detectorPath,
-      recognizerModel: recognizerPath,
-      error: &bridgeError
+      recognizerModel: recognizerPath
     )
-    if let bridgeError { throw bridgeError }
     return FaceEmbedding(
       faceCount: result.faceCount,
       detectionScore: Float(result.detectionScore),
@@ -358,34 +355,27 @@ nonisolated private struct CognitiveMemory {
     defer { sqlite3_close(database) }
 
     var statement: OpaquePointer?
-    guard sqlite3_prepare_v2(database, "SELECT schema_version, data_json FROM cognitive_memory WHERE id = 1", -1, &statement, nil) == SQLITE_OK else {
+    guard sqlite3_prepare_v2(database, "SELECT data_json FROM cognitive_memory WHERE id = 1", -1, &statement, nil) == SQLITE_OK else {
       throw FaceRecognitionError.sqlite("could not read cognitive memory: \(url.path)")
     }
     defer { sqlite3_finalize(statement) }
 
     var object: [String: Any]
     if sqlite3_step(statement) == SQLITE_ROW {
-      let schemaVersion = sqlite3_column_int(statement, 0)
-      guard schemaVersion == 2 else {
-        throw FaceRecognitionError.invalidMemory("unsupported cognitive schema version \(schemaVersion): \(url.path)")
-      }
-      guard let text = sqlite3_column_text(statement, 1) else {
+      guard let text = sqlite3_column_text(statement, 0) else {
         throw FaceRecognitionError.invalidMemory("memory data_json is empty: \(url.path)")
       }
       let data = Data(String(cString: text).utf8)
       object = try parseMemoryObject(data, path: url.path)
     } else {
       object = [
-        "schema_version": 2,
+        "schema_version": 1,
         "traces": [],
         "beliefs": [],
         "subjects": [],
         "artifacts": [],
         "dreams": [],
       ]
-    }
-    guard object["schema_version"] as? Int == 2 else {
-      throw FaceRecognitionError.invalidMemory("memory schema_version must be 2: \(url.path)")
     }
     guard let subjects = object["subjects"] as? [[String: Any]] else {
       throw FaceRecognitionError.invalidMemory("memory subjects field must be a list: \(url.path)")
@@ -416,7 +406,6 @@ nonisolated private struct CognitiveMemory {
 
   mutating func save(to url: URL) throws {
     data["subjects"] = subjects
-    data["schema_version"] = 2
     try Self.ensureSchema(at: url)
     var database: OpaquePointer?
     guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
@@ -428,9 +417,9 @@ nonisolated private struct CognitiveMemory {
     let json = String(decoding: jsonData, as: UTF8.self)
     var statement: OpaquePointer?
     let sql = """
-      INSERT INTO cognitive_memory (id, schema_version, data_json)
-      VALUES (1, 2, ?)
-      ON CONFLICT(id) DO UPDATE SET schema_version = excluded.schema_version, data_json = excluded.data_json
+      INSERT INTO cognitive_memory (id, data_json)
+      VALUES (1, ?)
+      ON CONFLICT(id) DO UPDATE SET data_json = excluded.data_json
       """
     guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
       throw FaceRecognitionError.sqlite("could not update cognitive memory: \(url.path)")
@@ -452,10 +441,9 @@ nonisolated private struct CognitiveMemory {
     defer { sqlite3_close(database) }
     let sql = """
       PRAGMA foreign_keys = ON;
-      PRAGMA user_version = 2;
+      PRAGMA user_version = 1;
       CREATE TABLE IF NOT EXISTS cognitive_memory (
         id INTEGER PRIMARY KEY CHECK(id = 1),
-        schema_version INTEGER NOT NULL,
         data_json TEXT NOT NULL
       );
       """

@@ -13,18 +13,18 @@ Affective currently has:
 - `BrainClient` in `Affective/CoreBridge/BrainClient.swift`.
 - `AffectiveCoreMCPBridge` in `Affective/CoreBridge/MCP/AffectiveCoreMCPBridge.swift`.
 - `BrainLibrary` in `Affective/BrainLibrary.swift`, which discovers brain folders under `~/Library/Application Support/AffectiveCore/brains`.
-- `AffectiveViewModel` in `Affective/AffectiveViewModel.swift`, which still knows AffectiveCore tool names for memory, reminders, attention, and text.
+- `AffectiveViewModel` in `Affective/AffectiveViewModel.swift`, which talks to AffectiveCore through typed `BrainCore` operations rather than raw tool names.
 
 AffectiveCore currently has:
 
 - `BrainRuntime` and `AppCore` in `src/app/brain.zig`.
 - The headless MCP wrapper in `src/main_mcp.zig`.
-- The full conversation engine in `src/core/bot.zig`.
-- Shared command schemas in `src/api/chat_client.zig` and `src/api/skills.zig`.
+- The event-sourced conversation path and action-pressure executor in `src/core/brain_action_execution.zig`, `src/core/action_selection.zig`, and the subsystem modules.
+- Shared capability schemas in `src/core/capabilities.zig`, `src/core/capability_registry.zig`, and `src/api/chat_client.zig`.
 - Brain archive/import/export logic in `src/app/brain_container.zig`.
 - A separate Apple MCP dashboard in `apple/AffectiveCore`, duplicating some Swift MCP client logic now present in Affective.
 
-The biggest gap was conversation. AffectiveCore now exposes the real mutating conversation path as `conversation_turn`, which delegates to `Bot.handleConversationText`. `chat_dry_run_prompt` remains useful as a debug/admin prompt inspection tool, but Affective product chat should use `conversation_turn`.
+Affective product chat uses the typed `conversation_turn` operation. LanguageMind can propose text and action pressures, but final execution is selected through the action-pressure pipeline and capability executor.
 
 ## Design Principle
 
@@ -79,26 +79,24 @@ Replace UI-level raw tool calls with a typed operation enum in Swift and matchin
 ```swift
 enum BrainOperation: Codable, Sendable {
     case connect(BrainOpenRequest)
-    case stateSnapshot
+    case hostAttach(HostBindingRequest)
+    case hostCapabilityManifest(HostCapabilityManifestRequest)
+    case sendExperienceEvent(ExperienceEventRequest)
     case conversationTurn(ConversationTurnRequest)
-    case recallMemory(RecallMemoryRequest)
-    case rememberMemory(RememberMemoryRequest)
-    case forgetMemory(ForgetMemoryRequest)
-    case listReminders
-    case setReminder(SetReminderRequest)
-    case chooseAttention
-    case consolidateMemory
-    case dream(DreamRequest)
-    case graph(GraphOperation)
+    case requestDreamTime(DreamTimeRequest)
+    case brainMode
+    case readModelsSnapshot
+    case mailboxList(MailboxListRequest)
+    case mailboxMarkRead(MailboxMarkReadRequest)
+    case capabilityStatus(CapabilityStatusRequest)
     case importBrain(BrainImportRequest)
     case exportBrain(BrainExportRequest)
-    case updateRuntimeOptions(RuntimeOptionsPatch)
 }
 ```
 
-The Swift UI should call `BrainClient.perform(_:)`, not `callTool("remember_memory", ...)`.
+The Swift UI should call typed `BrainCore` operations. Memory, recognition, graph work, reminders, speech, dreams, and mailbox delivery are modeled as experience events and capability requests, not ad hoc UI calls to raw tools.
 
-For the current macOS bridge, `AffectiveCoreMCPBridge` maps `BrainOperation` to MCP tools internally. For transports that support typed routes, the mapping becomes direct JSON.
+For the current macOS bridge, `AffectiveCoreMCPBridge` is only a transport adapter. Swift product code should not parse command text or depend on MCP tool names.
 
 ## Required New AffectiveCore Operations
 
@@ -129,7 +127,7 @@ Request:
     "client_id": "macbook-pro | iphone",
     "frontend": "macos | ios",
     "local_time": "2026-06-24T08:00:00-05:00",
-    "capabilities": ["typed_text", "uploaded_media_read", "speech_output"]
+    "capabilities": ["text_input", "uploaded_media_read", "speech_output"]
   }
 }
 ```
@@ -164,8 +162,8 @@ Implementation guidance:
 
 - Extract `Bot.handleConversationText` into a public-ish `handleConversationInput(input_mod.HeardSpeech, ConversationHostContext)` or `BrainRuntime.conversationTurn`.
 - Preserve existing memory/appraisal/summary behavior.
-- Return structured command results, not only stdout or a single observation string.
-- Keep `chat_dry_run_prompt` as a debug/admin tool, not product chat.
+- Return structured event batches plus display directives, not stdout or a single observation string.
+- Keep prompt inspection and other diagnostics outside the product runtime path.
 
 ### `brain_manifest`
 
@@ -227,8 +225,8 @@ Examples:
 
 - `lifecycle`: connecting, connected, disconnected, restarting.
 - `message`: user text accepted, bot text emitted.
-- `commandStarted`: `recall_memory`.
-- `commandFinished`: `recall_memory`, success, observation.
+- `commandStarted`: capability request accepted, with capability id and causal event ids.
+- `commandFinished`: capability request completed, failed, refused, or unavailable, with outcome events.
 - `memoryChanged`: created memory id, recalled memory id, promoted memory.
 - `error`: provider unavailable, missing permission, bridge disconnected.
 
@@ -246,7 +244,7 @@ Affective -> AffectiveCoreMCPBridge -> affective-core-mcp -> BrainRuntime
 
 Changes:
 
-- `AffectiveCoreMCPBridge` should be the only Affective type that knows MCP tool names.
+- `AffectiveCoreMCPBridge` should be only a transport adapter; product state should flow through typed operations and event batches.
 - Add a typed adapter from `BrainOperation` to MCP.
 - Add process supervision: exit detection, restart, timeout, and single-flight request handling.
 - Add `tools/list` verification during connect and expose unsupported tools as capability errors.
@@ -304,7 +302,7 @@ Current implementation:
 
 - `AffectiveCore/src/affective_core_embedded.zig` exports the first C ABI surface.
 - `zig build embedded` builds `libaffective-core-embedded.a`.
-- The exported ABI can create/destroy a local brain runtime and run embedded API v2 dispatch, drain, and introspection JSON routes.
+- The exported ABI can create/destroy a local brain runtime and run embedded API v2 typed operation dispatch plus event draining.
 - `Affective/Core/BrainCore.swift` has the Swift wrapper for that ABI.
 - `Affective.xcodeproj` now has an iOS-only build phase that runs `scripts/build_affective_core.sh`.
 - The build script compiles the Zig static library for `iphoneos` and `iphonesimulator` into DerivedData, including fat simulator archives when needed.
@@ -384,19 +382,14 @@ Use one canonical brain folder layout:
 
 ```text
 ~/Library/Application Support/AffectiveCore/brains/{brain_id}/
-  memory/people.sqlite
-  memory/relationships.sqlite
-  memory/face_embeddings/
-  events.jsonl
-  maintenance.md
-  maintenance_state.json
-  runtime_options.json
+  brain.sqlite
+  artifacts/
   captures/
   generated/
-  avatar.png
+  metadata.json
 ```
 
-Affective can keep reading this layout directly for fast welcome-screen discovery, but import/export should converge on AffectiveCore's `brain_container` format, not only raw folder copies.
+Affective can keep reading manifest metadata directly for fast welcome-screen discovery, but cognitive state belongs behind AffectiveCore APIs and import/export should use AffectiveCore's `brain_container` format, not raw folder copies.
 
 Migration:
 
@@ -433,7 +426,7 @@ Both sides should speak explicit capabilities:
 
 ```json
 {
-  "typed_text": "available",
+  "text_input": "available",
   "speech_input": "available | denied | unavailable",
   "speech_output": "available | unavailable",
   "camera": "available | denied | unavailable",
@@ -453,7 +446,7 @@ Normalize bridge errors:
 
 ```json
 {
-  "code": "missing_binary | disconnected | unknown_tool | missing_permission | missing_credentials | invalid_request | provider_failure | internal",
+  "code": "missing_binary | disconnected | unknown_operation | missing_permission | missing_credentials | invalid_request | provider_failure | internal",
   "message": "human readable",
   "recoverability": "retry | reconnect | configure | unsupported",
   "details": {}
@@ -474,8 +467,8 @@ Affective should use this to decide whether to show:
 
 1. `BrainRuntime.conversationTurn` now routes through `Bot.handleConversationText`.
 2. `conversation_turn` is available over MCP.
-3. `src/affective_core_embedded.zig` exposes the first embedded C ABI for iOS-local Affective.
-4. The embedded ABI supports generic tool dispatch for the current Affective live tools.
+3. `src/affective_core_embedded.zig` exposes the embedded C ABI for iOS-local Affective.
+4. The embedded ABI supports typed operation dispatch.
 5. Add richer structured JSON envelopes for product operations.
 6. Add `runtime_options_get` and `runtime_options_update`.
 7. Add `brain_manifest`.
@@ -489,12 +482,12 @@ Affective should use this to decide whether to show:
 2. MCP process ownership and framing stay inside `AffectiveCoreMCPBridge`, which is macOS-only.
 3. `EmbeddedBrainClient` is the iOS path and calls the Zig static library in-process.
 4. The Xcode target builds and links the embedded Zig core for iOS simulator and device SDKs.
-5. Replace remaining view-model raw `callTool` usage with typed `BrainOperation`.
+5. Keep view-model communication on typed `BrainCore` operations.
 6. Add response decoders for memory, reminders, attention, state, and conversation.
 7. Add provider account model and Keychain-backed store.
 8. Add a capability/permission model shared between macOS and iOS UI.
 9. Switch import/export to AffectiveCore brain archive when available.
-10. Keep raw MCP/admin tools behind a developer diagnostics panel, not the primary UI.
+10. Keep diagnostics outside the primary product runtime path.
 11. Add optional peer sync with Mac Affective after local iOS brain operations work.
 
 ## Phased Roadmap

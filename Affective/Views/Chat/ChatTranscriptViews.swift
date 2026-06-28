@@ -18,7 +18,7 @@ import UIKit
 import PhotosUI
 #endif
 
-struct CommandFilterBar: View {
+struct EventFilterBar: View {
     @ObservedObject var model: AffectiveViewModel
     @State private var didCopyLog = false
 
@@ -41,13 +41,13 @@ struct CommandFilterBar: View {
     }
 
     var searchField: some View {
-        TextField("Search command log", text: $model.commandSearchText)
+        TextField("Search event log", text: $model.eventSearchText)
             .textFieldStyle(.plain)
-            .optionFieldStyle(isDirty: !model.commandSearchText.isEmpty)
+            .optionFieldStyle(isDirty: !model.eventSearchText.isEmpty)
     }
 
     var kindPicker: some View {
-        Picker("Kind", selection: $model.selectedCommandKind) {
+        Picker("Kind", selection: $model.selectedEventKind) {
             Text("All").tag(LogKind?.none)
             ForEach(LogKind.allCases) { kind in
                 Text(kind.rawValue.optionDisplayName).tag(LogKind?.some(kind))
@@ -57,7 +57,7 @@ struct CommandFilterBar: View {
         .labelsHidden()
         .tint(AppTheme.primaryText)
         .frame(width: 132)
-        .optionFieldStyle(isDirty: model.selectedCommandKind != nil)
+        .optionFieldStyle(isDirty: model.selectedEventKind != nil)
     }
 
     var copyLogButton: some View {
@@ -80,14 +80,14 @@ struct CommandFilterBar: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(didCopyLog ? AppTheme.accent.opacity(0.72) : .white.opacity(0.07))
         )
-        .disabled(model.commandEntries.isEmpty)
-        .opacity(model.commandEntries.isEmpty ? 0.55 : 1)
-        .help("Copy the entire command log")
-        .accessibilityLabel(didCopyLog ? "Copied command log" : "Copy entire command log")
+        .disabled(model.eventEntries.isEmpty)
+        .opacity(model.eventEntries.isEmpty ? 0.55 : 1)
+        .help("Copy the entire event log")
+        .accessibilityLabel(didCopyLog ? "Copied event log" : "Copy entire event log")
     }
 
     func copyEntireLog() {
-        let text = model.commandEntries.commandLogCopyText
+        let text = model.eventEntries.eventLogCopyText
         #if os(macOS)
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
@@ -821,7 +821,7 @@ struct LogEntryView: View {
             }
 
             if let thumbnailAttachment {
-                CommandImageThumbnailView(attachment: thumbnailAttachment)
+                EventImageThumbnailView(attachment: thumbnailAttachment)
             }
 
             Text(entry.body)
@@ -940,7 +940,7 @@ struct LogEntryView: View {
     }
 }
 
-struct CommandImageThumbnailView: View {
+struct EventImageThumbnailView: View {
     let attachment: ChatMediaAttachment
 
     var body: some View {
@@ -1031,9 +1031,9 @@ extension LogEntry {
 }
 
 extension Array where Element == LogEntry {
-    var commandLogCopyText: String {
+    var eventLogCopyText: String {
         var sections = [
-            "Affective command log",
+            "Affective event log",
             "entries: \(count)",
             "copied: \(Date().formatted(date: .numeric, time: .standard))",
         ]

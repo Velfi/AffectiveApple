@@ -22,14 +22,14 @@ struct OrientationPermissionPrompt: Identifiable, Equatable {
 }
 
 #if os(iOS) && canImport(CoreMotion) && !targetEnvironment(simulator)
-final class CoreMotionSensorHub {
-    static let shared = CoreMotionSensorHub()
+final class CoreMotionSensorHub: @unchecked Sendable {
+    nonisolated static let shared = CoreMotionSensorHub()
 
     private let manager = CMMotionManager()
 
     private init() {}
 
-    var isAccelerometerAvailable: Bool {
+    nonisolated var isAccelerometerAvailable: Bool {
         manager.isAccelerometerAvailable
     }
 
@@ -43,7 +43,7 @@ final class CoreMotionSensorHub {
         manager.startAccelerometerUpdates(to: .main, withHandler: handler)
     }
 
-    func stopAccelerometerUpdates() {
+    nonisolated func stopAccelerometerUpdates() {
         manager.stopAccelerometerUpdates()
     }
 
@@ -118,7 +118,7 @@ nonisolated struct MotionGestureObservation: Equatable {
 final class MotionGestureMonitor {
     private let onGesture: @MainActor (MotionGestureObservation) -> Void
     private var lastGestureAt: [String: Date] = [:]
-    private static var cachedAvailability: Bool?
+    nonisolated(unsafe) private static var cachedAvailability: Bool?
 
     init(onGesture: @escaping @MainActor (MotionGestureObservation) -> Void) {
         self.onGesture = onGesture
@@ -142,7 +142,7 @@ final class MotionGestureMonitor {
         #endif
     }
 
-    func stop() {
+    nonisolated func stop() {
         #if os(iOS) && canImport(CoreMotion) && !targetEnvironment(simulator)
         CoreMotionSensorHub.shared.stopAccelerometerUpdates()
         #endif

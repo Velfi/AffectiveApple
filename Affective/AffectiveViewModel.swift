@@ -10,14 +10,16 @@ import Combine
 
 @MainActor
 final class AffectiveViewModel: ObservableObject {
-    static let legacyStoredOptionsKey = "Affective.runtimeOptions"
     static let autonomyBudgetOptionKey = "autonomy_daily_energy"
+    static let autonomyLimitedMaxCapacityOptionKey = "autonomy_limited_max_capacity"
+    static let autonomyFullMaxCapacityOptionKey = "autonomy_full_max_capacity"
     static let boredomIntervalOptionKey = "boredom_interval_seconds"
+    static let boredomIntervalMinSeconds = 60
     static let makeUpLostDreamTimeOptionKey = "make_up_lost_dream_time"
     static let speechVoiceOptionKey = "speech_voice"
     static let cameraDeviceIDOptionKey = "camera_device_id"
-    static let textProviderPreferenceOptionKey = "text_provider_preference"
-    static let motionGestureEnabledOptionKey = "motion_gesture_enabled"
+    nonisolated static let textProviderPreferenceOptionKey = "text_provider_preference"
+    nonisolated static let motionGestureEnabledOptionKey = "motion_gesture_enabled"
     static let automaticCameraDeviceID = "automatic"
     static let recentStimulusLimit = 10
     static let recentStimulusRetentionSeconds: TimeInterval = 90
@@ -37,6 +39,7 @@ final class AffectiveViewModel: ObservableObject {
     static let lastOpenedBrainIDKey = "Affective.lastOpenedBrainID"
     let brainCore: any BrainCoreClient
     let speechSpeaker = AppleSpeechSpeaker()
+    let notificationSounds = BrainNotificationSounds.shared
     var pokeStartedAt: Date?
     var lastPokeEndedAt: Date?
     var pendingPokePulses: [PokePulse] = []
@@ -50,7 +53,8 @@ final class AffectiveViewModel: ObservableObject {
     var lastHostStimulusAt = Date()
     var awaitingSocialResponseUntil: Date?
     var counterpartActiveUntil: Date?
-    let brain: BrainDescriptor
+    @Published private(set) var brain: BrainDescriptor
+    @Published var brainPresentationName: String?
     @Published var isBrainConnected = false
     @Published var isToolRunning = false
     var isBrainConnectionInFlight = false
@@ -62,35 +66,37 @@ final class AffectiveViewModel: ObservableObject {
     @Published var hostPipelineHold: HostPipelineHold = .none
 
     @Published var selectedSection: WorkspaceSection = .chat
-    @Published var commandSearchText = ""
-    @Published var selectedCommandKind: LogKind?
+    @Published var eventSearchText = ""
+    @Published var selectedEventKind: LogKind?
     @Published var knowledgeSearchText = ""
     @Published var selectedSettingsScope: SettingsScope = .brain
     @Published var messageText = ""
     @Published var statusText = "Ready"
     @Published var isPoking = false
     @Published var canSend = true
+    @Published var brainMode = "waking"
     @Published var brainVoiceEnabled = true
     @Published var isAwaitingChatResponse = false
     @Published var droppedImageName: String?
-    @Published var commandEntries: [LogEntry] = []
+    @Published var eventEntries: [LogEntry] = []
     @Published var chatEntries: [LogEntry] = []
+    @Published private(set) var storedKnowledgeEntries: [LogEntry] = []
     @Published var memoryQuery = ""
     @Published var memoryText = ""
     @Published var memoryTags = ""
     @Published var reminderSchedule = "in 10 minutes"
     @Published var reminderText = ""
     @Published var brainStats = BrainStatsJournal()
-    @Published var dreamReports: [DreamReport] = []
-    @Published var selectedDreamReportID: DreamReport.ID?
-    @Published var showsArchivedDreamReports = false
+    @Published var mailboxItems: [MailboxItem] = []
+    @Published var selectedMailboxItemID: MailboxItem.ID?
+    @Published var showsArchivedMailboxItems = false
+    private var mailboxUIState = MailboxUIStateJournal()
     @Published var brainNoteText = ""
     @Published var brainTraitsText = ""
     @Published var brainGoalsText = ""
     @Published var brainRecentMemoriesText = ""
     @Published var autonomyMode = "off"
     @Published var optionGroups: [RuntimeOptionGroup]
-    @Published var developerToolActions: [CoreToolAction] = []
     @Published var credentialTestResults: [ProviderCredentialKey: CredentialTestStatus] = [:]
     private var canWriteBrainStats = true
     private var didCheckDreamOnLoad = false
@@ -108,26 +114,42 @@ final class AffectiveViewModel: ObservableObject {
     var orientationPermissionContinuation: CheckedContinuation<HostOrientationPermissionStatus, Never>?
     var motionGestureMonitor: MotionGestureMonitor?
     @Published var orientationPermissionPrompt: OrientationPermissionPrompt?
+    @Published var avatarEyeSprite: String?
+    @Published var avatarMouthSprite: String?
+    var facialExpressionRevertTask: Task<Void, Never>?
+    var queuedFacialExpressions: [QueuedFacialExpression] = []
+    var applyingQueuedFacialExpression = false
+    @Published var autonomyControlCapacity: Double = 1.0
+    @Published var autonomyMaxCapacity: Double = 1.0
 
     init(brain: BrainDescriptor, brainCore: (any BrainCoreClient)? = nil) {
         self.brain = brain
         self.brainCore = brainCore ?? BrainCore(brain: brain)
         let storedValues = Self.storedValuesForLaunch(brain: brain)
         brainVoiceEnabled = UserDefaults.standard.object(forKey: Self.brainVoiceEnabledKey) as? Bool ?? true
-        autonomyMode = storedValues["autonomy_mode"] ?? "off"
+        autonomyMode = Self.normalizeAutonomyMode(storedValues["autonomy_mode"] ?? "off")
         optionGroups = Self.loadOptionGroups(storedValues: storedValues, brain: brain)
         UserDefaults.standard.set(brain.id, forKey: Self.lastOpenedBrainIDKey)
         statusText = "Opening \(brain.displayName)"
-        commandEntries = [
+        eventEntries = [
             .init(kind: .state, title: "brain selected", body: brain.rootURL.path, metadata: ["brain": brain.id]),
         ]
         chatEntries = [
             .init(kind: .brain, title: "Brain Loaded", body: "Loaded \(brain.displayName). Chat by typing or with the poke button.", metadata: ["brain": brain.id]),
         ]
         loadBrainStats()
-        loadDreamReports()
+        loadMailboxItems()
         recordBrainSizeSnapshotIfNeeded()
-        refreshDreamReports()
+        refreshMailboxItems()
+        refreshKnowledgeEntries()
+        resetAvatarFacialExpression()
+    }
+
+    func reloadBrain(_ updated: BrainDescriptor) {
+        guard updated.id == brain.id else { return }
+        brain = updated
+        refreshKnowledgeEntries()
+        resetAvatarFacialExpression()
     }
 
     deinit {
@@ -135,11 +157,36 @@ final class AffectiveViewModel: ObservableObject {
         motionGestureMonitor?.stop()
     }
 
+    var workspaceBrainTitle: String {
+        brainPresentationName ?? brain.displayName
+    }
+
     var coreStatusText: String {
         if isBrainConnectionInFlight { return "connecting" }
         if isBrainConnected { return "connected" }
         return "disconnected"
     }
+
+    var isBrainUnavailableForConversation: Bool {
+        Self.conversationBlockedBrainModes.contains(brainMode)
+    }
+
+    var brainModeStatusText: String {
+        switch brainMode {
+        case "drowsy": return "Brain is drowsy"
+        case "dreaming": return "Brain is dreaming"
+        case "waking_up": return "Brain is waking up"
+        case "unavailable": return "Brain is unavailable"
+        default: return "Ready"
+        }
+    }
+
+    static let conversationBlockedBrainModes: Set<String> = [
+        "drowsy",
+        "dreaming",
+        "waking_up",
+        "unavailable",
+    ]
 
     var coreStatusSymbolName: String {
         if isBrainConnectionInFlight { return "arrow.triangle.2.circlepath" }
@@ -150,53 +197,72 @@ final class AffectiveViewModel: ObservableObject {
     var visibleEntryCount: Int {
         switch selectedSection {
         case .chat: chatEntries.count
-        case .developer: filteredCommandEntries.count
+        case .developer: filteredEventEntries.count
         case .knowledge: filteredKnowledgeEntries.count
-        case .mailbox: visibleDreamReports.count
+        case .mailbox: visibleMailboxItems.count
         case .stats: brainStats.notes.count + brainStats.profileSnapshots.count + brainStats.sizeSnapshots.count
         case .settings: optionGroups.reduce(0) { $0 + $1.options.count }
     }
     }
 
-    var filteredCommandEntries: [LogEntry] {
-        filtered(entries: commandEntries, query: commandSearchText, kind: selectedCommandKind)
+    var filteredEventEntries: [LogEntry] {
+        filtered(entries: eventEntries, query: eventSearchText, kind: selectedEventKind)
     }
 
     var filteredKnowledgeEntries: [LogEntry] {
-        let memoryEntries = commandEntries.filter { entry in
-            let searchable = "\(entry.title) \(entry.body) \(entry.metadata.values.joined(separator: " "))"
-            return searchable.localizedCaseInsensitiveContains("memory")
-                || searchable.localizedCaseInsensitiveContains("reminder")
-                || searchable.localizedCaseInsensitiveContains("dream")
-                || searchable.localizedCaseInsensitiveContains("attention")
+        let sessionEntries = eventEntries.filter(BrainKnowledgeReader.isKnowledgeRelated)
+        let combined = deduplicatedKnowledgeEntries(storedKnowledgeEntries + sessionEntries)
+        return filtered(entries: combined, query: knowledgeSearchText, kind: nil)
+    }
+
+    func refreshKnowledgeEntries() {
+        do {
+            storedKnowledgeEntries = try BrainKnowledgeReader.loadEntries(from: brain)
+        } catch {
+            appendEventLog(kind: .error, title: "knowledge_load failed", body: error.localizedDescription)
         }
-        return filtered(entries: memoryEntries, query: knowledgeSearchText, kind: nil)
+    }
+
+    func deduplicatedKnowledgeEntries(_ entries: [LogEntry]) -> [LogEntry] {
+        var seenSourceIDs = Set<String>()
+        var output: [LogEntry] = []
+        for entry in entries {
+            if let sourceID = entry.metadata["knowledge_source_id"] {
+                guard seenSourceIDs.insert(sourceID).inserted else { continue }
+            }
+            output.append(entry)
+        }
+        return output
     }
 
     var selectedSettingsGroups: [RuntimeOptionGroup] {
         optionGroups.filter { $0.scope == selectedSettingsScope }
     }
 
-    var visibleDreamReports: [DreamReport] {
-        dreamReports
-            .filter { Self.isDreamReportVisible($0, showsArchived: showsArchivedDreamReports) }
+    var visibleMailboxItems: [MailboxItem] {
+        mailboxItems
+            .filter { Self.isMailboxItemVisible($0, showsArchived: showsArchivedMailboxItems) }
             .sorted {
                 if $0.createdAt != $1.createdAt { return $0.createdAt > $1.createdAt }
-                return $0.dreamID.localizedCaseInsensitiveCompare($1.dreamID) == .orderedAscending
+                return $0.sourceDreamID.localizedCaseInsensitiveCompare($1.sourceDreamID) == .orderedAscending
             }
     }
 
-    var selectedDreamReport: DreamReport? {
-        guard let selectedDreamReportID else { return visibleDreamReports.first }
-        return dreamReports.first { $0.id == selectedDreamReportID }
+    var selectedMailboxItem: MailboxItem? {
+        guard let selectedMailboxItemID else { return visibleMailboxItems.first }
+        return mailboxItems.first { $0.id == selectedMailboxItemID }
     }
 
-    var unreadDreamReportCount: Int {
-        dreamReports.filter { !$0.isRead && !$0.isArchived }.count
+    var unreadMailboxItemCount: Int {
+        mailboxItems.filter { !$0.isRead && !$0.isArchived }.count
     }
 
     static func hasAnyProviderCredential() -> Bool {
-        !keychainCredentialValues().isEmpty
+        !resolvedProviderCredentials().isEmpty
+    }
+
+    static func resolvedProviderCredentials() -> [ProviderCredentialKey: String] {
+        ProviderCredentialKey.resolvedCredentials(using: credentialStore)
     }
 
     static func saveProviderCredentials(_ credentials: [ProviderCredentialKey: String]) throws {
@@ -221,6 +287,34 @@ final class AffectiveViewModel: ObservableObject {
 
     var autonomyActionBudget: Int {
         max(runtimeOptionIntValue(for: Self.autonomyBudgetOptionKey) ?? 0, 0)
+    }
+
+    var normalizedAutonomyMode: String {
+        Self.normalizeAutonomyMode(autonomyMode)
+    }
+
+    var autonomyIsEnabled: Bool {
+        normalizedAutonomyMode != "off"
+    }
+
+    var autonomyCapacityFraction: Double {
+        guard autonomyMaxCapacity > 0 else { return 0 }
+        return min(max(autonomyControlCapacity / autonomyMaxCapacity, 0), 1)
+    }
+
+    var autonomyCapacityPercentText: String {
+        "\(Int((autonomyCapacityFraction * 100).rounded()))%"
+    }
+
+    static func normalizeAutonomyMode(_ rawMode: String) -> String {
+        switch rawMode {
+        case "full", "limited", "off":
+            return rawMode
+        case "on":
+            return "full"
+        default:
+            return "off"
+        }
     }
 
     var currentBrainSizeText: String {
@@ -289,16 +383,16 @@ final class AffectiveViewModel: ObservableObject {
         }
     }
 
-    func loadDreamReports() {
-        dreamReports = DreamReportJournal.load(from: brain.dreamReportsURL).reports
-        if selectedDreamReportID == nil {
-            selectedDreamReportID = visibleDreamReports.first?.id
+    func loadMailboxItems() {
+        mailboxUIState = Self.loadMailboxUIState(brain: brain)
+        if selectedMailboxItemID == nil {
+            selectedMailboxItemID = visibleMailboxItems.first?.id
         }
     }
 
-    func refreshDreamReports() {
+    func refreshMailboxItems() {
         Task {
-            await collectDreamReports()
+            await collectMailboxItems()
         }
     }
 
@@ -306,97 +400,115 @@ final class AffectiveViewModel: ObservableObject {
         guard runtimeOptionStringValue(for: Self.makeUpLostDreamTimeOptionKey) == "on" else { return }
         guard !didCheckDreamOnLoad else { return }
         didCheckDreamOnLoad = true
-        let journal = DreamReportJournal(reports: dreamReports)
-        guard DreamReportCollector.shouldEnterDreamOnLoad(brain: brain, journal: journal, now: now) else {
-            appendCommand(kind: .state, title: "dream load check", body: "Brain has dreamed in the past 24 hours.")
+        guard Self.shouldRequestDreamTimeFromMailbox(mailboxItems, now: now) else {
+            appendEventLog(kind: .state, title: "dream load check", body: "Brain has dreamed in the past 24 hours.")
             return
         }
 
-        appendCommand(kind: .sent, title: "dream load check", body: "No dream found in the past 24 hours; entering dream.")
-        await callCoreTool(name: "dream", title: "Dream", arguments: [:], mirrorToChat: true)
-    }
-
-    func collectDreamReports() async {
-        let journal = DreamReportJournal(reports: dreamReports)
-        let updated: DreamReportJournal
+        appendEventLog(kind: .sent, title: "dream load check", body: "No mailbox dream found in the past 24 hours; requesting Dream Time.")
+        brainMode = "dreaming"
+        canSend = false
+        statusText = brainModeStatusText
         do {
-            updated = try await DreamReportCollector.collect(brain: brain, existing: journal)
+            _ = try await brainCore.requestDreamTime(prompt: nil)
+            await refreshBrainMode()
+            await collectMailboxItems()
         } catch {
-            statusText = "Dream report update failed: \(error.localizedDescription)"
+            statusText = "Dream Time failed: \(error.localizedDescription)"
+            appendEventLog(kind: .error, title: "request_dream_time failed", body: error.localizedDescription)
+            await refreshBrainMode()
+        }
+    }
+
+    func collectMailboxItems() async {
+        do {
+            let response = try await brainCore.mailboxList()
+            let stateByID = mailboxUIState.stateByMailboxID
+            mailboxItems = response.items.map {
+                MailboxItem(mailbox: $0, state: stateByID[$0.mailboxID])
+                    .resolvingArtifact(in: brain.memoryDatabaseURL)
+            }
+        } catch {
+            statusText = "Mailbox update failed: \(error.localizedDescription)"
             return
         }
-        let mergedReports = Self.mergedDreamReports(scanned: updated.reports, current: dreamReports)
-        dreamReports = mergedReports
-        if mergedReports != updated.reports {
-            do {
-                try DreamReportJournal(reports: mergedReports).write(to: brain.dreamReportsURL)
-            } catch {
-                statusText = "Mailbox update failed: \(error.localizedDescription)"
-            }
-        }
-        if selectedDreamReportID == nil || !visibleDreamReports.contains(where: { $0.id == selectedDreamReportID }) {
-            selectedDreamReportID = visibleDreamReports.first?.id
+        if selectedMailboxItemID == nil || !visibleMailboxItems.contains(where: { $0.id == selectedMailboxItemID }) {
+            selectedMailboxItemID = visibleMailboxItems.first?.id
         }
     }
 
-    func selectDreamReport(_ report: DreamReport) {
-        selectedDreamReportID = report.id
-        setDreamReport(report.id, isRead: true)
+    func selectMailboxItem(_ item: MailboxItem) {
+        selectedMailboxItemID = item.id
+        setMailboxItem(item.id, isRead: true)
     }
 
-    func setDreamReport(_ reportID: DreamReport.ID, isRead: Bool) {
-        mutateDreamReport(reportID) { report in
-            report.isRead = isRead
+    func setMailboxItem(_ itemID: MailboxItem.ID, isRead: Bool) {
+        mailboxUIState.set(mailboxID: itemID, isRead: isRead)
+        mutateMailboxItem(itemID) { item in
+            item.isRead = isRead
+        }
+        if isRead {
+            Task { try? await brainCore.mailboxMarkRead(mailboxID: itemID) }
         }
     }
 
-    func setDreamReport(_ reportID: DreamReport.ID, isArchived: Bool) {
-        mutateDreamReport(reportID) { report in
-            report.isArchived = isArchived
+    func setMailboxItem(_ itemID: MailboxItem.ID, isArchived: Bool) {
+        mailboxUIState.set(mailboxID: itemID, isArchived: isArchived)
+        mutateMailboxItem(itemID) { item in
+            item.isArchived = isArchived
         }
-        if isArchived, selectedDreamReportID == reportID {
-            selectedDreamReportID = visibleDreamReports.first?.id
+        if isArchived, selectedMailboxItemID == itemID {
+            selectedMailboxItemID = visibleMailboxItems.first?.id
         }
     }
 
-    private func mutateDreamReport(_ reportID: DreamReport.ID, update: (inout DreamReport) -> Void) {
-        guard let index = dreamReports.firstIndex(where: { $0.id == reportID }) else { return }
-        update(&dreamReports[index])
-        saveDreamReports()
+    private func mutateMailboxItem(_ itemID: MailboxItem.ID, update: (inout MailboxItem) -> Void) {
+        guard let index = mailboxItems.firstIndex(where: { $0.id == itemID }) else { return }
+        update(&mailboxItems[index])
+        saveMailboxItems()
     }
 
-    private func saveDreamReports() {
+    private func saveMailboxItems() {
         do {
-            try DreamReportJournal(reports: dreamReports).write(to: brain.dreamReportsURL)
+            try mailboxUIState.write(to: brain.mailboxUIStateURL)
             statusText = "Updated mailbox"
         } catch {
             statusText = "Mailbox update failed: \(error.localizedDescription)"
         }
     }
 
-    nonisolated static func mergedDreamReports(scanned: [DreamReport], current: [DreamReport]) -> [DreamReport] {
+    nonisolated static func mergedMailboxItems(scanned: [MailboxItem], current: [MailboxItem]) -> [MailboxItem] {
         let currentByID = Dictionary(uniqueKeysWithValues: current.map { ($0.id, $0) })
         var mergedByID = currentByID
 
-        for scannedReport in scanned {
-            if let currentReport = currentByID[scannedReport.id] {
-                var report = scannedReport
-                report.isRead = currentReport.isRead
-                report.isArchived = currentReport.isArchived
-                mergedByID[scannedReport.id] = report
+        for scannedItem in scanned {
+            if let currentItem = currentByID[scannedItem.id] {
+                var item = scannedItem
+                item.isRead = currentItem.isRead
+                item.isArchived = currentItem.isArchived
+                mergedByID[scannedItem.id] = item
             } else {
-                mergedByID[scannedReport.id] = scannedReport
+                mergedByID[scannedItem.id] = scannedItem
             }
         }
 
         return Array(mergedByID.values).sorted {
             if $0.createdAt != $1.createdAt { return $0.createdAt > $1.createdAt }
-            return $0.dreamID.localizedCaseInsensitiveCompare($1.dreamID) == .orderedAscending
+            return $0.sourceDreamID.localizedCaseInsensitiveCompare($1.sourceDreamID) == .orderedAscending
         }
     }
 
-    nonisolated static func isDreamReportVisible(_ report: DreamReport, showsArchived: Bool) -> Bool {
-        showsArchived ? report.isArchived : !report.isArchived
+    nonisolated static func isMailboxItemVisible(_ item: MailboxItem, showsArchived: Bool) -> Bool {
+        showsArchived ? item.isArchived : !item.isArchived
+    }
+
+    nonisolated static func shouldRequestDreamTimeFromMailbox(_ items: [MailboxItem], now: Date = Date()) -> Bool {
+        guard let latest = items.map(\.createdAt).max() else { return true }
+        return now.timeIntervalSince(latest) >= MailboxItem.recentMailboxDeliveryInterval
+    }
+
+    nonisolated static func loadMailboxUIState(brain: BrainDescriptor) -> MailboxUIStateJournal {
+        MailboxUIStateJournal.load(from: brain.mailboxUIStateURL)
     }
 
 }
@@ -427,11 +539,11 @@ enum HostPipelineHold: Equatable {
 enum HostPipelineAction {
     case interrupt(userText: String, reason: String, interruptedAction: String?, canceledQueuedActionCount: Int)
     case typedText(text: String, stimulusContext: StimulusContext)
-    case imageText(prompt: String, attachment: [String: JSONValue], stimulusContext: StimulusContext)
-    case coreTool(name: String, title: String, arguments: [String: JSONValue], mirrorToChat: Bool, requiresCamera: Bool = false)
+    case imageText(prompt: String, attachment: [String: JSONValue], mediaPayload: String, stimulusContext: StimulusContext)
     case coreTouch(name: String, title: String)
     case pokeSequence([PokePulse])
     case pushedMotionGesture(MotionGestureObservation)
+    case boredomStimulus(text: String, stimulusContext: StimulusContext)
     case refreshBrainState
 }
 

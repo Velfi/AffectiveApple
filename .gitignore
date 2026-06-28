@@ -7,6 +7,7 @@ xcuserdata/
 
 # Xcode build products
 DerivedData/
+.derivedData/
 build/
 .archives/
 *.hmap
@@ -16,6 +17,12 @@ build/
 
 # Swift Package Manager
 .build/
+.swiftpm/
+
+# LLM tester and coverage output
+llm_tester_report-*.html
+*.profraw
+*.profdata
 
 # Locally downloaded models
 Models/

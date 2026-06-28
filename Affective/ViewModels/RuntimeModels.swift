@@ -7,7 +7,7 @@ import Foundation
 
 enum ControlTab: String, CaseIterable, Identifiable {
     case chat = "Chat"
-    case commands = "Commands"
+    case events = "Events"
     case options = "Options"
 
     var id: String { rawValue }
@@ -15,7 +15,7 @@ enum ControlTab: String, CaseIterable, Identifiable {
     var symbolName: String {
         switch self {
         case .chat: "bubble.left.and.bubble.right"
-        case .commands: "terminal"
+        case .events: "terminal"
         case .options: "slider.horizontal.3"
         }
     }
@@ -46,7 +46,7 @@ enum WorkspaceSection: String, CaseIterable, Identifiable {
         switch self {
         case .chat: "Chat"
         case .mailbox: "Daily reports"
-        case .developer: "Commands and actions"
+        case .developer: "Events and actions"
         case .knowledge: "Memory and recall"
         case .stats: "Growth and notes"
         case .settings: "Brain and host options"
@@ -80,55 +80,27 @@ enum LogKind: String, CaseIterable, Identifiable {
 }
 
 struct LogEntry: Identifiable, Equatable {
-    let id = UUID()
+    let id: UUID
     let kind: LogKind
     let title: String
     let body: String
     let metadata: [String: String]
-    let createdAt = Date()
-}
+    let createdAt: Date
 
-struct CoreToolAction: Identifiable, Equatable {
-    let id: String
-    let title: String
-    let toolName: String
-    let symbolName: String
-    let arguments: [String: JSONValue]
-    let mirrorToChat: Bool
-    let requiresCamera: Bool
-}
-
-nonisolated struct DeveloperToolCatalog: Decodable {
-    let tools: [DeveloperToolRecord]
-}
-
-nonisolated struct DeveloperToolRecord: Decodable {
-    let id: String
-    let title: String
-    let toolName: String
-    let symbolName: String
-    let mirrorToChat: Bool
-    let requiresCamera: Bool
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case title
-        case toolName = "tool_name"
-        case symbolName = "symbol_name"
-        case mirrorToChat = "mirror_to_chat"
-        case requiresCamera = "requires_camera"
-    }
-
-    var action: CoreToolAction {
-        .init(
-            id: id,
-            title: title,
-            toolName: toolName,
-            symbolName: symbolName,
-            arguments: [:],
-            mirrorToChat: mirrorToChat,
-            requiresCamera: requiresCamera
-        )
+    init(
+        kind: LogKind,
+        title: String,
+        body: String,
+        metadata: [String: String] = [:],
+        id: UUID = UUID(),
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.body = body
+        self.metadata = metadata
+        self.createdAt = createdAt
     }
 }
 
@@ -220,6 +192,10 @@ enum ProviderCredentialTester {
             var components = URLComponents(string: "https://generativelanguage.googleapis.com/v1beta/models")!
             components.queryItems = [URLQueryItem(name: "key", value: credential)]
             return URLRequest(url: components.url!)
+        case .deepseek:
+            var request = URLRequest(url: URL(string: "https://api.deepseek.com/v1/models")!)
+            request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
+            return request
         }
     }
 }
@@ -237,7 +213,7 @@ struct RuntimeOptionGroup: Identifiable, Equatable {
             .select(key: "psyche_mode", label: "Psyche", value: "on", choices: ["off", "on"]),
             .select(key: "speech_voice", label: "Speech voice", value: defaultSpeechVoiceName, choices: speechVoiceChoices),
             .number(key: "conversation_idle_timeout_seconds", label: "Conversation idle timeout", value: "120", unit: "sec"),
-            .number(key: "boredom_interval_seconds", label: "Boredom interval", value: "600", unit: "sec"),
+            .number(key: "boredom_interval_seconds", label: "Boredom interval max", value: "600", unit: "sec"),
         ]),
         .init(title: "Tuning", note: "Recognition, autonomy, and reasoning knobs.", isExpanded: true, options: [
             .number(key: "known_threshold", label: "Known face threshold", value: "0.85"),
@@ -245,7 +221,8 @@ struct RuntimeOptionGroup: Identifiable, Equatable {
             .number(key: "autonomy_interval_seconds", label: "Autonomy interval", value: "300", unit: "sec"),
             .select(key: "autonomy_sleep", label: "Sleep during quiet hours", value: "off", choices: ["off", "on"]),
             .timeRange(key: "autonomy_quiet_hours", label: "Quiet hours", value: "22:00-08:00"),
-            .number(key: "autonomy_daily_energy", label: "Daily autonomy budget", value: "20", unit: "actions"),
+            .number(key: "autonomy_limited_max_capacity", label: "Limited max capacity", value: "0.55"),
+            .number(key: "autonomy_full_max_capacity", label: "Full max capacity", value: "1.0"),
             .select(key: "make_up_lost_dream_time", label: "Make up for lost dream time", value: "off", choices: ["off", "on"]),
         ]),
         .init(title: "Biometric Privacy", note: "Local face-template controls for this brain. Owner-managed consent is required before use.", isExpanded: true, options: [
@@ -317,6 +294,7 @@ struct RuntimeOptionGroup: Identifiable, Equatable {
             .text(key: "openai_api_key", label: "OpenAI API key", value: ""),
             .text(key: "anthropic_api_key", label: "Anthropic API key", value: ""),
             .text(key: "google_api_key", label: "Google API key", value: ""),
+            .text(key: "deepseek_api_key", label: "DeepSeek API key", value: ""),
         ]),
         .init(title: "Host Senses", note: "Local devices used when the brain asks the host for sensory input.", scope: .host, isExpanded: true, options: [
             .select(key: "camera_device_id", label: "Camera input", value: "automatic", choices: ["automatic"]),

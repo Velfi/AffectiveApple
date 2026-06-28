@@ -47,6 +47,16 @@ import Foundation
         case maxTokens = "max_tokens"
         case jsonSchema = "json_schema"
       }
+
+      var promptPayload: HostLLMPromptPayload {
+        HostLLMPromptPayload(
+          systemPrompt: systemPrompt,
+          userPrompt: userPrompt,
+          responseFormat: responseFormat,
+          maxTokens: maxTokens,
+          jsonSchema: jsonSchema
+        )
+      }
     }
 
     private struct HostImageGenerationPayload: Decodable {
@@ -123,8 +133,8 @@ import Foundation
       body(
         AffectiveCoreEmbeddedHostServices(
           ctx: Unmanaged.passUnretained(self).toOpaque(),
-          http_post_json: embeddedHostHttpPostJSON,
-          free_string: embeddedHostFreeString
+          http_post_json: Self.embeddedHostHttpPostJSON,
+          free_string: Self.embeddedHostFreeString
         ))
     }
 
@@ -197,28 +207,9 @@ import Foundation
       }
 
       let request = try requestForPostJSON(url: urlString, headersJSON: headersJSON, body: body)
-
-      let semaphore = DispatchSemaphore(value: 0)
-      var result: Result<(Data, URLResponse), Error>?
-      let task = URLSession.shared.dataTask(with: request) { data, response, error in
-        if let error {
-          result = .failure(error)
-        } else if let response {
-          result = .success((data ?? Data(), response))
-        } else {
-          result = .failure(HostHTTPError.missingResponse)
-        }
-        semaphore.signal()
+      let (data, response) = try Self.runBlockingAsync {
+        try await URLSession.shared.data(for: request)
       }
-      task.resume()
-      guard semaphore.wait(timeout: .now() + 65) == .success else {
-        task.cancel()
-        throw HostHTTPError.timeout
-      }
-
-      let (data, response) = try result?.get() ?? {
-        throw HostHTTPError.missingResponse
-      }()
       guard let httpResponse = response as? HTTPURLResponse else {
         throw HostHTTPError.missingHTTPResponse
       }
@@ -230,35 +221,21 @@ import Foundation
 
     private func performHostLLMCompletion(body: Data) throws -> Data {
       let payload = try JSONDecoder().decode(HostLLMCompletionPayload.self, from: body)
-      let prompt = Self.prompt(for: payload)
+      let prompt = HostPromptBuilder.combinedPrompt(for: payload.promptPayload)
       let client = HostLLMCompletionClient(
         providerRouter: providerRouter,
         textProviderPreference: textProviderPreference,
         routePicker: textRoutePicker,
         jsonLoader: jsonLoader
       )
-      let semaphore = DispatchSemaphore(value: 0)
-      var result: Result<HostLLMCompletionResponse, Error>?
-      Task {
-        do {
-          let responseFormat = HostResponseFormat(rawValue: payload.responseFormat) ?? .text
-          result = .success(try await client.complete(HostLLMCompletionRequest(
-            prompt: prompt,
-            maxTokens: payload.maxTokens ?? 512,
-            responseFormat: responseFormat,
-            jsonSchema: payload.jsonSchema ?? "{}"
-          )))
-        } catch {
-          result = .failure(error)
-        }
-        semaphore.signal()
+      let completion = try Self.runBlockingAsync {
+        try await client.complete(HostLLMCompletionRequest(
+          prompt: prompt,
+          maxTokens: payload.maxTokens ?? 512,
+          responseFormat: HostResponseFormat(rawValue: payload.responseFormat) ?? .text,
+          jsonSchema: payload.jsonSchema ?? "{}"
+        ))
       }
-      guard semaphore.wait(timeout: .now() + 65) == .success else {
-        throw HostHTTPError.timeout
-      }
-      let completion = try result?.get() ?? {
-        throw HostHTTPError.missingResponse
-      }()
       return Data(completion.text.utf8)
     }
 
@@ -277,25 +254,12 @@ import Foundation
     private func performHostImageGeneration(body: Data) throws -> Data {
       let payload = try JSONDecoder().decode(HostImageGenerationPayload.self, from: body)
       let client = HostImageGenerationClient(providerRouter: providerRouter, jsonLoader: jsonLoader)
-      let semaphore = DispatchSemaphore(value: 0)
-      var result: Result<HostGeneratedImage, Error>?
-      Task {
-        do {
-          result = .success(try await client.generate(HostImageGenerationRequest(
-            prompt: payload.prompt,
-            outputDirectory: URL(fileURLWithPath: payload.outputDirectory)
-          )))
-        } catch {
-          result = .failure(error)
-        }
-        semaphore.signal()
+      let generated = try Self.runBlockingAsync {
+        try await client.generate(HostImageGenerationRequest(
+          prompt: payload.prompt,
+          outputDirectory: URL(fileURLWithPath: payload.outputDirectory)
+        ))
       }
-      guard semaphore.wait(timeout: .now() + 65) == .success else {
-        throw HostHTTPError.timeout
-      }
-      let generated = try result?.get() ?? {
-        throw HostHTTPError.missingResponse
-      }()
       return try JSONEncoder().encode(HostImageGenerationResponse(
         path: generated.path,
         mimeType: generated.mimeType
@@ -306,45 +270,17 @@ import Foundation
       let payload = try JSONDecoder().decode(HostVisionCompletionPayload.self, from: body)
       let responseFormat = HostResponseFormat(rawValue: payload.responseFormat) ?? .text
       let client = HostVisionCompletionClient(providerRouter: providerRouter, jsonLoader: jsonLoader)
-      let semaphore = DispatchSemaphore(value: 0)
-      var result: Result<HostVisionCompletionResponse, Error>?
-      Task {
-        do {
-          result = .success(try await client.complete(HostVisionCompletionRequest(
-            prompt: payload.prompt,
-            imagePaths: payload.imagePaths,
-            responseFormat: responseFormat,
-            maxTokens: payload.maxTokens ?? 800,
-            temperature: payload.temperature ?? 0.2,
-            jsonSchema: payload.jsonSchema ?? "{}"
-          )))
-        } catch {
-          result = .failure(error)
-        }
-        semaphore.signal()
+      let completion = try Self.runBlockingAsync {
+        try await client.complete(HostVisionCompletionRequest(
+          prompt: payload.prompt,
+          imagePaths: payload.imagePaths,
+          responseFormat: responseFormat,
+          maxTokens: payload.maxTokens ?? 800,
+          temperature: payload.temperature ?? 0.2,
+          jsonSchema: payload.jsonSchema ?? "{}"
+        ))
       }
-      guard semaphore.wait(timeout: .now() + 65) == .success else {
-        throw HostHTTPError.timeout
-      }
-      let completion = try result?.get() ?? {
-        throw HostHTTPError.missingResponse
-      }()
       return Data(completion.text.utf8)
-    }
-
-    private static func prompt(for payload: HostLLMCompletionPayload) -> String {
-      var sections = [
-        "System:\n\(payload.systemPrompt)",
-        "User:\n\(payload.userPrompt)",
-      ]
-      if payload.responseFormat == "json_object" {
-        var jsonInstruction = "Return only a valid JSON object."
-        if let schema = payload.jsonSchema?.trimmingCharacters(in: .whitespacesAndNewlines), !schema.isEmpty {
-          jsonInstruction += "\nJSON schema:\n\(schema)"
-        }
-        sections.append(jsonInstruction)
-      }
-      return sections.joined(separator: "\n\n")
     }
 
     private static func requiredString(_ value: AffectiveCoreEmbeddedString, label: String)
@@ -374,12 +310,7 @@ import Foundation
         value.isEmpty ? nil : value
       } ?? "unknown endpoint"
       let bodyBytes = body.len
-      let message: String
-      if let error = error as? CustomStringConvertible {
-        message = error.description
-      } else {
-        message = error.localizedDescription
-      }
+      let message = String(describing: error)
       return "host HTTP POST JSON failed for \(endpoint) (\(bodyBytes) request bytes): \(message)"
     }
 
@@ -401,54 +332,76 @@ import Foundation
       guard let ptr = string.ptr, string.len > 0 else { return }
       UnsafeMutablePointer(mutating: ptr).deallocate()
     }
-  }
 
-  private enum HostHTTPError: Error, CustomStringConvertible {
-    case invalidURL(String)
-    case invalidString(String)
-    case missingResponse
-    case missingHTTPResponse
-    case badStatus(Int, String)
-    case timeout
+    private static func runBlockingAsync<T>(
+      timeoutSeconds: TimeInterval = 65,
+      _ work: @escaping @Sendable () async throws -> T
+    ) throws -> T {
+      let semaphore = DispatchSemaphore(value: 0)
+      var result: Result<T, Error>?
+      Task.detached(priority: .userInitiated) {
+        do {
+          result = .success(try await work())
+        } catch {
+          result = .failure(error)
+        }
+        semaphore.signal()
+      }
+      guard semaphore.wait(timeout: .now() + timeoutSeconds) == .success else {
+        throw HostHTTPError.timeout
+      }
+      return try result?.get() ?? {
+        throw HostHTTPError.missingResponse
+      }()
+    }
 
-    var description: String {
-      switch self {
-      case .invalidURL(let url): return "invalid HTTP URL: \(url)"
-      case .invalidString(let label): return "invalid embedded HTTP string: \(label)"
-      case .missingResponse: return "host HTTP request produced no response"
-      case .missingHTTPResponse: return "host HTTP request produced a non-HTTP response"
-      case .badStatus(let status, let body): return "host HTTP request failed with HTTP \(status): \(body)"
-      case .timeout: return "host HTTP request timed out"
+    private enum HostHTTPError: Error, CustomStringConvertible {
+      case invalidURL(String)
+      case invalidString(String)
+      case missingResponse
+      case missingHTTPResponse
+      case badStatus(Int, String)
+      case timeout
+
+      var description: String {
+        switch self {
+        case .invalidURL(let url): return "invalid HTTP URL: \(url)"
+        case .invalidString(let label): return "invalid embedded HTTP string: \(label)"
+        case .missingResponse: return "host HTTP request produced no response"
+        case .missingHTTPResponse: return "host HTTP request produced a non-HTTP response"
+        case .badStatus(let status, let body): return "host HTTP request failed with HTTP \(status): \(body)"
+        case .timeout: return "host HTTP request timed out"
+        }
       }
     }
-  }
 
-  private let embeddedHostHttpPostJSON: AffectiveCoreEmbeddedHttpPostJsonFn = {
-    ctx,
-    url,
-    headersJSON,
-    body,
-    outData,
-    outError in
-    guard let ctx else {
-      EmbeddedHostServices.copy(Data("missing embedded host services context".utf8), to: outError)
-      EmbeddedHostServices.copy(Data(), to: outData)
-      return 1
+    nonisolated static let embeddedHostHttpPostJSON: AffectiveCoreEmbeddedHttpPostJsonFn = {
+      ctx,
+      url,
+      headersJSON,
+      body,
+      outData,
+      outError in
+      guard let ctx else {
+        EmbeddedHostServices.copy(Data("missing embedded host services context".utf8), to: outError)
+        EmbeddedHostServices.copy(Data(), to: outData)
+        return 1
+      }
+      let services = Unmanaged<EmbeddedHostServices>.fromOpaque(ctx).takeUnretainedValue()
+      return services.httpPostJSON(
+        url: url,
+        headersJSON: headersJSON,
+        body: body,
+        outData: outData,
+        outError: outError
+      )
     }
-    let services = Unmanaged<EmbeddedHostServices>.fromOpaque(ctx).takeUnretainedValue()
-    return services.httpPostJSON(
-      url: url,
-      headersJSON: headersJSON,
-      body: body,
-      outData: outData,
-      outError: outError
-    )
-  }
 
-  private let embeddedHostFreeString: AffectiveCoreEmbeddedFreeHostStringFn = { ctx, string in
-    guard let ctx else { return }
-    let services = Unmanaged<EmbeddedHostServices>.fromOpaque(ctx).takeUnretainedValue()
-    services.free(string)
+    nonisolated static let embeddedHostFreeString: AffectiveCoreEmbeddedFreeHostStringFn = { ctx, string in
+      guard let ctx else { return }
+      let services = Unmanaged<EmbeddedHostServices>.fromOpaque(ctx).takeUnretainedValue()
+      services.free(string)
+    }
   }
 #endif
 
@@ -463,7 +416,6 @@ import Foundation
     let memoryPath: [UInt8]
     let graphPath: [UInt8]
     let schedulePath: [UInt8]
-    let eventsPath: [UInt8]
     let maintenanceStatePath: [UInt8]
     let faceEmbeddingsDir: [UInt8]
     let hostManifestJSON: [UInt8]
@@ -490,7 +442,6 @@ import Foundation
       memoryPath = Array(brain.memoryDatabaseURL.path.utf8)
       graphPath = Array(brain.graphDatabaseURL.path.utf8)
       schedulePath = Array(brain.scheduleURL.path.utf8)
-      eventsPath = Array(brain.eventsURL.path.utf8)
       maintenanceStatePath = Array(brain.maintenanceStateURL.path.utf8)
       faceEmbeddingsDir = Array(brain.faceEmbeddingsURL.path.utf8)
       hostManifestJSON = Array(EmbeddedHostCapabilityManifest.current(
@@ -514,30 +465,26 @@ import Foundation
                   memoryPath.withUnsafeBufferPointer { memoryPath in
                     graphPath.withUnsafeBufferPointer { graphPath in
                       schedulePath.withUnsafeBufferPointer { schedulePath in
-                        eventsPath.withUnsafeBufferPointer { eventsPath in
-                          maintenanceStatePath.withUnsafeBufferPointer {
-                            maintenanceStatePath in
-                            faceEmbeddingsDir.withUnsafeBufferPointer { faceEmbeddingsDir in
-                              hostManifestJSON.withUnsafeBufferPointer { hostManifestJSON in
-                                body(
-                                  AffectiveCoreEmbeddedConfig(
-                                    brain_id: Self.string(brainID),
-                                    brain_root: Self.string(brainRoot),
-                                    conversation_models: Self.string(conversationModels),
-                                    conversation_reasoning_effort: Self.string(
-                                      conversationReasoningEffort),
-                                    image_generation_model: Self.string(imageGenerationModel),
-                                    image_generation_output_dir: Self.string(
-                                      imageGenerationOutputDir),
-                                    memory_path: Self.string(memoryPath),
-                                    graph_path: Self.string(graphPath),
-                                    schedule_path: Self.string(schedulePath),
-                                    events_path: Self.string(eventsPath),
-                                    maintenance_state_path: Self.string(maintenanceStatePath),
-                                    face_embeddings_dir: Self.string(faceEmbeddingsDir),
-                                    host_manifest_json: Self.string(hostManifestJSON)
-                                  ))
-                              }
+                        maintenanceStatePath.withUnsafeBufferPointer { maintenanceStatePath in
+                          faceEmbeddingsDir.withUnsafeBufferPointer { faceEmbeddingsDir in
+                            hostManifestJSON.withUnsafeBufferPointer { hostManifestJSON in
+                              body(
+                                AffectiveCoreEmbeddedConfig(
+                                  brain_id: Self.string(brainID),
+                                  brain_root: Self.string(brainRoot),
+                                  conversation_models: Self.string(conversationModels),
+                                  conversation_reasoning_effort: Self.string(
+                                    conversationReasoningEffort),
+                                  image_generation_model: Self.string(imageGenerationModel),
+                                  image_generation_output_dir: Self.string(
+                                    imageGenerationOutputDir),
+                                  memory_path: Self.string(memoryPath),
+                                  graph_path: Self.string(graphPath),
+                                  schedule_path: Self.string(schedulePath),
+                                  maintenance_state_path: Self.string(maintenanceStatePath),
+                                  face_embeddings_dir: Self.string(faceEmbeddingsDir),
+                                  host_manifest_json: Self.string(hostManifestJSON)
+                                ))
                             }
                           }
                         }
@@ -557,16 +504,7 @@ import Foundation
     }
 
     static func providerCredentials() -> [ProviderCredentialKey: String] {
-      ProviderCredentialKey.allCases.reduce(into: [:]) { credentials, key in
-        guard
-          let value = try? BrainCore.credentialStore.credential(for: key)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-          !value.isEmpty
-        else {
-          return
-        }
-        credentials[key] = value
-      }
+      ProviderCredentialKey.resolvedCredentials(using: BrainCore.credentialStore)
     }
 
     static func conversationModels(
@@ -594,6 +532,10 @@ import Foundation
       if credentials[.google] != nil
           && (textProviderPreference == .random || textProviderPreference == .google) {
         models.append("google:gemini-3.1-flash-lite")
+      }
+      if credentials[.deepseek] != nil
+          && (textProviderPreference == .random || textProviderPreference == .deepseek) {
+        models.append("deepseek:deepseek-chat")
       }
       return models.joined(separator: ",")
     }
@@ -765,7 +707,7 @@ import Foundation
         return sortedConfiguredProviderNames
       case .local:
         return appleFoundationModelsStatus.isAvailable ? ["Apple Foundation Models"] : []
-      case .openAI, .anthropic, .google:
+      case .openAI, .anthropic, .google, .deepseek:
         guard let provider = textProviderPreference.credentialProvider,
               configuredProviders.contains(provider) else {
           return []
@@ -890,27 +832,41 @@ import Foundation
       "camera_capture",
       "microphone_capture",
       "orientation_read",
+      "orientation_query",
       "motion_gesture_read",
       "memory_read",
       "memory_write",
+      "stored_memory_read",
+      "stored_memory_write",
       "reminder_read",
       "reminder_write",
+      "reminder_io",
       "notification_schedule",
       "uploaded_media_read",
       "stored_image_read",
       "face_identification",
-      "introspection",
+      "identity_recognition",
+      "face_enrollment",
+      "face_picture_update",
+      "facial_expression_output",
+      "event_envelope",
+      "event_drain",
+      "sense_catalog",
+      "sense_status",
+      "sense_observation",
       "time_lookup",
       "power_status",
       "storage_fullness",
       "database_stats",
-      "face_enrollment",
       "local_process_io",
       "file_import",
       "file_export",
+      "import_brain",
+      "export_brain",
     ]
 
     static let providerHostCapabilities: [String] = [
+      "image_generation",
       "provider_image_generation",
       "provider_vision_completion",
       "provider_text_completion",
@@ -922,9 +878,7 @@ import Foundation
       "sense_request",
       "capability_manifest",
       "capability_status",
-      "action_request",
       "action_result",
-      "memory_request",
       "memory_result",
       "memory_mutation",
     ]

@@ -17,7 +17,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface AFFaceRecognitionBridge : NSObject
 
-- (AFFaceEmbeddingResult *)embeddingForImageAtPath:(NSString *)imagePath
+- (nullable AFFaceEmbeddingResult *)embeddingForImageAtPath:(NSString *)imagePath
                                      detectorModel:(NSString *)detectorModelPath
                                    recognizerModel:(NSString *)recognizerModelPath
                                              error:(NSError **)error;

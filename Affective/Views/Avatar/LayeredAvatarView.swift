@@ -22,7 +22,15 @@ import PhotosUI
 struct LayeredAvatarView: View {
     let manifest: BrainAvatarManifest
     var expressionID: String? = nil
+    var eyeSprite: String? = nil
+    var mouthSprite: String? = nil
     var ignoresClip: Bool = false
+    var contentAlignment: Alignment = .center
+    var assetURLForPath: ((String) -> URL)? = nil
+
+    func assetURL(for path: String) -> URL {
+        assetURLForPath?(path) ?? manifest.url(for: path)
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -33,16 +41,28 @@ struct LayeredAvatarView: View {
             ZStack(alignment: .topLeading) {
                 ForEach(manifest.layers) { layer in
                     if let layerFrame = safeLayerFrame(for: layer, in: frame, scale: scale) {
-                        AvatarLayerView(manifest: manifest, layer: layer, expressionID: expressionID)
-                            .frame(width: layerFrame.size.width, height: layerFrame.size.height)
-                            .position(x: layerFrame.midX, y: layerFrame.midY)
-                            .opacity(layer.opacity ?? 1)
+                        AvatarLayerView(
+                            layer: layer,
+                            expressionID: expressionID,
+                            eyeSprite: eyeSprite,
+                            assetURL: assetURL,
+                            atlasPlayback: manifest.atlasPlayback(
+                                for: layer,
+                                expressionID: expressionID,
+                                eyeSprite: eyeSprite,
+                                mouthSprite: mouthSprite
+                            ),
+                            usesRandomBlink: shouldRandomBlink(for: layer)
+                        )
+                        .frame(width: layerFrame.size.width, height: layerFrame.size.height)
+                        .offset(x: layerFrame.minX, y: layerFrame.minY)
+                        .opacity(layer.opacity ?? 1)
                     }
                 }
             }
-            .frame(width: contentWidth, height: contentHeight)
+            .frame(width: contentWidth, height: contentHeight, alignment: .topLeading)
             .clipped()
-            .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: contentAlignment)
         }
     }
 
@@ -77,20 +97,19 @@ struct LayeredAvatarView: View {
         guard
             scale.isFinite,
             scale > 0,
-            layer.x.isFinite,
-            layer.y.isFinite,
             layer.width.isFinite,
             layer.height.isFinite,
             layer.width > 0,
             layer.height > 0
         else {
-            avatarRenderLogger.error("Skipping invalid avatar layer id=\(layer.id, privacy: .public) x=\(layer.x, privacy: .public) y=\(layer.y, privacy: .public) width=\(layer.width, privacy: .public) height=\(layer.height, privacy: .public) scale=\(scale, privacy: .public)")
+            avatarRenderLogger.error("Skipping invalid avatar layer id=\(layer.id, privacy: .public) width=\(layer.width, privacy: .public) height=\(layer.height, privacy: .public) scale=\(scale, privacy: .public)")
             return nil
         }
 
+        let topLeft = layer.topLeftOrigin()
         let rect = CGRect(
-            x: (layer.x - frame.x) * scale,
-            y: (layer.y - frame.y) * scale,
+            x: (topLeft.x - frame.x) * scale,
+            y: (topLeft.y - frame.y) * scale,
             width: layer.width * scale,
             height: layer.height * scale
         )
@@ -100,25 +119,43 @@ struct LayeredAvatarView: View {
         }
         return rect
     }
+
+    func shouldRandomBlink(for layer: BrainAvatarManifest.Layer) -> Bool {
+        guard layer.id == manifest.blinkTargetLayerID(expressionID: expressionID) else { return false }
+        guard manifest.resolvedBlinkPlayback(expressionID: expressionID)?.isAnimated == true else { return false }
+        if layer.id == "eyes",
+           let eyeSprite,
+           let neutral = manifest.neutralEyeSpriteName(),
+           eyeSprite != neutral {
+            return false
+        }
+        return true
+    }
 }
 
 struct AvatarLayerView: View {
-    let manifest: BrainAvatarManifest
     let layer: BrainAvatarManifest.Layer
     let expressionID: String?
+    let eyeSprite: String?
+    let assetURL: (String) -> URL
+    let atlasPlayback: BrainAvatarManifest.AtlasPlayback
+    let usesRandomBlink: Bool
 
     var body: some View {
         if layer.atlas != nil {
-            let playback = manifest.atlasPlayback(for: layer, expressionID: expressionID)
-            if playback.isAnimated && layer.id == "blink" {
-                RandomBlinkAvatarLayerView(manifest: manifest, layer: layer, playback: playback)
-            } else if playback.isAnimated {
+            if usesRandomBlink {
+                RandomBlinkAvatarLayerView(layer: layer, playback: atlasPlayback, assetURL: assetURL)
+            } else if atlasPlayback.isAnimated {
                 TimelineView(.animation) { timeline in
-                    atlasFrame(index: playback.frameIndex(at: timeline.date))
+                    atlasFrame(index: atlasPlayback.frameIndex(at: timeline.date))
                 }
             } else {
-                atlasFrame(index: playback.frameIndex(at: .now))
+                atlasFrame(index: atlasPlayback.frameIndex(at: .now))
             }
+        } else if let colorHex = layer.color, layer.image == nil,
+                  let fillColor = Color.avatarColor(fromHex: colorHex) {
+            Rectangle()
+                .fill(fillColor)
         } else {
             imageLayer
         }
@@ -128,17 +165,19 @@ struct AvatarLayerView: View {
     var imageLayer: some View {
         #if os(macOS)
         if let imagePath = layer.image,
-           let image = NSImage(contentsOf: manifest.url(for: imagePath)) {
+           let image = AvatarAssetImageLoader.loadImage(from: assetURL(imagePath), layerID: layer.id) {
             Image(nsImage: image)
                 .resizable()
                 .scaledToFill()
+                .clipped()
         }
         #elseif canImport(UIKit)
         if let imagePath = layer.image,
-           let image = UIImage(contentsOfFile: manifest.url(for: imagePath).path) {
+           let image = UIImage(contentsOfFile: assetURL(imagePath).path) {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFill()
+                .clipped()
         }
         #endif
     }
@@ -147,7 +186,7 @@ struct AvatarLayerView: View {
     func atlasFrame(index: Int) -> some View {
         #if os(macOS)
         if let atlasPath = layer.atlas,
-           let image = NSImage(contentsOf: manifest.url(for: atlasPath)),
+           let image = AvatarAssetImageLoader.loadImage(from: assetURL(atlasPath), layerID: layer.id),
            let frameImage = image.croppedAvatarFrame(
                 index: index,
                 frameX: safeInt(layer.frameX),
@@ -158,10 +197,11 @@ struct AvatarLayerView: View {
             Image(nsImage: frameImage)
                 .resizable()
                 .scaledToFill()
+                .clipped()
         }
         #elseif canImport(UIKit)
         if let atlasPath = layer.atlas,
-           let image = UIImage(contentsOfFile: manifest.url(for: atlasPath).path),
+           let image = UIImage(contentsOfFile: assetURL(atlasPath).path),
            let frameImage = image.croppedAvatarFrame(
                 index: index,
                 frameX: safeInt(layer.frameX),
@@ -172,6 +212,7 @@ struct AvatarLayerView: View {
             Image(uiImage: frameImage)
                 .resizable()
                 .scaledToFill()
+                .clipped()
         }
         #endif
     }
@@ -179,9 +220,9 @@ struct AvatarLayerView: View {
 }
 
 struct RandomBlinkAvatarLayerView: View {
-    let manifest: BrainAvatarManifest
     let layer: BrainAvatarManifest.Layer
     let playback: BrainAvatarManifest.AtlasPlayback
+    let assetURL: (String) -> URL
     @State private var blinkStartDate: Date?
     @State private var nextBlinkDate = Date(timeIntervalSinceNow: Double.random(in: 2.4...7.0))
 
@@ -220,7 +261,7 @@ struct RandomBlinkAvatarLayerView: View {
     func atlasFrame(index: Int) -> some View {
         #if os(macOS)
         if let atlasPath = layer.atlas,
-           let image = NSImage(contentsOf: manifest.url(for: atlasPath)),
+           let image = AvatarAssetImageLoader.loadImage(from: assetURL(atlasPath), layerID: layer.id),
            let frameImage = image.croppedAvatarFrame(
                 index: index,
                 frameX: safeInt(layer.frameX),
@@ -231,10 +272,11 @@ struct RandomBlinkAvatarLayerView: View {
             Image(nsImage: frameImage)
                 .resizable()
                 .scaledToFill()
+                .clipped()
         }
         #elseif canImport(UIKit)
         if let atlasPath = layer.atlas,
-           let image = UIImage(contentsOfFile: manifest.url(for: atlasPath).path),
+           let image = UIImage(contentsOfFile: assetURL(atlasPath).path),
            let frameImage = image.croppedAvatarFrame(
                 index: index,
                 frameX: safeInt(layer.frameX),
@@ -245,9 +287,39 @@ struct RandomBlinkAvatarLayerView: View {
             Image(uiImage: frameImage)
                 .resizable()
                 .scaledToFill()
+                .clipped()
         }
         #endif
     }
+}
+
+enum AvatarAssetImageLoader {
+    #if os(macOS)
+    static func loadImage(from url: URL, layerID: String) -> NSImage? {
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if didAccess {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            avatarRenderLogger.error("Missing avatar asset layer=\(layerID, privacy: .public) path=\(url.path, privacy: .public)")
+            return nil
+        }
+
+        do {
+            let cgImage = try AvatarKitChromaKey.keyedImageIfNeeded(from: url)
+            return NSImage(
+                cgImage: cgImage,
+                size: NSSize(width: cgImage.width, height: cgImage.height)
+            )
+        } catch {
+            avatarRenderLogger.error("Could not decode avatar asset layer=\(layerID, privacy: .public) path=\(url.path, privacy: .public) error=\(String(describing: error), privacy: .public)")
+            return nil
+        }
+    }
+    #endif
 }
 
 private let avatarRenderLogger = Logger(subsystem: "com.zelda-built-this.AMBI", category: "avatar-render")
@@ -265,7 +337,8 @@ private func safeInt(_ value: Double?) -> Int {
 extension NSImage {
     func croppedAvatarFrame(index: Int, frameX: Int, frameY: Int, frameWidth: Int, frameHeight: Int) -> NSImage? {
         guard
-            let cgImage = cgImage(forProposedRect: nil, context: nil, hints: nil),
+            let cgImage = cgImage(forProposedRect: nil, context: nil, hints: nil)?
+                .copyWithAlphaIfNeeded(),
             frameWidth > 0,
             frameHeight > 0
         else {

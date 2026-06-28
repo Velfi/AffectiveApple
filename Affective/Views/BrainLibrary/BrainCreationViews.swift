@@ -23,8 +23,8 @@ struct BrainCreationSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var name = ""
-    @State private var wants = [BrainSeedCard()]
-    @State private var goals = [BrainSeedCard()]
+    @State private var wants = NewBrainDefaults.wantsCards
+    @State private var goals = NewBrainDefaults.goalsCards
     @State private var initialThoughts = [BrainSeedCard()]
     @State private var notes = [BrainSeedCard()]
     @State private var errorText = ""
@@ -310,8 +310,13 @@ struct BrainCreationTextField: View {
 }
 
 struct BrainSeedCard: Identifiable, Equatable {
-    let id = UUID()
-    var text = ""
+    let id: UUID
+    var text: String
+
+    init(text: String = "") {
+        self.id = UUID()
+        self.text = text
+    }
 }
 
 struct BrainCreationCardStack: View {

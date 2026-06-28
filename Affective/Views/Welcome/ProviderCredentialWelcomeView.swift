@@ -55,6 +55,14 @@ struct APIKeyWelcomeView: View {
         }
         .background(AppTheme.controlBackground)
         .keyboardDoneToolbar()
+        .onAppear(perform: prefillCredentials)
+    }
+
+    func prefillCredentials() {
+        let resolved = ProviderCredentialKey.resolvedCredentials(using: AffectiveViewModel.credentialStore)
+        for key in ProviderCredentialKey.allCases {
+            credentials[key] = resolved[key] ?? ""
+        }
     }
 
     var desktopWelcomeLayout: some View {
@@ -92,7 +100,7 @@ struct APIKeyWelcomeView: View {
                     .minimumScaleFactor(0.72)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text("Add at least one model provider key before waking a brain.")
+                Text("Add at least one key for \(ProviderCredentialKey.supportedDisplayNames) before waking a brain.")
                     .font(.title3)
                     .foregroundStyle(AppTheme.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
@@ -108,7 +116,7 @@ struct APIKeyWelcomeView: View {
                 WelcomePlainLanguageRow(
                     symbolName: "arrow.left.arrow.right",
                     title: "Affective uses them only for model calls.",
-                    message: "When a brain asks OpenAI, Anthropic, or Google for a response, Affective attaches the matching key so that provider can bill your account."
+                    message: "When a brain asks OpenAI, Anthropic, Google, or DeepSeek for a response, Affective attaches the matching key so that provider can bill your account."
                 )
 
                 WelcomePlainLanguageRow(
@@ -142,7 +150,7 @@ struct APIKeyWelcomeView: View {
                     .font(.system(size: 30, weight: .semibold, design: .rounded))
                     .lineLimit(2)
                     .minimumScaleFactor(0.84)
-                Text("Paste whichever account key you want Affective to use. One is enough to continue.")
+                Text("Paste keys for \(ProviderCredentialKey.supportedDisplayNames). One is enough to continue.")
                     .font(.callout)
                     .foregroundStyle(AppTheme.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
@@ -174,7 +182,7 @@ struct APIKeyWelcomeView: View {
             .padding(.top, 4)
 
             StatusNoteCard(
-                text: "The skip button is here for local development and advanced setups. Affective also picks up keys from standard provider environment variables, so click \"Nevermind\" if that is how you configure them. If no key is configured, model requests may fail until one is added in Host settings.",
+                text: "The skip button is here for local development and advanced setups. Affective also picks up keys from standard provider environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `DEEPSEEK_API_KEY`), so click \"Nevermind\" if that is how you configure them. If no key is configured, model requests may fail until one is added in Host settings.",
                 systemImage: "wrench.and.screwdriver"
             )
                 .frame(maxWidth: 720, alignment: .leading)

@@ -21,25 +21,34 @@ import PhotosUI
 struct ComposerPanel: View {
     @ObservedObject var model: AffectiveViewModel
     var composerFocused: FocusState<Bool>.Binding
-    var includesVoiceButton = false
     var isCompact = false
     #if canImport(PhotosUI)
     @State private var selectedPhotoItem: PhotosPickerItem?
     #endif
 
     var body: some View {
-        HStack(alignment: .center, spacing: isCompact ? 6 : 8) {
-            if includesVoiceButton {
-                PokeButton(model: model)
+        VStack(spacing: isCompact ? 6 : 8) {
+            if showsInlineAutonomy {
+                InlineAutonomyControls(model: model, isCompact: isCompact)
             }
 
-            photoButton
+            HStack(alignment: .center, spacing: isCompact ? 6 : 8) {
+                if isCompact {
+                    PokeButton(model: model)
+                } else {
+                    WakeButton(model: model, size: controlSize)
+                }
 
-            composerInput
+                BrainVoiceToggleButton(model: model)
 
-            interruptButton
+                photoButton
 
-            sendButton
+                composerInput
+
+                interruptButton
+
+                sendButton
+            }
         }
         .padding(isCompact ? 6 : 7)
         .background(AppTheme.composerBackground, in: RoundedRectangle(cornerRadius: isCompact ? 22 : 24, style: .continuous))
@@ -155,11 +164,17 @@ struct ComposerPanel: View {
     }
 
     var canSubmit: Bool {
-        !model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        model.canSend &&
+            !model.isBrainUnavailableForConversation &&
+            !model.messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var controlSize: CGFloat {
         isCompact ? 34 : 36
+    }
+
+    var showsInlineAutonomy: Bool {
+        !isCompact || !composerFocused.wrappedValue
     }
 
     func submitMessage() {

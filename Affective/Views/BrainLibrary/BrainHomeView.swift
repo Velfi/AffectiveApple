@@ -59,7 +59,7 @@ struct WelcomeView: View {
         }
         .fileImporter(
             isPresented: $isImportingBrainFile,
-            allowedContentTypes: [.zip],
+            allowedContentTypes: [.data],
             allowsMultipleSelection: false
         ) { result in
             importBrainFile(result)
@@ -131,7 +131,7 @@ struct WelcomeView: View {
         ) { brain in
             Button("Share With Biometrics") {
                 brainPendingBiometricShareExport = nil
-                performShareBrainZip(brain)
+                performShareBrainFile(brain)
             }
             Button("Cancel", role: .cancel) {
                 brainPendingBiometricShareExport = nil
@@ -174,7 +174,7 @@ struct WelcomeView: View {
                 VStack(alignment: .leading, spacing: 26) {
                     BrainSection(
                         title: "Projects",
-                        emptyText: "Create a new brain or import an existing folder.",
+                        emptyText: "Create a new brain or import an existing archive.",
                         brains: library.recencySortedBrains,
                         selectedBrainID: $selectedBrainID,
                         syncManager: syncManager,
@@ -184,8 +184,7 @@ struct WelcomeView: View {
                         renameBrain: { brainBeingRenamed = $0 },
                         chooseAvatar: chooseAvatar,
                         relocateBrain: relocateBrain,
-                        exportBrain: exportBrain,
-                        exportBrainZip: exportBrainZip,
+                        exportBrainFile: exportBrainFile,
                         deleteBrain: requestDeleteBrain
                     )
                 }
@@ -204,7 +203,7 @@ struct WelcomeView: View {
 
                 BrainSection(
                     title: "Projects",
-                    emptyText: "Create a new brain or import an existing folder.",
+                    emptyText: "Create a new brain or import an existing archive.",
                     brains: library.recencySortedBrains,
                     selectedBrainID: $selectedBrainID,
                     syncManager: syncManager,
@@ -214,8 +213,7 @@ struct WelcomeView: View {
                     renameBrain: { brainBeingRenamed = $0 },
                     chooseAvatar: chooseAvatar,
                     relocateBrain: relocateBrain,
-                    exportBrain: exportBrain,
-                    exportBrainZip: exportBrainZip,
+                    exportBrainFile: exportBrainFile,
                     deleteBrain: requestDeleteBrain
                 )
             }
@@ -243,7 +241,7 @@ struct WelcomeView: View {
             ScrollView {
                 BrainSection(
                     title: "Projects",
-                    emptyText: "Create a new brain or import an existing folder.",
+                    emptyText: "Create a new brain or import an existing archive.",
                     brains: library.recencySortedBrains,
                     selectedBrainID: $selectedBrainID,
                     syncManager: syncManager,
@@ -253,8 +251,7 @@ struct WelcomeView: View {
                     renameBrain: { brainBeingRenamed = $0 },
                     chooseAvatar: chooseAvatar,
                     relocateBrain: relocateBrain,
-                    exportBrain: exportBrain,
-                    exportBrainZip: exportBrainZip,
+                    exportBrainFile: exportBrainFile,
                     deleteBrain: requestDeleteBrain
                 )
                 .padding(18)
@@ -457,20 +454,14 @@ struct WelcomeView: View {
         let panel = NSOpenPanel()
         panel.title = "Import Brain"
         panel.prompt = "Import"
-        panel.message = "Choose an exported Affective brain folder or zip archive."
-        panel.canChooseDirectories = true
+        panel.message = "Choose an exported .brain archive."
+        panel.canChooseDirectories = false
         panel.canChooseFiles = true
-        panel.allowedContentTypes = [.zip]
+        panel.allowedContentTypes = [.data]
         panel.allowsMultipleSelection = false
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            let brain = try library.importBrain(from: url)
-            selectedBrainID = brain.id
-            statusText = "Imported \(brain.displayName)."
-        } catch {
-            statusText = "Import failed: \(error.localizedDescription)"
-        }
+        importBrain(at: url)
         #else
         isImportingBrainFile = true
         #endif
@@ -479,17 +470,40 @@ struct WelcomeView: View {
     func importBrainFile(_ result: Result<[URL], Error>) {
         do {
             guard let url = try result.get().first else { return }
-            let didAccess = url.startAccessingSecurityScopedResource()
+            importBrain(at: url)
+        } catch {
+            statusText = "Import failed: \(error.localizedDescription)"
+        }
+    }
+
+    func importBrain(at url: URL) {
+        let didAccess = url.startAccessingSecurityScopedResource()
+        guard url.pathExtension.localizedCaseInsensitiveCompare("brain") == .orderedSame else {
+            if didAccess {
+                url.stopAccessingSecurityScopedResource()
+            }
+            statusText = "Import failed: choose a .brain archive."
+            return
+        }
+
+        statusText = "Importing brain archive..."
+        Task {
             defer {
                 if didAccess {
                     url.stopAccessingSecurityScopedResource()
                 }
             }
-            let brain = try library.importBrain(from: url)
-            selectedBrainID = brain.id
-            statusText = "Imported \(brain.displayName)."
-        } catch {
-            statusText = "Import failed: \(error.localizedDescription)"
+            do {
+                let brain = try await library.importBrainFileWithCore(from: url)
+                await MainActor.run {
+                    selectedBrainID = brain.id
+                    statusText = "Imported \(brain.displayName)."
+                }
+            } catch {
+                await MainActor.run {
+                    statusText = "Import failed: \(error.localizedDescription)"
+                }
+            }
         }
     }
 
@@ -519,81 +533,90 @@ struct WelcomeView: View {
         return "iCloud import failed: \(reason)\n\(suggestion)"
     }
 
-    func exportBrain(_ brain: BrainDescriptor) {
-        #if os(macOS)
-        let panel = NSOpenPanel()
-        panel.title = "Export Brain"
-        panel.prompt = "Export Here"
-        panel.message = exportPanelMessage(for: brain)
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.canCreateDirectories = true
-        panel.allowsMultipleSelection = false
-
-        guard panel.runModal() == .OK, let destination = panel.url else { return }
-        guard confirmBiometricExportIfNeeded(for: brain) else { return }
-        do {
-            selectedBrainID = brain.id
-            let exportedURL = try library.exportBrainFolder(brain, to: destination)
-            statusText = "Exported to \(exportedURL.lastPathComponent)."
-        } catch {
-            statusText = "Export failed: \(error.localizedDescription)"
-        }
-        #else
-        statusText = "Brain folder export is macOS-only for this host."
-        #endif
-    }
-
-    func exportBrainZip(_ brain: BrainDescriptor) {
+    func exportBrainFile(_ brain: BrainDescriptor) {
         #if os(macOS)
         let panel = NSSavePanel()
-        panel.title = "Export Brain ZIP"
+        panel.title = "Export Brain File"
         panel.prompt = "Export"
         panel.message = exportPanelMessage(for: brain)
-        panel.allowedContentTypes = [.zip]
-        panel.nameFieldStringValue = "\(brain.id).affectivebrain.zip"
+        panel.allowedContentTypes = [.data]
+        panel.nameFieldStringValue = "\(brain.id).brain"
         panel.canCreateDirectories = true
 
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         guard confirmBiometricExportIfNeeded(for: brain) else { return }
-        do {
-            selectedBrainID = brain.id
-            let exportedURL = try library.exportBrainZip(brain, to: destination)
-            statusText = "Exported to \(exportedURL.lastPathComponent)."
-        } catch {
-            statusText = "Export failed: \(error.localizedDescription)"
+        selectedBrainID = brain.id
+        statusText = "Exporting \(brain.displayName)..."
+        Task {
+            do {
+                let exportedURL = try await exportBrainFileWithCore(brain, to: destination)
+                await MainActor.run {
+                    statusText = "Exported to \(exportedURL.lastPathComponent)."
+                }
+            } catch {
+                await MainActor.run {
+                    statusText = "Export failed: \(error.localizedDescription)"
+                }
+            }
         }
         #else
-        shareBrainZip(brain)
+        shareBrainFile(brain)
         #endif
     }
 
-    func shareBrainZip(_ brain: BrainDescriptor) {
+    func shareBrainFile(_ brain: BrainDescriptor) {
         #if os(macOS)
         guard confirmBiometricExportIfNeeded(for: brain) else { return }
-        performShareBrainZip(brain)
+        performShareBrainFile(brain)
         #else
         let policy = BiometricDataPolicy.load(for: brain)
         if policy.shouldIncludeInExport {
             brainPendingBiometricShareExport = brain
             return
         }
-        performShareBrainZip(brain)
+        performShareBrainFile(brain)
         #endif
     }
 
-    func performShareBrainZip(_ brain: BrainDescriptor) {
+    func performShareBrainFile(_ brain: BrainDescriptor) {
+        selectedBrainID = brain.id
+        statusText = "Preparing \(brain.displayName) for sharing..."
+        Task {
+            do {
+                let shareDirectory = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("AffectiveBrainShare-\(UUID().uuidString)", isDirectory: true)
+                try FileManager.default.createDirectory(at: shareDirectory, withIntermediateDirectories: true)
+                let destination = shareDirectory.appendingPathComponent("\(brain.id).brain")
+                let exportedURL = try await exportBrainFileWithCore(brain, to: destination)
+                await MainActor.run {
+                    sharedBrainExport = SharedBrainExport(url: exportedURL)
+                    statusText = "Prepared \(exportedURL.lastPathComponent) for sharing."
+                }
+            } catch {
+                await MainActor.run {
+                    statusText = "Export failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func exportBrainFileWithCore(_ brain: BrainDescriptor, to destinationURL: URL) async throws -> URL {
+        let destination = destinationURL.pathExtension.localizedCaseInsensitiveCompare("brain") == .orderedSame
+            ? destinationURL
+            : destinationURL.appendingPathExtension("brain")
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        let core = BrainCore(brain: brain)
         do {
-            selectedBrainID = brain.id
-            let shareDirectory = FileManager.default.temporaryDirectory
-                .appendingPathComponent("AffectiveBrainShare-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.createDirectory(at: shareDirectory, withIntermediateDirectories: true)
-            let destination = shareDirectory.appendingPathComponent("\(brain.id).affectivebrain.zip")
-            let exportedURL = try library.exportBrainZip(brain, to: destination)
-            sharedBrainExport = SharedBrainExport(url: exportedURL)
-            statusText = "Prepared \(exportedURL.lastPathComponent) for sharing."
+            _ = try await BrainArchiveOperationGate.shared.run {
+                try await core.exportBrain(to: destination)
+            }
+            await core.disconnect()
+            return destination
         } catch {
-            statusText = "Export failed: \(error.localizedDescription)"
+            await core.disconnect()
+            throw error
         }
     }
 

@@ -86,6 +86,18 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: AffectiveAppIntentBridge.requestNotification)) { _ in
             openPendingAppIntentBrain()
         }
+        .onReceive(NotificationCenter.default.publisher(for: BrainLibrary.avatarDidUpdateNotification)) { notification in
+            reloadAvatarIfNeeded(from: notification)
+        }
+    }
+
+    private func reloadAvatarIfNeeded(from notification: Notification) {
+        guard let brainID = notification.userInfo?[BrainLibrary.avatarDidUpdateBrainIDKey] as? String else {
+            return
+        }
+        library.refresh()
+        guard selectedBrain?.id == brainID else { return }
+        selectedBrain = library.brains.first { $0.id == brainID }
     }
 
     private func finishCredentialWelcome(bypassed: Bool = false) {
@@ -133,12 +145,14 @@ struct ContentView: View {
 }
 
 private struct AffectiveShellView: View {
+    let brain: BrainDescriptor
     @StateObject private var model: AffectiveViewModel
     @FocusState private var composerFocused: Bool
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     init(brain: BrainDescriptor) {
+        self.brain = brain
         AppTheme.applyTheme(for: brain)
         #if DEBUG
         let viewModel = AffectiveViewModel(
@@ -156,6 +170,10 @@ private struct AffectiveShellView: View {
         shell
             .background(AppTheme.background)
             .foregroundStyle(AppTheme.primaryText)
+            .onChange(of: brain) { _, updated in
+                AppTheme.applyTheme(for: updated)
+                model.reloadBrain(updated)
+            }
             .alert(item: $model.orientationPermissionPrompt) { prompt in
                 Alert(
                     title: Text("Allow Orientation Sense?"),
@@ -234,8 +252,8 @@ private struct CompactWorkspaceRail: View {
                             .foregroundStyle(model.selectedSection == section ? AppTheme.accent : AppTheme.secondaryText)
                             .background(model.selectedSection == section ? AppTheme.activePanelBackground : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                        if section == .mailbox && model.unreadDreamReportCount > 0 {
-                            Text("\(model.unreadDreamReportCount)")
+                        if section == .mailbox && model.unreadMailboxItemCount > 0 {
+                            Text("\(model.unreadMailboxItemCount)")
                                 .font(.system(size: 9, weight: .bold, design: .rounded))
                                 .foregroundStyle(AppTheme.textOnAccent)
                                 .padding(.horizontal, 5)
@@ -279,8 +297,8 @@ private struct CompactWorkspaceBar: View {
                         .padding(.vertical, 10)
                         .foregroundStyle(model.selectedSection == section ? AppTheme.accent : AppTheme.secondaryText)
 
-                        if section == .mailbox && model.unreadDreamReportCount > 0 {
-                            Text("\(model.unreadDreamReportCount)")
+                        if section == .mailbox && model.unreadMailboxItemCount > 0 {
+                            Text("\(model.unreadMailboxItemCount)")
                                 .font(.system(size: 9, weight: .bold, design: .rounded))
                                 .foregroundStyle(AppTheme.textOnAccent)
                                 .padding(.horizontal, 5)

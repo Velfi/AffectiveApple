@@ -16,10 +16,10 @@ enum AppleSpeechVoiceCatalog {
             .map(\.name)
             .uniqued()
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-        return availableNames.isEmpty ? fallbackNames : availableNames
+        return availableNames.isEmpty ? builtInVoiceNames : availableNames
     }
 
-    private static let fallbackNames = [
+    private static let builtInVoiceNames = [
         "Alex",
         "Fred",
         "Samantha",

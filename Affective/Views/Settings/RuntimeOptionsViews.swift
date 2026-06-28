@@ -233,7 +233,7 @@ struct DonationSupportCard: View {
                         Button {
                             store.statusText = "Tip products are not available yet. Check App Store Connect setup."
                         } label: {
-                            Label(product.fallbackButtonTitle, systemImage: "heart.fill")
+                            Label(product.defaultButtonTitle, systemImage: "heart.fill")
                                 .labelStyle(.titleAndIcon)
                         }
                         .buttonStyle(.borderedProminent)
@@ -506,7 +506,7 @@ enum DonationSupportProduct: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var productID: String { rawValue }
 
-    var fallbackButtonTitle: String {
+    var defaultButtonTitle: String {
         switch self {
         case .smallTip: "Small Tip"
         case .mediumTip: "Medium Tip"
@@ -944,16 +944,16 @@ enum TimeRangeEdge {
 }
 
 struct TimeRangeValue {
-    static let fallbackStart = "22:00"
-    static let fallbackEnd = "08:00"
+    static let defaultStart = "22:00"
+    static let defaultEnd = "08:00"
 
     var start: String
     var end: String
 
     init(_ storageValue: String) {
         let parts = storageValue.split(separator: "-", maxSplits: 1).map(String.init)
-        start = parts.first ?? Self.fallbackStart
-        end = parts.dropFirst().first ?? Self.fallbackEnd
+        start = parts.first ?? Self.defaultStart
+        end = parts.dropFirst().first ?? Self.defaultEnd
     }
 
     var startDate: Date {

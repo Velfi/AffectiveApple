@@ -41,6 +41,103 @@ final class AffectiveTests: XCTestCase {
     XCTAssertNoThrow(try brain.validateForCoreConnection())
   }
 
+  func testBrainCoreHasNoOperationFallbackRuntimePath() throws {
+    let testFile = URL(fileURLWithPath: #filePath)
+    let projectRoot = testFile.deletingLastPathComponent().deletingLastPathComponent()
+    let sourceURL = projectRoot.appendingPathComponent("Affective/Core/BrainCore.swift")
+    let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+    XCTAssertFalse(source.contains("unavailable(operation:"))
+    XCTAssertFalse(source.contains("func unavailable(operation:"))
+    XCTAssertFalse(source.contains("#if os(iOS) || os(macOS)"))
+    XCTAssertFalse(source.contains("api_e2e needs the AffectiveCore Zig core linked"))
+  }
+
+  func testBrainLibraryUsesOnlyCoreBrainArchivesForImportExport() throws {
+    let testFile = URL(fileURLWithPath: #filePath)
+    let projectRoot = testFile.deletingLastPathComponent().deletingLastPathComponent()
+    let checkedFiles = [
+      "Affective/BrainLibrary.swift",
+      "Affective/Views/BrainLibrary/BrainHomeView.swift",
+      "Affective/Views/BrainLibrary/BrainCardViews.swift",
+    ]
+    let forbidden = [
+      "importBrain" + "Folder",
+      "importBrain" + "Directory",
+      "exportBrain" + "Folder",
+      "Export " + "Folder",
+    ]
+
+    for relativePath in checkedFiles {
+      let sourceURL = projectRoot.appendingPathComponent(relativePath)
+      let source = try String(contentsOf: sourceURL, encoding: .utf8)
+      for token in forbidden {
+        XCTAssertFalse(source.contains(token), "\(relativePath) still contains \(token)")
+      }
+    }
+  }
+
+  @MainActor
+  func testMailboxReadsBrainOwnedItemsAndPersistsOnlyHostUIState() async throws {
+    let brain = try makeBrain()
+    let item = BrainMailboxItem(
+      mailboxID: "mail_dream_1",
+      kind: "DreamMail",
+      title: "Rain Door",
+      text: "A dream linked the workshop light to a door opening into rain.",
+      imageArtifactID: "artifact_dream_1",
+      imageSpecJSON: #"{"subject":"door","mood":"quiet"}"#,
+      wakingThought: "Ask before assuming the old pattern is still true.",
+      visibleLesson: "Pause before recognition confidence rises.",
+      debugDetails: "source=unit-test",
+      sourceEventIDs: ["event_day_residue"],
+      sourceDreamID: "dream_1",
+      createdAtMS: 1_782_515_600_000
+    )
+    try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
+    {
+      "schema_version": 1,
+      "artifacts": [
+        {
+          "artifact_id": "artifact_dream_1",
+          "kind": "image",
+          "path": "generated/images/dream-1.png",
+          "mime_type": "image/png",
+          "provenance": "dream_time_internal_synthesis",
+          "source_event_ids": ["event_dream_artifact"]
+        }
+      ]
+    }
+    """)
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "mailbox_list"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation"),
+      mailboxItems: [item]
+    )
+    let model = AffectiveViewModel(brain: brain, brainCore: core)
+
+    await model.collectMailboxItems()
+
+    XCTAssertEqual(model.mailboxItems.count, 1)
+    XCTAssertEqual(model.mailboxItems.first?.mailboxID, "mail_dream_1")
+    XCTAssertEqual(model.mailboxItems.first?.summary, "Rain Door")
+    XCTAssertEqual(model.mailboxItems.first?.bodyText, item.text)
+    XCTAssertEqual(model.mailboxItems.first?.sourceEventIDs, ["event_day_residue"])
+    XCTAssertEqual(model.mailboxItems.first?.artifactID, "artifact_dream_1")
+    XCTAssertEqual(model.mailboxItems.first?.imagePath, "generated/images/dream-1.png")
+    XCTAssertEqual(model.mailboxItems.first?.imageMimeType, "image/png")
+    XCTAssertEqual(model.mailboxItems.first?.imageSpec, item.imageSpecJSON)
+
+    let mailboxItem = try XCTUnwrap(model.mailboxItems.first)
+    model.selectMailboxItem(mailboxItem)
+
+    let savedState = MailboxUIStateJournal.load(from: brain.mailboxUIStateURL)
+    XCTAssertEqual(savedState.items, [MailboxUIState(mailboxID: "mail_dream_1", isRead: true, isArchived: false)])
+    try await Task.sleep(nanoseconds: 50_000_000)
+    let markReadIDs = await core.mailboxMarkReadIDs
+    XCTAssertEqual(markReadIDs, ["mail_dream_1"])
+  }
+
   func testBrainSemanticEntityUsesStableBrainIdentity() throws {
     guard #available(macOS 15.0, iOS 18.0, visionOS 2.0, *) else {
       throw XCTSkip("Affective semantic entities require IndexedEntity support.")
@@ -77,7 +174,7 @@ final class AffectiveTests: XCTestCase {
     let brain = try makeBrain()
     try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
       {
-        "schema_version": 2,
+        "schema_version": 1,
         "traces": [],
         "beliefs": [],
         "subjects": [
@@ -96,7 +193,7 @@ final class AffectiveTests: XCTestCase {
         "artifacts": [],
         "dreams": []
       }
-      """)
+    """)
 
     let service = FaceRecognitionService()
     let known = try fixtureURL("known_01", extension: "png", subdirectory: "Fixtures/visitors")
@@ -150,12 +247,107 @@ final class AffectiveTests: XCTestCase {
 
   }
 
+  func testFaceRecognitionServiceFixtureMatrix() throws {
+    guard FaceRecognitionService.bundledModelsAvailable else {
+      throw XCTSkip("Bundled ONNX recognition models are not available in this test bundle.")
+    }
+
+    let brain = try makeBrain()
+    try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
+      {
+        "schema_version": 1,
+        "traces": [],
+        "beliefs": [],
+        "subjects": [
+          {
+            "subject_id": "person_mara",
+            "display_name": "Mara",
+            "relationship_status": "visitor",
+            "stable_notes": [],
+            "recent_notes": [],
+            "biometric_records": [],
+            "representative_image_path": null,
+            "representative_quality_score": 0,
+            "lifecycle": { "created_at": "1", "updated_at": "1" }
+          }
+        ],
+        "artifacts": [],
+        "dreams": []
+      }
+    """)
+
+    let service = FaceRecognitionService()
+    let requestBase = (
+      memoryPath: brain.memoryDatabaseURL.path,
+      embeddingsDir: brain.faceEmbeddingsURL.path,
+      knownThreshold: Float(0.85),
+      uncertainThreshold: Float(0.60)
+    )
+
+    let emptyRoom = try fixtureURL("empty_room_01", extension: "jpg", subdirectory: "Fixtures/empty")
+    try skipPlaceholderImageFixtures([emptyRoom])
+    let emptyResult = try service.identify(.init(
+      imagePath: emptyRoom.path,
+      memoryPath: requestBase.memoryPath,
+      embeddingsDir: requestBase.embeddingsDir,
+      detectorModel: nil,
+      recognizerModel: nil,
+      knownThreshold: requestBase.knownThreshold,
+      uncertainThreshold: requestBase.uncertainThreshold
+    ))
+    XCTAssertFalse(emptyResult.personPresent)
+    XCTAssertEqual(emptyResult.matchStatus, "none")
+    XCTAssertEqual(emptyResult.peopleCount, 0)
+
+    let unknown = try fixtureURL("unknown_01", extension: "png", subdirectory: "Fixtures/visitors")
+    try skipPlaceholderImageFixtures([unknown])
+    let unknownImage = try cameraJPEGFixture(from: unknown, named: "matrix_unknown_01", in: brain.rootURL)
+    let unknownResult = try service.identify(.init(
+      imagePath: unknownImage.path,
+      memoryPath: requestBase.memoryPath,
+      embeddingsDir: requestBase.embeddingsDir,
+      detectorModel: nil,
+      recognizerModel: nil,
+      knownThreshold: requestBase.knownThreshold,
+      uncertainThreshold: requestBase.uncertainThreshold
+    ))
+    XCTAssertTrue(unknownResult.personPresent)
+    XCTAssertEqual(unknownResult.matchStatus, "unknown")
+    XCTAssertEqual(unknownResult.peopleCount, 1)
+
+    let known = try fixtureURL("known_01", extension: "png", subdirectory: "Fixtures/visitors")
+    try skipPlaceholderImageFixtures([known])
+    let knownImage = try cameraJPEGFixture(from: known, named: "matrix_known_01", in: brain.rootURL)
+    _ = try service.enroll(.init(
+      imagePath: knownImage.path,
+      memoryPath: requestBase.memoryPath,
+      embeddingsDir: requestBase.embeddingsDir,
+      detectorModel: nil,
+      recognizerModel: nil,
+      personID: "person_mara",
+      name: nil,
+      keepExisting: false
+    ))
+    let knownResult = try service.identify(.init(
+      imagePath: knownImage.path,
+      memoryPath: requestBase.memoryPath,
+      embeddingsDir: requestBase.embeddingsDir,
+      detectorModel: nil,
+      recognizerModel: nil,
+      knownThreshold: requestBase.knownThreshold,
+      uncertainThreshold: requestBase.uncertainThreshold
+    ))
+    XCTAssertTrue(["known", "uncertain"].contains(knownResult.matchStatus))
+    XCTAssertEqual(knownResult.personID, "person_mara")
+    XCTAssertEqual(knownResult.candidateName, "Mara")
+  }
+
   @MainActor
   func testSpecialPokeCuriosityIdentifiesUnknownThenEnrollsAfterIntroduction() async throws {
     let brain = try makeBrain()
     try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
       {
-        "schema_version": 2,
+        "schema_version": 1,
         "traces": [],
         "beliefs": [],
         "subjects": [
@@ -174,7 +366,7 @@ final class AffectiveTests: XCTestCase {
         "artifacts": [],
         "dreams": []
       }
-      """)
+    """)
 
     let visitor = try fixtureURL("known_01", extension: "png", subdirectory: "Fixtures/visitors")
     try skipPlaceholderImageFixtures([visitor])
@@ -212,7 +404,7 @@ final class AffectiveTests: XCTestCase {
     let pokes = await waitForPokeSequenceCount(1, in: core)
     XCTAssertEqual(pokes.count, 1)
     XCTAssertEqual(pokes.first?.first?.pressMilliseconds, 120)
-    XCTAssertEqual(model.commandEntries.last { $0.title == "Curiosity" }?.body, "Curious after a poke; trying to identify the person nearby.")
+    XCTAssertEqual(model.eventEntries.last { $0.title == "Curiosity" }?.body, "Curious after a poke; trying to identify the person nearby.")
     XCTAssertEqual(model.statusText, "Poke sent")
 
     let identifyBody = try recognitionRequestData([
@@ -622,6 +814,46 @@ final class AffectiveTests: XCTestCase {
     ))
   }
 
+  func testHostLLMCompletionClientRandomRetriesFailedRoute() async throws {
+    var attemptedRoutes: [HostLLMCompletionProvider] = []
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .openAI: "openai-secret",
+        ]
+      }
+    )
+    let client = HostLLMCompletionClient(
+      providerRouter: router,
+      appleFoundationModelsClient: AppleFoundationModelsTextClient(
+        availabilityProvider: { .available },
+        completionProvider: { _ in
+          attemptedRoutes.append(.appleFoundationModels)
+          throw HostLLMCompletionError.invalidProviderResponse
+        }
+      ),
+      routePicker: { routes in
+        routes.first { $0 == .appleFoundationModels } ?? routes.first
+      },
+      jsonLoader: { request in
+        attemptedRoutes.append(.credential(.openAI))
+        XCTAssertEqual(request.url?.absoluteString, "https://api.openai.com/v1/responses")
+        return ["output_text": "Fallback completion."]
+      }
+    )
+
+    let completion = try await client.complete(HostLLMCompletionRequest(
+      prompt: "Say hello.",
+      maxTokens: 64
+    ))
+
+    XCTAssertEqual(attemptedRoutes, [.appleFoundationModels, .credential(.openAI)])
+    XCTAssertEqual(completion, HostLLMCompletionResponse(
+      text: "Fallback completion.",
+      provider: .credential(.openAI)
+    ))
+  }
+
   func testHostLLMCompletionClientLocalPreferenceUsesAppleFoundationModelsOnly() async throws {
     let router = HostProviderRouter(
       credentialProvider: {
@@ -842,6 +1074,9 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(completion.text, #"{"message":"from google"}"#)
     let generationConfig = try XCTUnwrap(requestedBody["generationConfig"] as? [String: Any])
     XCTAssertEqual(generationConfig["responseMimeType"] as? String, "application/json")
+    let responseSchema = try XCTUnwrap(generationConfig["responseSchema"] as? [String: Any])
+    XCTAssertEqual(responseSchema["type"] as? String, "object")
+    XCTAssertEqual(responseSchema["additionalProperties"] as? Bool, false)
   }
 
   func testHostLLMCompletionClientUnavailableExplicitPreferenceFailsClearly() async throws {
@@ -960,7 +1195,7 @@ final class AffectiveTests: XCTestCase {
           requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         }
         return [
-          "output_text": #"```json { "commands": [], "conversation_done": false } ```"#,
+          "output_text": #"```json { "action_pressures": [], "conversation_done": false } ```"#,
         ]
       }
     )
@@ -983,7 +1218,7 @@ final class AffectiveTests: XCTestCase {
 
     XCTAssertEqual(
       String(decoding: response, as: UTF8.self),
-      #"{"commands":[],"conversation_done":false}"#
+      #"{"action_pressures":[],"conversation_done":false}"#
     )
     let textConfig = try XCTUnwrap(requestedBody["text"] as? [String: Any])
     let responseFormat = try XCTUnwrap(textConfig["format"] as? [String: Any])
@@ -1130,54 +1365,114 @@ final class AffectiveTests: XCTestCase {
     let brain = try makeBrain()
     let core = BrainCore(brain: brain)
 
+    func isExpectedCoverageProbeBoundary(_ error: Error) -> Bool {
+      let description = String(describing: error)
+      return description.contains("FrontendCaptureRequested")
+        || description.contains("HostHttpPostJsonFailed")
+    }
+
+    func assertCoverageProbeResponse(
+      _ label: String,
+      _ body: () async throws -> BrainToolResponse
+    ) async throws {
+      do {
+        let response = try await body()
+        XCTAssertNotNil(response.metadata["request_id"], label)
+      } catch {
+        guard isExpectedCoverageProbeBoundary(error) else {
+          throw NSError(
+            domain: "AffectiveTests.CoverageProbe",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "\(label): \(String(describing: error))"]
+          )
+        }
+      }
+    }
+
     try await withConnectedCore(core) {
-      let shortTouch = try await core.shortTouch()
-      XCTAssertNotNil(shortTouch.metadata["request_id"])
+      try await assertCoverageProbeResponse("short_touch") {
+        try await core.shortTouch()
+      }
 
-      let longTouch = try await core.longTouch()
-      XCTAssertNotNil(longTouch.metadata["request_id"])
+      try await assertCoverageProbeResponse("long_touch") {
+        try await core.longTouch()
+      }
 
-      let poke = try await core.pokeSequence([
-        PokePulse(pressMilliseconds: 25, pauseBeforeMilliseconds: 0)
-      ])
-      XCTAssertNotNil(poke.metadata["request_id"])
+      try await assertCoverageProbeResponse("poke_sequence") {
+        try await core.pokeSequence([
+          PokePulse(pressMilliseconds: 25, pauseBeforeMilliseconds: 0)
+        ])
+      }
 
-      let tool = try await core.sendEvent(actionRequestEvent(
-        actionID: "list-reminders-e2e",
-        action: "list_reminders",
-        arguments: [:]
-      ))
-      XCTAssertNotNil(tool.metadata["request_id"])
+      do {
+        let response = try await core.mailboxList()
+        XCTAssertNotNil(response.metadata["request_id"], "mailbox_list typed operation")
+      } catch {
+        guard isExpectedCoverageProbeBoundary(error) else { throw error }
+      }
+
+      try await assertCoverageProbeResponse("send_experience_event") {
+        try await core.sendExperienceEvent(
+          hostID: "swift-test-host",
+          source: "host",
+          kind: "Host.TestEvent",
+          payload: "{\"ok\":true}",
+          salience: 0.42,
+          confidence: 0.91,
+          valence: 0.1,
+          arousal: 0.2,
+          uncertainty: 0.05,
+          causalParentIDs: ["parent-test-event"],
+          retention: "episode",
+          visibility: "internal"
+        )
+      }
+
+      try await assertCoverageProbeResponse("capability_status") {
+        try await core.capabilityStatus(
+          capability: "camera",
+          status: "denied",
+          requestID: "capability-e2e-status",
+          pendingSince: nil,
+          pendingElapsedMS: 12,
+          reason: "coverage probe"
+        )
+      }
 
       do {
         let typedText = try await core.sendText("capability e2e typed text")
         XCTAssertNotNil(typedText.metadata["request_id"])
       } catch {
-        let description = String(describing: error)
-        guard description.contains("FrontendCaptureRequested") else { throw error }
-        // The coverage probe only verifies the dispatch route. If the brain
-        // elects to pull an awaited sense during that route, the host should not
-        // synthesize a chat fallback for this test.
+        guard isExpectedCoverageProbeBoundary(error) else { throw error }
       }
+      // The coverage probe only verifies dispatch routes. If the brain elects
+      // to pull an awaited sense or probe a provider host callback, the host
+      // should not synthesize a chat stand-in for this test.
 
-      let orientation = try await core.orientationObservation(
-        OrientationQueryProvider.classify(x: 0.02, y: 0.01, z: -0.99)
-      )
-      XCTAssertNotNil(orientation.metadata["request_id"])
+      try await assertCoverageProbeResponse("orientation_observation") {
+        try await core.orientationObservation(
+          OrientationQueryProvider.classify(x: 0.02, y: 0.01, z: -0.99)
+        )
+      }
 
       let imageURL = await brain.rootURL.appendingPathComponent("capability-e2e.png")
       try Self.tinyPNGData.write(to: imageURL, options: .atomic)
-      let camera = try await core.cameraObservation(
-        path: imageURL.path,
-        mimeType: "image/png",
-        source: "capability_e2e",
-        requestID: "capability-e2e-camera"
-      )
-      XCTAssertNotNil(camera.metadata["request_id"])
+      try await assertCoverageProbeResponse("camera_observation") {
+        try await core.cameraObservation(
+          path: imageURL.path,
+          mimeType: "image/png",
+          source: "capability_e2e",
+          requestID: "capability-e2e-camera"
+        )
+      }
 
-      let state = try await core.refreshState()
-      XCTAssertNotNil(state.metadata["request_id"])
-      XCTAssertFalse(state.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+      do {
+        let state = try await core.readModelsSnapshot()
+        XCTAssertNotNil(state.metadata["request_id"])
+        XCTAssertNotNil(state.readModels.objectValue)
+      } catch {
+        guard isExpectedCoverageProbeBoundary(error) else { throw error }
+      }
     }
   }
 
@@ -1312,9 +1607,9 @@ final class AffectiveTests: XCTestCase {
 
   @MainActor
   func testLiveCameraHardwareCaptureReturnsVisibleImage() async throws {
-//    guard ProcessInfo.processInfo.environment["AFFECTIVE_RUN_CAMERA_HARDWARE_E2E"] == "1" else {
-//      throw XCTSkip("Set AFFECTIVE_RUN_CAMERA_HARDWARE_E2E=1 to run the live camera hardware capture check.")
-//    }
+    guard ProcessInfo.processInfo.environment["AFFECTIVE_RUN_CAMERA_HARDWARE_E2E"] == "1" else {
+      throw XCTSkip("Set AFFECTIVE_RUN_CAMERA_HARDWARE_E2E=1 to run the live camera hardware capture check.")
+    }
 
     let model = AffectiveViewModel(brain: try makeBrain())
     let status = await model.requestCameraPermissionIfNeeded(requestID: "camera-hardware-e2e")
@@ -1328,6 +1623,69 @@ final class AffectiveTests: XCTestCase {
 
     XCTAssertGreaterThan(imageInfo.width, 1)
     XCTAssertGreaterThan(imageInfo.height, 1)
+  }
+
+  @MainActor
+  func testLiveCameraCaptureProducesDetectableFace() async throws {
+    guard ProcessInfo.processInfo.environment["AFFECTIVE_RUN_CAMERA_HARDWARE_E2E"] == "1" else {
+      throw XCTSkip("Set AFFECTIVE_RUN_CAMERA_HARDWARE_E2E=1 to run the live camera face-detection check.")
+    }
+    guard FaceRecognitionService.bundledModelsAvailable else {
+      throw XCTSkip("Bundled ONNX recognition models are not available in this test bundle.")
+    }
+
+    let brain = try makeBrain()
+    try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
+      {
+        "schema_version": 1,
+        "traces": [],
+        "beliefs": [],
+        "subjects": [],
+        "artifacts": [],
+        "dreams": []
+      }
+    """)
+
+    let model = AffectiveViewModel(brain: brain)
+    let status = await model.requestCameraPermissionIfNeeded(requestID: "camera-hardware-identify-e2e")
+    guard status == .available else {
+      XCTFail("Live camera identify test requested, but camera permission/status is \(status.rawValue).")
+      return
+    }
+
+    let data = try await model.captureWebcamPhotoData()
+    let imageInfo = try model.validateCapturedImageData(data)
+    let storedImage = try model.storeChatImage(data: data, suggestedName: "hardware-identify-e2e-\(UUID().uuidString)")
+    let service = FaceRecognitionService()
+    let result = try service.identify(.init(
+      imagePath: storedImage.url.path,
+      memoryPath: brain.memoryDatabaseURL.path,
+      embeddingsDir: brain.faceEmbeddingsURL.path,
+      detectorModel: nil,
+      recognizerModel: nil,
+      knownThreshold: 0.85,
+      uncertainThreshold: 0.60
+    ))
+
+    if result.peopleCount == 0 {
+      XCTFail(
+        """
+        Live camera identify returned people_count=0 (match_status=\(result.matchStatus)).
+        image_path=\(storedImage.url.path)
+        byte_count=\(data.count)
+        pixel_width=\(imageInfo.width)
+        pixel_height=\(imageInfo.height)
+        Reproduce with:
+        tools/affective-face-recognizer identify \\
+          --image "\(storedImage.url.path)" \\
+          --memory "\(brain.memoryDatabaseURL.path)" \\
+          --embeddings-dir "\(brain.faceEmbeddingsURL.path)" \\
+          --known-threshold 0.85 \\
+          --uncertain-threshold 0.60
+        """
+      )
+    }
+    XCTAssertGreaterThanOrEqual(result.peopleCount, 1)
   }
 
   @MainActor
@@ -1346,9 +1704,9 @@ final class AffectiveTests: XCTestCase {
 
     XCTAssertFalse(result.didAppendBrainChat)
     XCTAssertEqual(model.chatEntries.count, initialChatCount)
-    XCTAssertEqual(model.commandEntries.last?.title, "camera sense")
-    XCTAssertEqual(model.commandEntries.last?.body, "")
-    XCTAssertEqual(model.commandEntries.last?.metadata["sense"], "camera")
+    XCTAssertEqual(model.eventEntries.last?.title, "camera sense")
+    XCTAssertEqual(model.eventEntries.last?.body, "")
+    XCTAssertEqual(model.eventEntries.last?.metadata["sense"], "camera")
   }
 
   @MainActor
@@ -1451,7 +1809,7 @@ final class AffectiveTests: XCTestCase {
 
     let observations = await core.cameraObservations
     XCTAssertFalse(observations.contains { $0.requestID == "capture-timeout" })
-    let failure = try XCTUnwrap(model.commandEntries.last { $0.title == "camera sense timed out" })
+    let failure = try XCTUnwrap(model.eventEntries.last { $0.title == "camera sense timed out" })
     XCTAssertTrue(failure.body.contains("timed out"))
     XCTAssertEqual(failure.metadata["status"], PullSenseTerminalStatus.timedOut.rawValue)
     XCTAssertNil(model.chatEntries.last { $0.title == "Camera" && $0.body.contains("couldn't get a usable image") })
@@ -1485,7 +1843,7 @@ final class AffectiveTests: XCTestCase {
 
     let observations = await core.cameraObservations
     XCTAssertTrue(observations.isEmpty)
-    let failure = try XCTUnwrap(model.commandEntries.last { $0.title == "camera sense failed" })
+    let failure = try XCTUnwrap(model.eventEntries.last { $0.title == "camera sense failed" })
     XCTAssertEqual(failure.metadata["camera_error"], "blackImageData")
     XCTAssertNil(model.chatEntries.last { $0.title == "Camera" })
   }
@@ -1726,7 +2084,7 @@ final class AffectiveTests: XCTestCase {
 
     let observations = await core.cameraObservations
     XCTAssertTrue(observations.isEmpty)
-    XCTAssertNotNil(model.commandEntries.last { $0.title == "camera sense failed" })
+    XCTAssertNotNil(model.eventEntries.last { $0.title == "camera sense failed" })
     XCTAssertEqual(model.chatEntries.count, initialChatCount)
   }
 
@@ -1767,8 +2125,67 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(observation.presentation, .chat)
 
     XCTAssertEqual(model.chatEntries.last?.body, "I can see the captured frame now.")
-    XCTAssertNotNil(model.commandEntries.last { $0.title == "camera sense" })
-    XCTAssertNotNil(model.commandEntries.last { $0.title == "sense_observation" })
+    XCTAssertNotNil(model.eventEntries.last { $0.title == "camera sense" })
+    XCTAssertNotNil(model.eventEntries.last { $0.title == "sense_observation" })
+  }
+
+  @MainActor
+  func testTypedTextCameraResumeMirrorsChatEvenWhenSenseRequestUsesStatusPresentation() async throws {
+    let pausedResponse = Self.toolResponse(
+      toolName: "user_text",
+      events: [
+        senseRequestEvent(
+          requestID: "recognize-camera",
+          sense: "camera",
+          title: "camera sense",
+          summary: "frontend camera sense requested",
+          responsePresentation: .status
+        )
+      ],
+      result: .object([
+        "event_type": .string("user_text"),
+        "value": .object([
+          "kind": .string("user_text"),
+          "outcome": .object([
+            "text": .string("do you recognize me?"),
+            "spoken_text": .string(""),
+            "user_summary": .string("Asked about recognition."),
+            "brain_summary": .string("Requested camera capture."),
+            "interrupted_by": .null,
+            "awaiting_host_sense": .bool(true),
+          ]),
+        ]),
+      ])
+    )
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      textResponse: BrainTextResponse(
+        toolName: "user_text",
+        text: pausedResponse.text,
+        metadata: pausedResponse.metadata.merging(["state": "awaiting host sense"]) { current, _ in current },
+        events: pausedResponse.events
+      ),
+      cameraObservationResponse: Self.toolResponse(
+        toolName: "sense_observation",
+        events: [
+          brainChatEvent(title: "Brain", text: "I can see someone is here, but I don't recognize you yet.")
+        ]
+      )
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.cameraPermissionRequestTask = Task { .available }
+    model.cameraPhotoCaptureOverride = { Self.tinyPNGData }
+
+    await model.sendTextToBrain("do you recognize me?")
+
+    XCTAssertEqual(model.chatEntries.last?.body, "I can see someone is here, but I don't recognize you yet.")
+    XCTAssertNil(model.eventEntries.last { $0.title == "chat display" && $0.body.contains("display_text_empty=true") })
+    XCTAssertNil(model.eventEntries.first {
+      $0.kind == .result
+        && $0.title == "user_text"
+        && $0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    })
   }
 
   @MainActor
@@ -1791,7 +2208,7 @@ final class AffectiveTests: XCTestCase {
 
     await model.callCoreTouch(name: "short_touch", title: "short_touch")
 
-    let entry = try XCTUnwrap(model.commandEntries.last { $0.title == "short_touch" })
+    let entry = try XCTUnwrap(model.eventEntries.last { $0.title == "short_touch" })
     XCTAssertEqual(entry.metadata["ignored_because"], "low_salience")
   }
 
@@ -1814,7 +2231,7 @@ final class AffectiveTests: XCTestCase {
 
     await model.callCoreTouch(name: "short_touch", title: "short_touch")
 
-    let entry = try XCTUnwrap(model.commandEntries.last { $0.title == "short_touch" })
+    let entry = try XCTUnwrap(model.eventEntries.last { $0.title == "short_touch" })
     XCTAssertNil(entry.metadata["ignored_because"])
   }
 
@@ -1837,7 +2254,7 @@ final class AffectiveTests: XCTestCase {
 
     await model.callCoreTouch(name: "short_touch", title: "short_touch")
 
-    let entry = try XCTUnwrap(model.commandEntries.last { $0.title == "short_touch" })
+    let entry = try XCTUnwrap(model.eventEntries.last { $0.title == "short_touch" })
     XCTAssertNil(entry.metadata["ignored_because"])
   }
 
@@ -1917,7 +2334,7 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(observations.last?.presentation, .internalOnly)
     XCTAssertEqual(model.chatEntries.filter { $0.body == "Hello from the first turn." }.count, 1)
     XCTAssertNil(model.chatEntries.last { $0.body == "I can see the captured frame now." })
-    XCTAssertNotNil(model.commandEntries.last { $0.title == "sense_observation" })
+    XCTAssertNotNil(model.eventEntries.last { $0.title == "sense_observation" })
   }
 
   @MainActor
@@ -1966,8 +2383,8 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(observation.presentation, .chat)
 
     XCTAssertEqual(model.chatEntries.last?.body, "The device is face up.")
-    XCTAssertNotNil(model.commandEntries.last { $0.title == "orientation sense" })
-    XCTAssertNotNil(model.commandEntries.last { $0.title == "sense_observation" })
+    XCTAssertNotNil(model.eventEntries.last { $0.title == "orientation sense" })
+    XCTAssertNotNil(model.eventEntries.last { $0.title == "sense_observation" })
   }
 
   @MainActor
@@ -1999,7 +2416,7 @@ final class AffectiveTests: XCTestCase {
     }
     XCTAssertEqual(pulses.count, 1)
     XCTAssertEqual(model.pendingChatResponseCount, 0)
-    XCTAssertEqual(model.commandEntries.last?.metadata["mirror_to_chat"], "false")
+    XCTAssertEqual(model.eventEntries.last?.metadata["mirror_to_chat"], "false")
   }
 
   @MainActor
@@ -2032,7 +2449,7 @@ final class AffectiveTests: XCTestCase {
     }
     XCTAssertEqual(queuedObservation.gesture, "shake")
     XCTAssertEqual(model.pendingChatResponseCount, 0)
-    XCTAssertEqual(model.commandEntries.last?.title, "motion gesture")
+    XCTAssertEqual(model.eventEntries.last?.title, "motion gesture")
 
     let context = model.currentStimulusContext(kind: "user_message")
     XCTAssertEqual(context.recentStimuli.first?.kind, "motion_gesture")
@@ -2056,7 +2473,7 @@ final class AffectiveTests: XCTestCase {
     let observations = await core.motionGestureObservations
     XCTAssertEqual(observations.last?.observation.gesture, "tilt_left")
     XCTAssertEqual(observations.last?.presentation, .internalOnly)
-    XCTAssertNotNil(model.commandEntries.last { $0.title == "pushed_motion_gesture" })
+    XCTAssertNotNil(model.eventEntries.last { $0.title == "pushed_motion_gesture" })
   }
 
   @MainActor
@@ -2152,6 +2569,28 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
+  func testDreamingBrainModeBlocksTypedTextBeforeCoreTurn() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      textResponse: BrainTextResponse(toolName: "experience", text: "Should not send", metadata: [:], events: []),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation"),
+      brainMode: "dreaming"
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    await model.refreshBrainMode()
+    model.messageText = "Are you awake?"
+
+    model.sendText()
+
+    let textCalls = await core.waitForTextCallCount(0)
+    XCTAssertEqual(textCalls.count, 0)
+    XCTAssertEqual(model.messageText, "Are you awake?")
+    XCTAssertEqual(model.statusText, "Brain is dreaming")
+    XCTAssertTrue(model.isBrainUnavailableForConversation)
+  }
+
+  @MainActor
   func testTypedTextPassesPriorConversationContextWithoutCurrentMessage() async throws {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "unused"),
@@ -2213,7 +2652,7 @@ final class AffectiveTests: XCTestCase {
     model.recordConversationTurn(
       role: "other",
       text: "Can you keep track of me?",
-      source: "speech_transcript",
+      source: "speech_input",
       metadata: ["speaker_name": "Mira"]
     )
 
@@ -2224,10 +2663,10 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
-  func testFallbackBrainResponseDoesNotRecordConversationTurn() async throws {
+  func testEmptyEventBrainResponseIsProtocolError() async throws {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "unused"),
-      textResponse: BrainTextResponse(toolName: "experience", text: "Fallback hello.", metadata: [:], events: []),
+      textResponse: BrainTextResponse(toolName: "experience", text: "raw text without events", metadata: [:], events: []),
       cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
@@ -2236,7 +2675,9 @@ final class AffectiveTests: XCTestCase {
     await model.sendTextToBrain("Hello?", speakResponse: false)
 
     let turns = model.conversationContextSnapshot().recentTurns
-    XCTAssertNil(turns.last { $0.speakerRole == "self" && $0.text == "Fallback hello." })
+    XCTAssertNil(turns.last { $0.speakerRole == "self" && $0.text == "raw text without events" })
+    XCTAssertEqual(model.statusText, "Core protocol error")
+    XCTAssertNotNil(model.eventEntries.last { $0.kind == .error && $0.title == "user_text" })
   }
 
   @MainActor
@@ -2285,8 +2726,24 @@ final class AffectiveTests: XCTestCase {
     XCTAssertFalse(result.didAppendBrainChat)
     XCTAssertTrue(result.didRecordBrainTurn)
     XCTAssertEqual(turns.last?.speakerRole, "self")
-    XCTAssertEqual(turns.last?.source, "action_request")
+    XCTAssertEqual(turns.last?.source, "capability_request")
     XCTAssertEqual(turns.filter { $0.text == "Speech-only hello." }.count, 1)
+  }
+
+  @MainActor
+  func testBotActionClickSoundSurvivesRapidPlayback() {
+    for _ in 0..<8 {
+      BrainNotificationSounds.shared.playBotActionClick()
+    }
+    BrainNotificationSounds.shared.playSpeechNotification()
+  }
+
+  @MainActor
+  func testShouldPlayBotActionClickMatchesSkillActionsOnly() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    XCTAssertTrue(model.shouldPlayBotActionClick(for: controlEvent(id: "action-say", status: "say")))
+    XCTAssertFalse(model.shouldPlayBotActionClick(for: controlEvent(id: "status-ready", status: "Ready")))
+    XCTAssertFalse(model.shouldPlayBotActionClick(for: controlEvent(id: "control-off", sendEnabled: false)))
   }
 
   @MainActor
@@ -2322,6 +2779,16 @@ final class AffectiveTests: XCTestCase {
 
     model.sendImage(data: Self.tinyPNGData, suggestedName: "sketch.png")
     let textCalls = await core.waitForTextCallCount(1)
+    let mediaEvents = await core.waitForExperienceEventCallCount(1)
+    let mediaEvent = try XCTUnwrap(mediaEvents.last)
+    XCTAssertEqual(mediaEvent.arguments["kind"]?.stringValue, "User.MediaUploaded")
+    XCTAssertEqual(mediaEvent.arguments["source"]?.stringValue, "user")
+    XCTAssertEqual(mediaEvent.arguments["retention"]?.stringValue, "episode")
+    XCTAssertEqual(mediaEvent.arguments["visibility"]?.stringValue, "host")
+    XCTAssertEqual(mediaEvent.arguments["salience"], .number(0.65))
+    let mediaPayload = try XCTUnwrap(mediaEvent.arguments["payload"]?.stringValue)
+    XCTAssertTrue(mediaPayload.contains("\"media_kind\":\"image\""))
+    XCTAssertTrue(mediaPayload.contains("\"mime_type\":\"image/png\""))
 
     let imageTurn = try XCTUnwrap(model.conversationContextSnapshot().recentTurns.last)
     XCTAssertEqual(imageTurn.speakerRole, "other")
@@ -2347,8 +2814,8 @@ final class AffectiveTests: XCTestCase {
 
     XCTAssertFalse(result.didAppendBrainChat)
     XCTAssertEqual(model.chatEntries.count, initialChatCount)
-    XCTAssertEqual(model.commandEntries.last?.title, "facial expression")
-    XCTAssertEqual(model.commandEntries.last?.body, "bright eyes / small smile")
+    XCTAssertEqual(model.eventEntries.last?.title, "facial expression")
+    XCTAssertEqual(model.eventEntries.last?.body, "bright eyes / small smile")
   }
 
   @MainActor
@@ -2362,18 +2829,18 @@ final class AffectiveTests: XCTestCase {
     ], mirrorChatMessages: true, speak: false)
 
     XCTAssertEqual(model.chatEntries.count, initialChatCount)
-    XCTAssertEqual(model.commandEntries.last?.title, "facial expression")
-    XCTAssertEqual(model.commandEntries.last?.body, "bright eyes / small smile")
+    XCTAssertEqual(model.eventEntries.last?.title, "facial expression")
+    XCTAssertEqual(model.eventEntries.last?.body, "bright eyes / small smile")
   }
 
   @MainActor
-  func testGenericBrainEventTitleUsesFactDatabaseBrainName() async throws {
+  func testGenericBrainEventTitleIgnoresCognitiveDatabaseIdentity() async throws {
     let brain = try makeBrain()
     try writeCognitiveStore(
       at: brain.memoryDatabaseURL,
       dataJSON: """
         {
-          "schema_version": 2,
+          "schema_version": 1,
           "brain_name": "Otto",
           "traces": [],
           "beliefs": [],
@@ -2390,7 +2857,7 @@ final class AffectiveTests: XCTestCase {
     ], mirrorChatMessages: true, speak: false)
 
     XCTAssertTrue(result.didAppendBrainChat)
-    XCTAssertEqual(model.chatEntries.last?.title, "Otto")
+    XCTAssertEqual(model.chatEntries.last?.title, "A brain")
     XCTAssertEqual(model.chatEntries.last?.body, "Hello from the core.")
   }
 
@@ -2448,7 +2915,7 @@ final class AffectiveTests: XCTestCase {
     XCTAssertTrue(result.didAppendBrainChat)
     XCTAssertFalse(result.didRequestSpeech)
     XCTAssertEqual(model.chatEntries.last?.body, "Hello from the core.")
-    XCTAssertFalse(model.commandEntries.contains { entry in
+    XCTAssertFalse(model.eventEntries.contains { entry in
       entry.title == "speech output" && entry.body == "apple_speech=true"
     })
   }
@@ -2460,7 +2927,7 @@ final class AffectiveTests: XCTestCase {
       at: brain.memoryDatabaseURL,
       dataJSON: """
         {
-          "schema_version": 2,
+          "schema_version": 1,
           "traces": [],
           "beliefs": [],
           "subjects": [
@@ -2481,83 +2948,7 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
-  func testNestedFactIdentityProvidesBrainSenderName() throws {
-    let brain = try makeBrain()
-    try writeCognitiveStore(
-      at: brain.memoryDatabaseURL,
-      dataJSON: """
-        {
-          "schema_version": 2,
-          "identity": {
-            "preferred_name": "Otto"
-          },
-          "traces": [],
-          "beliefs": [],
-          "subjects": [],
-          "artifacts": [],
-          "dreams": []
-        }
-        """
-    )
-    let model = AffectiveViewModel(brain: brain)
-
-    XCTAssertEqual(model.brainSenderName, "Otto")
-  }
-
-  @MainActor
-  func testSelfMarkedSubjectProvidesBrainSenderName() throws {
-    let brain = try makeBrain()
-    try writeCognitiveStore(
-      at: brain.memoryDatabaseURL,
-      dataJSON: """
-        {
-          "schema_version": 2,
-          "traces": [],
-          "beliefs": [],
-          "subjects": [
-            {
-              "subject_id": "self",
-              "display_name": "Otto"
-            }
-          ],
-          "artifacts": [],
-          "dreams": []
-        }
-        """
-    )
-    let model = AffectiveViewModel(brain: brain)
-
-    XCTAssertEqual(model.brainSenderName, "Otto")
-  }
-
-  @MainActor
-  func testBrainPrefixedSubjectProvidesBrainSenderName() throws {
-    let brain = try makeBrain()
-    try writeCognitiveStore(
-      at: brain.memoryDatabaseURL,
-      dataJSON: """
-        {
-          "schema_version": 2,
-          "traces": [],
-          "beliefs": [],
-          "subjects": [
-            {
-              "subject_id": "brain_primary",
-              "name": "Otto"
-            }
-          ],
-          "artifacts": [],
-          "dreams": []
-        }
-        """
-    )
-    let model = AffectiveViewModel(brain: brain)
-
-    XCTAssertEqual(model.brainSenderName, "Otto")
-  }
-
-  @MainActor
-  func testBrainSenderNameIgnoresProfileDisplayNameFallback() async throws {
+  func testBrainSenderNameIgnoresProfileDisplayNameDefault() async throws {
     let model = AffectiveViewModel(brain: try makeBrain())
 
     _ = await model.applyCoreEvents([
@@ -2574,14 +2965,24 @@ final class AffectiveTests: XCTestCase {
     model.autonomyMode = "on"
     model.lastHostStimulusAt = Date(timeIntervalSinceNow: -700)
 
-    XCTAssertTrue(model.canEmitBoredomStimulus(intervalSeconds: 600))
+    XCTAssertTrue(model.canEmitBoredomStimulus(waitSeconds: 600))
 
     model.autonomyMode = "off"
-    XCTAssertFalse(model.canEmitBoredomStimulus(intervalSeconds: 600))
+    XCTAssertFalse(model.canEmitBoredomStimulus(waitSeconds: 600))
 
     model.autonomyMode = "on"
     model.hostPipelineHold = .speechOutput
-    XCTAssertFalse(model.canEmitBoredomStimulus(intervalSeconds: 600))
+    XCTAssertFalse(model.canEmitBoredomStimulus(waitSeconds: 600))
+  }
+
+  @MainActor
+  func testNextBoredomWaitSecondsStaysWithinConfiguredRange() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    for _ in 0..<20 {
+      let waitSeconds = model.nextBoredomWaitSeconds()
+      XCTAssertGreaterThanOrEqual(waitSeconds, AffectiveViewModel.boredomIntervalMinSeconds)
+      XCTAssertLessThanOrEqual(waitSeconds, model.boredomIntervalMaxSeconds)
+    }
   }
 
   @MainActor
@@ -2589,11 +2990,15 @@ final class AffectiveTests: XCTestCase {
     let model = AffectiveViewModel(brain: try makeBrain())
     model.isBrainConnected = true
     model.autonomyMode = "on"
+    model.lastHostStimulusAt = Date(timeIntervalSinceNow: -620)
 
-    let text = model.boredomStimulusText(intervalSeconds: 600)
+    let text = model.boredomStimulusText(idleSeconds: 620)
+    let summary = model.boredomStimulusSummary(idleSeconds: 620)
     let context = model.currentStimulusContext(kind: "boredom")
 
-    XCTAssertTrue(text.contains("Stay patient"))
+    XCTAssertTrue(text.contains("620 seconds"))
+    XCTAssertTrue(text.contains("You feel bored."))
+    XCTAssertEqual(summary, "Host quiet for 620s.")
     XCTAssertEqual(context.kind, "boredom")
     XCTAssertEqual(context.receivedDuring, "idle")
   }
@@ -2650,7 +3055,7 @@ final class AffectiveTests: XCTestCase {
     ], mirrorChatMessages: true, speak: false)
 
     XCTAssertEqual(model.statusText, "Waiting for your name.")
-    XCTAssertEqual(model.commandEntries.last?.title, "Learning your name")
+    XCTAssertEqual(model.eventEntries.last?.title, "Learning your name")
     XCTAssertEqual(model.chatEntries.count, initialChatCount)
   }
 
@@ -2729,49 +3134,6 @@ final class AffectiveTests: XCTestCase {
     XCTAssertNotNil(object["provider_image_generation_checked"])
   }
 
-  func testBrainToolResponseParsesSpokenCommandResults() throws {
-    let response = BrainToolResponse(
-      toolName: "say",
-      rawText: #"""
-        {
-          "command": "say",
-          "observation": "",
-          "spoken_text": "I found one memory.",
-          "ended_with_speech": true,
-          "interrupted_by": null
-        }
-        """#)
-
-    XCTAssertEqual(response.text, "I found one memory.")
-    XCTAssertTrue(response.shouldSpeak)
-    XCTAssertEqual(response.metadata["command"], "say")
-    XCTAssertEqual(response.metadata["display_source"], "spoken_text")
-    XCTAssertEqual(response.metadata["spoken_text_present"], "true")
-  }
-
-  func testConversationTurnPayloadRejectsPlainText() throws {
-    XCTAssertNil(ConversationTurnPayload.decode(from: "I heard you say: hello"))
-  }
-
-  func testBrainToolResponseUsesObservationForDirectSilentCommandResults() throws {
-    let response = BrainToolResponse(
-      toolName: "recall_memory",
-      rawText: #"""
-        {
-          "command": "recall_memory",
-          "observation": "memory: Papa taught me to solder patiently.",
-          "spoken_text": null,
-          "ended_with_speech": false,
-          "interrupted_by": null
-        }
-        """#)
-
-    XCTAssertEqual(response.text, "memory: Papa taught me to solder patiently.")
-    XCTAssertFalse(response.shouldSpeak)
-    XCTAssertEqual(response.metadata["display_source"], "observation")
-    XCTAssertEqual(response.metadata["observation_present"], "true")
-  }
-
   func testBrainToolResponsePrefersEventEnvelope() throws {
     let envelope = try BrainDispatchEnvelope.decode(from: encodedEnvelopeText(
       requestID: "test-request",
@@ -2795,17 +3157,17 @@ final class AffectiveTests: XCTestCase {
       )
     ))
 
-    let response = BrainToolResponse(toolName: "recall_memory", envelope: envelope, rawText: envelope.rawText)
+    let response = BrainToolResponse(toolName: "user_text", envelope: envelope, rawText: envelope.rawText)
 
     XCTAssertEqual(response.text, "Here is what I remember.")
     XCTAssertTrue(response.shouldSpeak)
     XCTAssertEqual(response.events.count, 4)
     XCTAssertEqual(response.metadata["display_source"], "event_envelope")
-    XCTAssertEqual(response.metadata["event_types"], "control,action_request,expression,control")
+    XCTAssertEqual(response.metadata["event_types"], "control,capability_request,expression")
     XCTAssertEqual(response.metadata["budget_max_bytes"], "16384")
   }
 
-  func testBrainToolResponseIgnoresLegacyEnvelopeCommandSummary() throws {
+  func testBrainToolResponseIgnoresEnvelopeResultSummaryWithoutEvents() throws {
     let envelope = try BrainDispatchEnvelope.decode(from: encodedEnvelopeText(
       requestID: "test-request",
       events: [],
@@ -2823,14 +3185,14 @@ final class AffectiveTests: XCTestCase {
       )
     ))
 
-    let response = BrainToolResponse(toolName: "recall_memory", envelope: envelope, rawText: envelope.rawText)
+    let response = BrainToolResponse(toolName: "user_text", envelope: envelope, rawText: envelope.rawText)
 
     XCTAssertEqual(response.text, "")
     XCTAssertEqual(response.metadata["display_source"], "empty")
     XCTAssertEqual(response.metadata["display_text_length"], "0")
   }
 
-  func testBrainToolResponseDecodesDirectTouchCommandResult() throws {
+  func testBrainToolResponseDoesNotDisplayDirectTouchResultSummary() throws {
     let envelope = try BrainDispatchEnvelope.decode(from: #"""
       {
         "request_id": "touch-request",
@@ -2853,8 +3215,9 @@ final class AffectiveTests: XCTestCase {
 
     let response = BrainToolResponse(toolName: "short_touch", envelope: envelope, rawText: envelope.rawText)
 
-    XCTAssertEqual(response.text, "touch stimulus received")
-    XCTAssertEqual(response.metadata["display_source"], "result_summary")
+    XCTAssertEqual(response.text, "")
+    XCTAssertEqual(response.metadata["display_source"], "empty")
+    XCTAssertEqual(response.metadata["display_text_length"], "0")
     XCTAssertEqual(response.metadata["event_types"], "")
   }
 
@@ -2876,9 +3239,17 @@ final class AffectiveTests: XCTestCase {
         controlEvent(id: "fixture-success-001-control-on", sendEnabled: true),
       ],
       result: .object([
-        "event_type": .string("experience"),
-        "summary": .string("{\"user_text\":\"What do you remember about soldering?\",\"spoken_text\":\"I found one memory about soldering.\",\"user_summary\":\"Asked for soldering memories.\",\"brain_summary\":\"Shared a soldering memory.\",\"interrupted_by\":null}"),
-        "raw_result": .bool(true),
+        "event_type": .string("user_text"),
+        "value": .object([
+          "kind": .string("user_text"),
+          "outcome": .object([
+            "text": .string("What do you remember about soldering?"),
+            "spoken_text": .string("I found one memory about soldering."),
+            "user_summary": .string("Asked for soldering memories."),
+            "brain_summary": .string("Shared a soldering memory."),
+            "interrupted_by": .null,
+          ]),
+        ]),
       ]),
       budget: BrainDispatchBudget(
         maxBytes: 16384,
@@ -2894,8 +3265,48 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(success.events.count, 4)
     XCTAssertEqual(success.events.first?.id, "fixture-success-001-control-off")
     XCTAssertEqual(success.displayTextFromEvents, "I found one memory about soldering.")
-    XCTAssertNotNil(success.conversationTurnJSON)
-    XCTAssertEqual(success.budget?.maxBytes, 16384)
+    XCTAssertEqual(success.structuredResultValue?.objectValue?["kind"]?.stringValue, "user_text")
+    XCTAssertEqual(success.displayText, "I found one memory about soldering.")
+    XCTAssertEqual(success.awaitingHostSense, false)
+
+    let paused = try BrainDispatchEnvelope.decode(from: encodedEnvelopeText(
+      requestID: "fixture-paused-001",
+      events: [
+        senseRequestEvent(
+          requestID: "fixture-paused-sense",
+          sense: "camera",
+          title: "camera sense",
+          summary: "frontend camera sense requested",
+          responsePresentation: .status
+        ),
+      ],
+      result: .object([
+        "event_type": .string("user_text"),
+        "value": .object([
+          "kind": .string("user_text"),
+          "outcome": .object([
+            "text": .string("do you recognize me?"),
+            "spoken_text": .string(""),
+            "user_summary": .string("Asked about recognition."),
+            "brain_summary": .string("Requested camera capture."),
+            "interrupted_by": .null,
+            "awaiting_host_sense": .bool(true),
+          ]),
+        ]),
+      ]),
+      budget: BrainDispatchBudget(
+        maxBytes: 16384,
+        usedBytes: 780,
+        compacted: false,
+        droppedEventCount: 0,
+        rawRefs: []
+      )
+    ))
+
+    XCTAssertTrue(paused.awaitingHostSense)
+    XCTAssertEqual(paused.displayText, "")
+    XCTAssertEqual(paused.metadata()["awaiting_host_sense"], "true")
+    XCTAssertEqual(paused.metadata()["user_summary_present"], "true")
 
     let drain = try BrainDispatchEnvelope.decode(from: encodedEnvelopeText(
       requestID: "",
@@ -2981,9 +3392,16 @@ final class AffectiveTests: XCTestCase {
       )),
       .capabilityStatus(BrainCapabilityStatusPayload(
         capabilityID: "camera_capture",
-        status: "available",
+        status: nil,
         reason: nil,
-        permissionState: "granted"
+        permission: "granted",
+        availability: "available",
+        quality: 0.9,
+        reliability: 0.8,
+        cost: 0.0,
+        latencyMS: 0,
+        risk: 0.05,
+        unavailableReason: nil
       )),
       .thought(BrainThoughtPayload(text: "I should answer.", salience: 0.6, tags: ["reply"])),
       .appraisal(BrainAppraisalPayload(
@@ -3008,7 +3426,7 @@ final class AffectiveTests: XCTestCase {
         expectedAction: "speak",
         stoppingCondition: "answer delivered"
       )),
-      .actionRequest(BrainActionRequestPayload(
+      .capabilityRequest(BrainActionRequestPayload(
         actionID: "action-1",
         action: "speak",
         arguments: .object(["text": .string("hello")]),
@@ -3032,13 +3450,6 @@ final class AffectiveTests: XCTestCase {
         eyes: nil,
         mouth: nil,
         durationMS: nil
-      )),
-      .memoryRequest(BrainMemoryRequestPayload(
-        operation: .recall,
-        layers: [.working, .episodic],
-        query: "hello",
-        text: nil,
-        tags: ["conversation"]
       )),
       .memoryResult(BrainMemoryResultPayload(
         operation: .recall,
@@ -3112,23 +3523,51 @@ final class AffectiveTests: XCTestCase {
     XCTAssertThrowsError(try JSONDecoder().decode(BrainEvent.self, from: malformed))
   }
 
+  func testBrainEventRejectsTopLevelExpressionWithoutEnvelope() throws {
+    let malformed = Data(#"""
+      {
+        "type": "expression",
+        "role": "user",
+        "text": "hello"
+      }
+      """#.utf8)
+
+    XCTAssertThrowsError(try JSONDecoder().decode(BrainEvent.self, from: malformed))
+  }
+
+  func testBrainEventUnknownRoleDecodesAsUnknown() throws {
+    let event = Data(#"""
+      {
+        "id": "event-unknown-role",
+        "trace_id": "trace-unknown-role",
+        "occurred_at": "2026-06-26T00:00:00Z",
+        "source": "brain",
+        "target": "host",
+        "visibility": "public",
+        "presentation": "chat",
+        "payload": {
+          "expression": {
+            "modality": "text",
+            "role": "future_role",
+            "title": "Brain",
+            "text": "hello",
+            "media": [],
+            "expression_id": "expression-unknown-role"
+          }
+        }
+      }
+      """#.utf8)
+
+    let decoded = try JSONDecoder().decode(BrainEvent.self, from: event)
+    XCTAssertEqual(decoded.role, "unknown")
+  }
+
   func testMissingRequiredFileFailsCoreValidation() throws {
     let brain = try makeBrain()
     try FileManager.default.removeItem(at: brain.runtimeOptionsURL)
 
     XCTAssertThrowsError(try brain.validateForCoreConnection()) { error in
       XCTAssertEqual(error as? BrainValidationError, .missingFile("runtime_options.json"))
-    }
-  }
-
-  func testInvalidEventsJSONLFailsCoreValidation() throws {
-    let brain = try makeBrain(events: #"{"ok": true}"# + "\nnot-json\n")
-
-    XCTAssertThrowsError(try brain.validateForCoreConnection()) { error in
-      guard case .invalidJSON("events.jsonl", let detail) = error as? BrainValidationError else {
-        return XCTFail("Expected invalid events JSONL, got \(error)")
-      }
-      XCTAssertTrue(detail.contains("line 2"))
     }
   }
 
@@ -3257,7 +3696,7 @@ final class AffectiveTests: XCTestCase {
     XCTAssertFalse(loaded.layers.contains { ($0.image ?? $0.atlas ?? "").hasPrefix("/") })
   }
 
-  func testAvatarManifestClipFallsBackToCanvas() throws {
+  func testAvatarManifestClipUsesCanvasDefault() throws {
     let manifest = BrainAvatarManifest(
       canvas: .init(width: 640, height: 360),
       layers: [],
@@ -3268,7 +3707,138 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(manifest.effectiveClip, .init(x: 0, y: 0, width: 640, height: 360))
   }
 
-  func testAvatarAtlasPlaybackResolvesExpressionAndLayerFallbacks() throws {
+  func testAvatarManifestEffectiveClipPreservesNegativeOrigin() throws {
+    let manifest = BrainAvatarManifest(
+      canvas: .init(width: 1024, height: 1024),
+      clip: .init(x: -40, y: -20, width: 512, height: 288),
+      layers: [],
+      rootURL: FileManager.default.temporaryDirectory
+    )
+
+    XCTAssertEqual(manifest.effectiveClip, .init(x: -40, y: -20, width: 512, height: 288))
+  }
+
+  func testAvatarLayerTopLeftOriginUsesCenterAnchor() {
+    let layer = BrainAvatarManifest.Layer(
+      id: "head",
+      image: "avatar/head.png",
+      x: 300,
+      y: 400,
+      width: 200,
+      height: 100,
+      z: 10,
+      anchor: .center
+    )
+
+    XCTAssertEqual(layer.topLeftOrigin().x, 200)
+    XCTAssertEqual(layer.topLeftOrigin().y, 350)
+  }
+
+  func testAvatarAtlasPlaybackUsesEyeAtlasBlinkWithoutSeparateBlinkLayer() throws {
+    let root = FileManager.default.temporaryDirectory
+    let eyesLayer = BrainAvatarManifest.Layer(
+      id: "eyes",
+      atlas: "avatar/eyes.png",
+      x: 0,
+      y: 0,
+      width: 512,
+      height: 512,
+      z: 20,
+      frameWidth: 128,
+      frameHeight: 128,
+      frames: 16,
+      frame: 0,
+      fps: nil
+    )
+    let manifest = BrainAvatarManifest(
+      canvas: .init(width: 512, height: 512),
+      layers: [eyesLayer],
+      eyeSprites: [
+        .init(frame: 0, row: 0, column: 0, name: "neutral_open"),
+        .init(frame: 15, row: 3, column: 3, name: "blink_closed"),
+      ],
+      defaultExpression: "neutral",
+      expressions: [
+        .init(
+          id: "neutral",
+          name: "Neutral",
+          layers: [
+            "eyes": .init(frames: [0, 14, 15, 14, 0], fps: 12)
+          ]
+        )
+      ],
+      rootURL: root
+    )
+
+    XCTAssertFalse(manifest.hasSeparateBlinkLayer())
+    XCTAssertEqual(manifest.blinkTargetLayerID(), "eyes")
+    XCTAssertEqual(
+      manifest.resolvedEyeBlinkPlayback(expressionID: "neutral")?.frames,
+      [0, 14, 15, 14, 0]
+    )
+    XCTAssertFalse(manifest.shouldApplyEyeSpriteOverride("neutral_open"))
+    XCTAssertTrue(manifest.shouldApplyEyeSpriteOverride("stern"))
+
+    let neutralEyes = manifest.atlasPlayback(
+      for: eyesLayer,
+      expressionID: "neutral",
+      eyeSprite: "neutral_open"
+    )
+    XCTAssertTrue(neutralEyes.isAnimated)
+    XCTAssertEqual(neutralEyes.frames, [0, 14, 15, 14, 0])
+
+    let sternEyes = manifest.atlasPlayback(
+      for: eyesLayer,
+      expressionID: "neutral",
+      eyeSprite: "stern"
+    )
+    XCTAssertFalse(sternEyes.isAnimated)
+  }
+
+  func testAvatarAtlasPlaybackMapsLegacyBlinkExpressionToEyesLayer() throws {
+    let root = FileManager.default.temporaryDirectory
+    let eyesLayer = BrainAvatarManifest.Layer(
+      id: "eyes",
+      atlas: "avatar/eyes.png",
+      x: 0,
+      y: 0,
+      width: 512,
+      height: 512,
+      z: 20,
+      frameWidth: 128,
+      frameHeight: 128,
+      frames: 16,
+      frame: 0,
+      fps: nil
+    )
+    let manifest = BrainAvatarManifest(
+      canvas: .init(width: 512, height: 512),
+      layers: [eyesLayer],
+      eyeSprites: [
+        .init(frame: 0, row: 0, column: 0, name: "neutral_open")
+      ],
+      expressions: [
+        .init(
+          id: "neutral",
+          name: "Neutral",
+          layers: [
+            "eyes": .init(sprite: "neutral_open"),
+            "blink": .init(frames: [0, 1, 2, 1], fps: 10),
+          ]
+        )
+      ],
+      rootURL: root
+    )
+
+    XCTAssertEqual(manifest.blinkTargetLayerID(), "eyes")
+    XCTAssertEqual(
+      manifest.resolvedEyeBlinkPlayback(expressionID: "neutral")?.frames,
+      [0, 1, 2, 1]
+    )
+    XCTAssertFalse(manifest.shouldApplyEyeSpriteOverride("neutral_open"))
+  }
+
+  func testAvatarAtlasPlaybackResolvesExpressionAndLayerDefaults() throws {
     let root = FileManager.default.temporaryDirectory
     let eyesLayer = BrainAvatarManifest.Layer(
       id: "eyes",
@@ -3318,8 +3888,8 @@ final class AffectiveTests: XCTestCase {
     let expressionEyes = manifest.atlasPlayback(for: eyesLayer, expressionID: "happy")
     XCTAssertEqual(expressionEyes.frameIndex(at: .now), 7)
 
-    let fallbackEyes = manifest.atlasPlayback(for: eyesLayer, expressionID: "missing")
-    XCTAssertEqual(fallbackEyes.frameIndex(at: .now), 7)
+    let defaultEyes = manifest.atlasPlayback(for: eyesLayer, expressionID: "missing")
+    XCTAssertEqual(defaultEyes.frameIndex(at: .now), 7)
 
     let layerOnlyManifest = BrainAvatarManifest(
       canvas: manifest.canvas,
@@ -3363,6 +3933,448 @@ final class AffectiveTests: XCTestCase {
     )
   }
 
+  #if os(macOS)
+  func testAvatarKitPromptBuilderSubstitutesBriefAndBuildsDistinctPrompts() throws {
+    let brief = "A teal fox with round glasses"
+    let prompts = try AvatarKitGenerationPrompt.allPrompts(characterBrief: brief)
+
+    XCTAssertEqual(prompts.count, 3)
+    for kind in AvatarKitAssetKind.allCases {
+      let prompt = try XCTUnwrap(prompts[kind])
+      XCTAssertTrue(prompt.contains(brief))
+      XCTAssertTrue(prompt.contains(kind.generateOnlyLine))
+    }
+
+    XCTAssertNotEqual(prompts[.baseHead], prompts[.eyesAtlas])
+    XCTAssertNotEqual(prompts[.eyesAtlas], prompts[.mouthAtlas])
+
+    let eyesPrompt = try XCTUnwrap(prompts[.eyesAtlas])
+    XCTAssertTrue(eyesPrompt.contains("alpha transparency"))
+    XCTAssertTrue(eyesPrompt.contains("checkerboard"))
+    XCTAssertFalse(eyesPrompt.contains("neutral_open"))
+
+    let checkerboardPrompt = AvatarKitGenerationPrompt.removeCheckerboardBackgroundPrompt(for: .eyesAtlas)
+    XCTAssertTrue(checkerboardPrompt.contains("Remove the checkerboard background"))
+    XCTAssertTrue(checkerboardPrompt.contains("alpha transparency"))
+  }
+
+  func testAvatarKitChromaKeyRemovesMagentaBackground() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveAvatarChroma-\(UUID().uuidString)", isDirectory: true)
+    temporaryRoots.append(root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let sourceURL = root.appendingPathComponent("source.png")
+    let outputURL = root.appendingPathComponent("output.png")
+    let sourceData = try Self.pngFixture(width: 8, height: 8) { x, y in
+      if x == 3 && y == 3 {
+        return (red: 40, green: 40, blue: 40, alpha: 255)
+      }
+      return (red: 255, green: 0, blue: 255, alpha: 255)
+    }
+    try sourceData.write(to: sourceURL)
+
+    try AvatarKitChromaKey.removeDebugBackground(from: sourceURL, to: outputURL)
+
+    let keyedData = try Data(contentsOf: outputURL)
+    let centerAlpha = try Self.pngPixelAlpha(data: keyedData, x: 3, y: 3)
+    let backgroundAlpha = try Self.pngPixelAlpha(data: keyedData, x: 0, y: 0)
+    XCTAssertEqual(centerAlpha, 255)
+    XCTAssertEqual(backgroundAlpha, 0)
+    let keyedImage = try AvatarKitChromaKey.decodeImage(from: outputURL)
+    XCTAssertFalse(AvatarKitChromaKey.containsDebugMagenta(in: keyedImage))
+  }
+
+  func testAvatarKitChromaKeyRemovesMagentaFromJPEG() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveAvatarChromaJPEG-\(UUID().uuidString)", isDirectory: true)
+    temporaryRoots.append(root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let sourceURL = root.appendingPathComponent("source.jpg")
+    let outputURL = root.appendingPathComponent("output.png")
+    let sourceData = try Self.jpegFixture(width: 64, height: 64) { x, y in
+      if x == 32 && y == 32 {
+        return (red: 40, green: 40, blue: 40, alpha: 255)
+      }
+      return (red: 255, green: 0, blue: 255, alpha: 255)
+    }
+    try sourceData.write(to: sourceURL)
+
+    try AvatarKitChromaKey.removeDebugBackground(from: sourceURL, to: outputURL)
+
+    let keyedData = try Data(contentsOf: outputURL)
+    let backgroundAlpha = try Self.pngPixelAlpha(data: keyedData, x: 0, y: 0)
+    XCTAssertEqual(backgroundAlpha, 0)
+  }
+
+  func testAvatarKitChromaKeyFeathersNearMagentaEdge() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveAvatarChromaEdge-\(UUID().uuidString)", isDirectory: true)
+    temporaryRoots.append(root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let sourceURL = root.appendingPathComponent("source.png")
+    let outputURL = root.appendingPathComponent("output.png")
+    let sourceData = try Self.pngFixture(width: 4, height: 4) { _, _ in
+      (red: 255, green: 50, blue: 255, alpha: 255)
+    }
+    try sourceData.write(to: sourceURL)
+
+    try AvatarKitChromaKey.removeDebugBackground(from: sourceURL, to: outputURL)
+
+    let keyedData = try Data(contentsOf: outputURL)
+    let alpha = try Self.pngPixelAlpha(data: keyedData, x: 0, y: 0)
+    XCTAssertLessThan(alpha, 255)
+    XCTAssertGreaterThan(alpha, 0)
+  }
+
+  func testAvatarKitPromptBuilderRejectsEmptyBrief() {
+    XCTAssertThrowsError(try AvatarKitGenerationPrompt.normalizedBrief("   ")) { error in
+      XCTAssertEqual(error as? AvatarKitGenerationError, .emptyCharacterBrief)
+    }
+  }
+
+  func testAvatarKitCanonicalSpritesUseExpectedNamesAndGrid() {
+    let eyes = AvatarKitCanonicalSprites.eyeSprites()
+    let mouths = AvatarKitCanonicalSprites.mouthSprites()
+
+    XCTAssertEqual(eyes.count, 16)
+    XCTAssertEqual(mouths.count, 16)
+    XCTAssertEqual(eyes.map(\.name), AvatarKitCanonicalSprites.eyeNames)
+    XCTAssertEqual(mouths.map(\.name), AvatarKitCanonicalSprites.mouthNames)
+    XCTAssertEqual(eyes[0], AvatarAtlasSprite(frame: 0, row: 0, column: 0, name: "neutral_open"))
+    XCTAssertEqual(eyes[15], AvatarAtlasSprite(frame: 15, row: 3, column: 3, name: "blink_closed"))
+  }
+
+  func testAvatarAtlasInspectionDecodesAndMapsToSlots() throws {
+    let inspection = AvatarAtlasInspection(
+      canvas: .init(width: 512, height: 512),
+      eyesLayer: .init(x: 64, y: 96, width: 384, height: 256),
+      mouthLayer: .init(x: 128, y: 320, width: 256, height: 128),
+      eyesAtlas: .init(columns: 4, rows: 4, frameX: 0, frameY: 0, frameWidth: 256, frameHeight: 256),
+      mouthAtlas: .init(columns: 4, rows: 4, frameX: 0, frameY: 0, frameWidth: 256, frameHeight: 256),
+      confidence: 0.92,
+      notes: nil
+    )
+
+    var slots = AvatarSlot.Kind.allCases.map { AvatarSlot(kind: $0) }
+    inspection.apply(
+      to: &slots,
+      headRelativePath: "avatar/head.png",
+      eyesRelativePath: "avatar/eyes.png",
+      mouthRelativePath: "avatar/mouth.png"
+    )
+
+    let head = try XCTUnwrap(slots.first { $0.kind == .head })
+    let eyes = try XCTUnwrap(slots.first { $0.kind == .eyes })
+    let mouth = try XCTUnwrap(slots.first { $0.kind == .mouth })
+
+    XCTAssertEqual(head.relativePath, "avatar/head.png")
+    XCTAssertFalse(head.usesAtlas)
+    XCTAssertEqual(head.width, 512)
+
+    XCTAssertEqual(eyes.relativePath, "avatar/eyes.png")
+    XCTAssertTrue(eyes.usesAtlas)
+    XCTAssertEqual(eyes.columns, 4)
+    XCTAssertEqual(eyes.rows, 4)
+    XCTAssertEqual(eyes.frames, 16)
+    XCTAssertEqual(eyes.x, 256)
+
+    XCTAssertEqual(mouth.relativePath, "avatar/mouth.png")
+    XCTAssertEqual(mouth.frameWidth, 256)
+  }
+
+  func testAvatarAtlasInspectionRejectsInvalidJSON() {
+    XCTAssertThrowsError(try AvatarAtlasInspection.decode(from: "{")) { error in
+      guard case .invalidInspectionJSON = error as? AvatarKitGenerationError else {
+        return XCTFail("Expected invalidInspectionJSON, got \(error)")
+      }
+    }
+  }
+
+  func testAvatarKitGenerationServiceUsesMocksEndToEnd() async throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveAvatarKit-\(UUID().uuidString)", isDirectory: true)
+    temporaryRoots.append(root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let headData = try Self.pngFixture(width: 512, height: 512) { x, y in
+      if x == 256 && y == 256 {
+        return (red: 220, green: 180, blue: 140, alpha: 255)
+      }
+      return (red: 0, green: 0, blue: 0, alpha: 0)
+    }
+    let atlasData = try Self.pngFixture(width: 1024, height: 1024) { x, y in
+      if x == 512 && y == 512 {
+        return (red: 40, green: 40, blue: 40, alpha: 255)
+      }
+      return (red: 0, green: 0, blue: 0, alpha: 0)
+    }
+
+    let mockImages = AvatarKitMockImageGenerator(
+      responses: [
+        .baseHead: headData,
+        .eyesAtlas: atlasData,
+        .mouthAtlas: atlasData,
+      ]
+    )
+    let mockVision = AvatarKitMockVisionClient(
+      response: """
+      {
+        "canvas": { "width": 512, "height": 512 },
+        "eyesLayer": { "x": 0, "y": 0, "width": 512, "height": 512 },
+        "mouthLayer": { "x": 0, "y": 0, "width": 512, "height": 512 },
+        "eyesAtlas": { "columns": 4, "rows": 4, "frameX": 0, "frameY": 0, "frameWidth": 256, "frameHeight": 256 },
+        "mouthAtlas": { "columns": 4, "rows": 4, "frameX": 0, "frameY": 0, "frameWidth": 256, "frameHeight": 256 },
+        "confidence": 0.95
+      }
+      """
+    )
+
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .google: "test-google-key",
+          .openAI: "test-openai-key",
+        ]
+      }
+    )
+    let service = AvatarKitGenerationService(
+      providerRouter: router,
+      imageGenerator: mockImages,
+      visionClient: mockVision
+    )
+
+    let result = try await service.generateKit(
+      characterBrief: "A friendly robot barista",
+      brainRoot: root
+    ) { _, _ in }
+
+    XCTAssertEqual(result.canvasWidth, 512)
+    XCTAssertEqual(result.eyeSprites.count, 16)
+    XCTAssertEqual(result.neutralEyeName, "neutral_open")
+    XCTAssertTrue(FileManager.default.fileExists(atPath: result.assets.headURL.path))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: result.assets.eyesURL.path))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: result.assets.mouthURL.path))
+    XCTAssertTrue(result.assets.headURL.path.contains("/avatar/generated/"))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("avatar/head.png").path))
+    XCTAssertFalse(result.lowConfidenceLayout)
+    XCTAssertEqual(mockImages.prompts.count, 3)
+    XCTAssertEqual(mockVision.imagePaths.count, 3)
+  }
+
+  func testAvatarKitGenerationServiceRetriesCheckerboardRemovalWhenOpaque() async throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveAvatarKitOpaque-\(UUID().uuidString)", isDirectory: true)
+    temporaryRoots.append(root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let opaqueData = try Self.pngFixture(width: 128, height: 128) { _, _ in
+      (red: 180, green: 180, blue: 180, alpha: 255)
+    }
+    let transparentData = try Self.pngFixture(width: 128, height: 128) { x, y in
+      if x == 64 && y == 64 {
+        return (red: 40, green: 40, blue: 40, alpha: 255)
+      }
+      return (red: 0, green: 0, blue: 0, alpha: 0)
+    }
+
+    let mockImages = AvatarKitRetryMockImageGenerator(
+      opaqueData: opaqueData,
+      transparentData: transparentData
+    )
+    let mockVision = AvatarKitMockVisionClient(
+      response: """
+      {
+        "canvas": { "width": 128, "height": 128 },
+        "eyesLayer": { "x": 0, "y": 0, "width": 128, "height": 128 },
+        "mouthLayer": { "x": 0, "y": 0, "width": 128, "height": 128 },
+        "eyesAtlas": { "columns": 4, "rows": 4, "frameX": 0, "frameY": 0, "frameWidth": 32, "frameHeight": 32 },
+        "mouthAtlas": { "columns": 4, "rows": 4, "frameX": 0, "frameY": 0, "frameWidth": 32, "frameHeight": 32 },
+        "confidence": 0.95
+      }
+      """
+    )
+
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .google: "test-google-key",
+          .openAI: "test-openai-key",
+        ]
+      }
+    )
+    let service = AvatarKitGenerationService(
+      providerRouter: router,
+      imageGenerator: mockImages,
+      visionClient: mockVision
+    )
+
+    _ = try await service.generateKit(
+      characterBrief: "A friendly robot barista",
+      brainRoot: root
+    ) { _, _ in }
+
+    XCTAssertEqual(mockImages.prompts.count, 6)
+    XCTAssertTrue(mockImages.prompts[3].contains("Remove the checkerboard background"))
+    XCTAssertNotNil(mockImages.referencePaths[3])
+  }
+
+  func testAvatarKitImageTransparencyDetectsAlpha() throws {
+    let opaqueData = try Self.pngFixture(width: 16, height: 16) { _, _ in
+      (red: 255, green: 0, blue: 255, alpha: 255)
+    }
+    let transparentData = try Self.pngFixture(width: 16, height: 16) { x, y in
+      if x == 8 && y == 8 {
+        return (red: 40, green: 40, blue: 40, alpha: 255)
+      }
+      return (red: 0, green: 0, blue: 0, alpha: 0)
+    }
+
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveAvatarTransparency-\(UUID().uuidString)", isDirectory: true)
+    temporaryRoots.append(root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let opaqueURL = root.appendingPathComponent("opaque.png")
+    let transparentURL = root.appendingPathComponent("transparent.png")
+    try opaqueData.write(to: opaqueURL)
+    try transparentData.write(to: transparentURL)
+
+    XCTAssertFalse(AvatarKitImageTransparency.hasTransparentPixels(at: opaqueURL))
+    XCTAssertTrue(AvatarKitImageTransparency.hasTransparentPixels(at: transparentURL))
+  }
+
+  func testAvatarKitGenerationServiceStagesOpaqueAssetsWithWarning() async throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveAvatarKitOpaqueStage-\(UUID().uuidString)", isDirectory: true)
+    temporaryRoots.append(root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let opaqueData = try Self.pngFixture(width: 128, height: 128) { _, _ in
+      (red: 180, green: 180, blue: 180, alpha: 255)
+    }
+
+    let mockImages = AvatarKitMockImageGenerator(
+      responses: [
+        .baseHead: opaqueData,
+        .eyesAtlas: opaqueData,
+        .mouthAtlas: opaqueData,
+      ]
+    )
+    let mockVision = AvatarKitMockVisionClient(
+      response: """
+      {
+        "canvas": { "width": 128, "height": 128 },
+        "eyesLayer": { "x": 0, "y": 0, "width": 128, "height": 128 },
+        "mouthLayer": { "x": 0, "y": 0, "width": 128, "height": 128 },
+        "eyesAtlas": { "columns": 4, "rows": 4, "frameX": 0, "frameY": 0, "frameWidth": 32, "frameHeight": 32 },
+        "mouthAtlas": { "columns": 4, "rows": 4, "frameX": 0, "frameY": 0, "frameWidth": 32, "frameHeight": 32 },
+        "confidence": 0.95
+      }
+      """
+    )
+
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .google: "test-google-key",
+          .openAI: "test-openai-key",
+        ]
+      }
+    )
+    let service = AvatarKitGenerationService(
+      providerRouter: router,
+      imageGenerator: mockImages,
+      visionClient: mockVision
+    )
+
+    let result = try await service.generateKit(
+      characterBrief: "A friendly robot barista",
+      brainRoot: root
+    ) { _, _ in }
+
+    XCTAssertTrue(result.lowConfidenceLayout)
+    XCTAssertTrue(result.statusNote?.contains("opaque background") == true)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: result.assets.headURL.path))
+  }
+
+  func testAvatarKitGenerationServiceRegeneratesSingleAsset() async throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveAvatarKitRegenOne-\(UUID().uuidString)", isDirectory: true)
+    temporaryRoots.append(root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let headData = try Self.pngFixture(width: 128, height: 128) { x, y in
+      if x == 64 && y == 64 { return (red: 200, green: 180, blue: 140, alpha: 255) }
+      return (red: 0, green: 0, blue: 0, alpha: 0)
+    }
+    let atlasData = try Self.pngFixture(width: 128, height: 128) { x, y in
+      if x == 64 && y == 64 { return (red: 40, green: 40, blue: 40, alpha: 255) }
+      return (red: 0, green: 0, blue: 0, alpha: 0)
+    }
+    let replacementHead = try Self.pngFixture(width: 128, height: 128) { x, y in
+      if x == 64 && y == 64 { return (red: 20, green: 120, blue: 220, alpha: 255) }
+      return (red: 0, green: 0, blue: 0, alpha: 0)
+    }
+
+    let mockImages = AvatarKitPerKindMockImageGenerator(
+      initial: [
+        .baseHead: headData,
+        .eyesAtlas: atlasData,
+        .mouthAtlas: atlasData,
+      ],
+      replacements: [
+        .baseHead: replacementHead,
+      ]
+    )
+    let mockVision = AvatarKitMockVisionClient(
+      response: """
+      {
+        "canvas": { "width": 128, "height": 128 },
+        "eyesLayer": { "x": 0, "y": 0, "width": 128, "height": 128 },
+        "mouthLayer": { "x": 0, "y": 0, "width": 128, "height": 128 },
+        "eyesAtlas": { "columns": 4, "rows": 4, "frameX": 0, "frameY": 0, "frameWidth": 32, "frameHeight": 32 },
+        "mouthAtlas": { "columns": 4, "rows": 4, "frameX": 0, "frameY": 0, "frameWidth": 32, "frameHeight": 32 },
+        "confidence": 0.95
+      }
+      """
+    )
+
+    let router = HostProviderRouter(
+      credentialProvider: {
+        [
+          .google: "test-google-key",
+          .openAI: "test-openai-key",
+        ]
+      }
+    )
+    let service = AvatarKitGenerationService(
+      providerRouter: router,
+      imageGenerator: mockImages,
+      visionClient: mockVision
+    )
+
+    let initial = try await service.generateKit(
+      characterBrief: "A friendly robot barista",
+      brainRoot: root
+    ) { _, _ in }
+
+    let regenerated = try await service.regenerateAsset(
+      kind: .baseHead,
+      characterBrief: "A friendly robot barista",
+      workingDirectory: initial.assets.headURL.deletingLastPathComponent(),
+      currentAssets: initial.assets
+    ) { _, _ in }
+
+    XCTAssertEqual(mockImages.generationCount(for: .baseHead), 2)
+    XCTAssertEqual(regenerated.assets.headURL, initial.assets.headURL)
+    XCTAssertEqual(initial.assets.eyesURL, regenerated.assets.eyesURL)
+    XCTAssertEqual(initial.assets.mouthURL, regenerated.assets.mouthURL)
+  }
+  #endif
+
   @MainActor
   func testBrainLibrarySavesAvatarManifest() throws {
     let brain = try makeBrain()
@@ -3385,6 +4397,16 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(loaded.canvas.height, 512)
     XCTAssertEqual(loaded.layers.first?.image, "avatar/head.png")
     XCTAssertEqual(library.statusText, "Updated \(brain.displayName)'s layered avatar.")
+  }
+
+  @MainActor
+  func testNewBrainDefaultsLoadsSharedFixture() {
+    XCTAssertEqual(NewBrainDefaults.wantsLines.count, 7)
+    XCTAssertEqual(NewBrainDefaults.goalsLines.count, 4)
+    XCTAssertEqual(NewBrainDefaults.wantsLines.first, "Continue existing.")
+    XCTAssertEqual(NewBrainDefaults.goalsLines.first, "Figure out who I am")
+    XCTAssertEqual(NewBrainDefaults.wantsCards.count, 7)
+    XCTAssertEqual(NewBrainDefaults.goalsCards.first?.text, "Figure out who I am")
   }
 
   @MainActor
@@ -3447,7 +4469,7 @@ final class AffectiveTests: XCTestCase {
     ))
   }
 
-  @MainActor func testAppIntentBridgeFallsBackToLastOpenedBrain() throws {
+  @MainActor func testAppIntentBridgeRequiresExplicitRequestedBrain() throws {
     let defaults = try makeUserDefaults()
     let first = BrainDescriptor(
       id: "first",
@@ -3470,13 +4492,22 @@ final class AffectiveTests: XCTestCase {
 
     defaults.set(second.id, forKey: AffectiveViewModel.lastOpenedBrainIDKey)
 
-    let requested = AffectiveAppIntentBridge.requestedBrain(
+    XCTAssertNil(AffectiveAppIntentBridge.requestedBrain(
       from: [first, second],
       requestedID: nil,
       defaults: defaults
-    )
+    ))
+    XCTAssertNil(AffectiveAppIntentBridge.requestedBrain(
+      from: [first, second],
+      requestedID: "missing",
+      defaults: defaults
+    ))
 
-    XCTAssertEqual(requested, second)
+    XCTAssertEqual(AffectiveAppIntentBridge.requestedBrain(
+      from: [first, second],
+      requestedID: second.id,
+      defaults: defaults
+    ), second)
   }
 
   @MainActor
@@ -3519,37 +4550,32 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
-  func testBrainLibraryImportsSameArchiveWithUniqueUUIDIDs() throws {
+  func testBrainLibraryImportsCoreArchiveWithStableBrainID() async throws {
     let source = try makeBrain()
-    let checkpoint = try BrainCheckpointArchive.createCheckpoint(
-      for: source,
-      schemaVersion: 1,
-      deviceID: "test-device",
-      revision: 1,
-      includeBiometricData: true
-    )
-    defer { try? FileManager.default.removeItem(at: checkpoint.archiveURL.deletingLastPathComponent()) }
+    let archive = try await makeCoreBrainArchive(for: source)
+    defer { try? FileManager.default.removeItem(at: archive.scratchRoot) }
     let library = BrainLibrary()
 
-    let first = try library.importBrainArchive(from: checkpoint.archiveURL)
-    let second = try library.importBrainArchive(from: checkpoint.archiveURL)
+    try FileManager.default.removeItem(at: source.rootURL)
+    library.refresh()
+    let first = try await library.importBrainFileWithCore(from: archive.archiveURL)
     temporaryRoots.append(first.rootURL)
-    temporaryRoots.append(second.rootURL)
 
     XCTAssertEqual(first.displayName, "Test Brain")
-    XCTAssertEqual(second.displayName, "Test Brain")
-    XCTAssertNotEqual(first.id, second.id)
-    XCTAssertNotEqual(first.id, source.id)
-    XCTAssertNotEqual(second.id, source.id)
-    XCTAssertNotNil(UUID(uuidString: first.id))
-    XCTAssertNotNil(UUID(uuidString: second.id))
+    XCTAssertEqual(first.id, source.id)
+    do {
+      _ = try await library.importBrainFileWithCore(from: archive.archiveURL)
+      XCTFail("Expected duplicate Core archive import to fail")
+    } catch {
+      // Expected: Core archives preserve brain identity instead of creating duplicate UUID imports.
+    }
   }
 
   @MainActor
   func testBrainSyncWithoutConfiguredBrainDoesNothing() async throws {
     let brain = try makeBrain()
     let defaults = try makeUserDefaults()
-    let store = FakeBrainCloudCheckpointStore()
+    let store = FakeBrainCloudArchiveStore()
     let manager = BrainSyncManager(store: store, userDefaults: defaults, deviceID: "test-device")
 
     manager.syncOnAppStart(brains: [brain])
@@ -3564,21 +4590,19 @@ final class AffectiveTests: XCTestCase {
   func testCloudImportsOnlyIncludeBrainsMissingLocally() async throws {
     let brain = try makeBrain()
     let defaults = try makeUserDefaults()
-    let store = FakeBrainCloudCheckpointStore()
+    let store = FakeBrainCloudArchiveStore()
     let manager = BrainSyncManager(store: store, userDefaults: defaults, deviceID: "test-device")
     let remoteBrain = try makeBrain(
       profile: #"{"schema_version":1,"display_name":"Remote Brain"}"#,
       displayName: "Remote Brain"
     )
-    let remoteCheckpoint = try BrainCheckpointArchive.createCheckpoint(
+    let remoteArchive = try await makeCoreBrainArchive(
       for: remoteBrain,
-      schemaVersion: 1,
       deviceID: "cloud-device",
-      revision: 1,
-      includeBiometricData: true
+      revision: 1
     )
-    defer { try? FileManager.default.removeItem(at: remoteCheckpoint.archiveURL.deletingLastPathComponent()) }
-    let remoteManifest = remoteCheckpoint.manifest
+    defer { try? FileManager.default.removeItem(at: remoteArchive.scratchRoot) }
+    let remoteManifest = remoteArchive.manifest
     store.manifests[brain.id] = BrainCloudManifest(
       brainID: brain.id,
       displayName: brain.displayName,
@@ -3591,7 +4615,7 @@ final class AffectiveTests: XCTestCase {
       revision: 1
     )
     store.manifests[remoteManifest.brainID] = remoteManifest
-    store.archives[remoteManifest.brainID] = try Data(contentsOf: remoteCheckpoint.archiveURL)
+    store.archives[remoteManifest.brainID] = try Data(contentsOf: remoteArchive.archiveURL)
 
     manager.refreshCloudImports(installedBrains: [brain])
     try await waitForCloudImportCount(1, manager: manager)
@@ -3604,7 +4628,7 @@ final class AffectiveTests: XCTestCase {
   func testCloudImportsAreHiddenWhenNothingIsAvailable() async throws {
     let brain = try makeBrain()
     let defaults = try makeUserDefaults()
-    let store = FakeBrainCloudCheckpointStore()
+    let store = FakeBrainCloudArchiveStore()
     let manager = BrainSyncManager(store: store, userDefaults: defaults, deviceID: "test-device")
     store.manifests[brain.id] = BrainCloudManifest(
       brainID: brain.id,
@@ -3627,7 +4651,7 @@ final class AffectiveTests: XCTestCase {
   @MainActor
   func testCloudImportsReportStillSyncingWhenArchiveIsMissing() async throws {
     let defaults = try makeUserDefaults()
-    let store = FakeBrainCloudCheckpointStore()
+    let store = FakeBrainCloudArchiveStore()
     let manager = BrainSyncManager(store: store, userDefaults: defaults, deviceID: "test-device")
     let manifest = BrainCloudManifest(
       brainID: "syncing-brain",
@@ -3653,14 +4677,14 @@ final class AffectiveTests: XCTestCase {
   @MainActor
   func testCloudImportsReportInvalidWhenArchiveFailsValidation() async throws {
     let defaults = try makeUserDefaults()
-    let store = FakeBrainCloudCheckpointStore()
+    let store = FakeBrainCloudArchiveStore()
     let manager = BrainSyncManager(store: store, userDefaults: defaults, deviceID: "test-device")
-    let archive = Data("not a checkpoint".utf8)
+    let archive = Data("not a archive".utf8)
     let manifest = BrainCloudManifest(
       brainID: "invalid-brain",
       displayName: "Invalid Brain",
       schemaVersion: 1,
-      archiveHash: BrainCheckpointArchive.sha256Hex(archive),
+      archiveHash: BrainCloudArchive.sha256Hex(archive),
       createdAt: Date(),
       modifiedAt: Date(),
       uploadedAt: Date(),
@@ -3683,7 +4707,7 @@ final class AffectiveTests: XCTestCase {
   @MainActor
   func testCloudImportFailureReportsUnderlyingError() async throws {
     let defaults = try makeUserDefaults()
-    let store = FakeBrainCloudCheckpointStore()
+    let store = FakeBrainCloudArchiveStore()
     let manager = BrainSyncManager(store: store, userDefaults: defaults, deviceID: "test-device")
     let library = BrainLibrary()
     let manifest = BrainCloudManifest(
@@ -3701,21 +4725,21 @@ final class AffectiveTests: XCTestCase {
     do {
       _ = try await manager.importCloudBrain(manifest, library: library)
       XCTFail("Expected cloud import to throw")
-    } catch BrainSyncError.missingCheckpoint {
+    } catch BrainSyncError.missingArchive {
       XCTAssertEqual(
-        BrainSyncError.missingCheckpoint.recoverySuggestion,
+        BrainSyncError.missingArchive.recoverySuggestion,
         "Wait for iCloud Drive to finish syncing, then try Import Brain (iCloud) again. If it still is not available, export the brain from the other device and use Import Brain."
       )
     } catch {
-      XCTFail("Expected missing checkpoint error, got \(error)")
+      XCTFail("Expected missing archive error, got \(error)")
     }
   }
 
   @MainActor
-  func testBrainSyncUploadsWhenNoCloudCheckpointExists() async throws {
+  func testBrainSyncUploadsWhenNoCloudArchiveExists() async throws {
     let brain = try makeBrain()
     let defaults = try makeUserDefaults()
-    let store = FakeBrainCloudCheckpointStore()
+    let store = FakeBrainCloudArchiveStore()
     let manager = BrainSyncManager(store: store, userDefaults: defaults, deviceID: "test-device")
 
     manager.selectBrainForSync(brain)
@@ -3730,7 +4754,7 @@ final class AffectiveTests: XCTestCase {
   func testBrainSyncBlocksOpenWhileChecking() async throws {
     let brain = try makeBrain()
     let defaults = try makeUserDefaults()
-    let store = FakeBrainCloudCheckpointStore(loadDelayNanoseconds: 200_000_000)
+    let store = FakeBrainCloudArchiveStore(loadDelayNanoseconds: 200_000_000)
     let manager = BrainSyncManager(store: store, userDefaults: defaults, deviceID: "test-device")
 
     manager.selectBrainForSync(brain)
@@ -3743,7 +4767,7 @@ final class AffectiveTests: XCTestCase {
   func testBrainSyncFailureDoesNotDeleteLocalBrain() async throws {
     let brain = try makeBrain()
     let defaults = try makeUserDefaults()
-    let store = FakeBrainCloudCheckpointStore(error: CocoaError(.fileReadNoSuchFile))
+    let store = FakeBrainCloudArchiveStore(error: CocoaError(.fileReadNoSuchFile))
     let manager = BrainSyncManager(store: store, userDefaults: defaults, deviceID: "test-device")
 
     manager.selectBrainForSync(brain)
@@ -3757,7 +4781,7 @@ final class AffectiveTests: XCTestCase {
   func testBrainSyncDetectsConflictWhenLocalAndCloudChanged() async throws {
     let brain = try makeBrain()
     let defaults = try makeUserDefaults()
-    let store = FakeBrainCloudCheckpointStore()
+    let store = FakeBrainCloudArchiveStore()
     let manager = BrainSyncManager(store: store, userDefaults: defaults, deviceID: "test-device")
 
     manager.selectBrainForSync(brain)
@@ -3765,26 +4789,24 @@ final class AffectiveTests: XCTestCase {
 
     try "local change".write(to: brain.rootURL.appendingPathComponent("local.txt"), atomically: true, encoding: .utf8)
     let cloudBrain = try makeBrain(profile: #"{"schema_version":1,"display_name":"Cloud Brain"}"#)
-    let cloudCheckpoint = try BrainCheckpointArchive.createCheckpoint(
+    let cloudArchive = try await makeCoreBrainArchive(
       for: cloudBrain,
-      schemaVersion: 1,
       deviceID: "cloud-device",
-      revision: 2,
-      includeBiometricData: true
+      revision: 2
     )
-    defer { try? FileManager.default.removeItem(at: cloudCheckpoint.archiveURL.deletingLastPathComponent()) }
+    defer { try? FileManager.default.removeItem(at: cloudArchive.scratchRoot) }
     store.manifests[brain.id] = BrainCloudManifest(
       brainID: brain.id,
       displayName: brain.displayName,
-      schemaVersion: cloudCheckpoint.manifest.schemaVersion,
-      archiveHash: cloudCheckpoint.manifest.archiveHash,
-      createdAt: cloudCheckpoint.manifest.createdAt,
-      modifiedAt: cloudCheckpoint.manifest.modifiedAt,
-      uploadedAt: cloudCheckpoint.manifest.uploadedAt,
-      deviceID: cloudCheckpoint.manifest.deviceID,
+      schemaVersion: cloudArchive.manifest.schemaVersion,
+      archiveHash: cloudArchive.manifest.archiveHash,
+      createdAt: cloudArchive.manifest.createdAt,
+      modifiedAt: cloudArchive.manifest.modifiedAt,
+      uploadedAt: cloudArchive.manifest.uploadedAt,
+      deviceID: cloudArchive.manifest.deviceID,
       revision: 2
     )
-    store.archives[brain.id] = try Data(contentsOf: cloudCheckpoint.archiveURL)
+    store.archives[brain.id] = try Data(contentsOf: cloudArchive.archiveURL)
 
     manager.syncNow(brain)
     try await waitForSyncState(.conflict, manager: manager, brain: brain)
@@ -3792,30 +4814,34 @@ final class AffectiveTests: XCTestCase {
     XCTAssertFalse(manager.canOpen(brain))
   }
 
-  func testBrainCheckpointRestoresNestedFilesAndExcludesSecrets() throws {
+  @MainActor
+  func testBrainArchiveRestoresNestedFilesAndExcludesSecrets() async throws {
     let brain = try makeBrain()
     let nested = brain.rootURL.appendingPathComponent("generated", isDirectory: true)
       .appendingPathComponent("notes", isDirectory: true)
     try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
     try "durable".write(to: nested.appendingPathComponent("one.txt"), atomically: true, encoding: .utf8)
     try "secret".write(to: brain.rootURL.appendingPathComponent("secrets.json"), atomically: true, encoding: .utf8)
+    try "grant".write(to: brain.rootURL.appendingPathComponent("host_permission_grants.json"), atomically: true, encoding: .utf8)
+    try "pairing".write(to: brain.rootURL.appendingPathComponent("host_pairing.json"), atomically: true, encoding: .utf8)
 
-    let checkpoint = try BrainCheckpointArchive.createCheckpoint(
-      for: brain,
-      schemaVersion: 1,
-      deviceID: "test-device",
-      revision: 1,
-      includeBiometricData: true
-    )
-    defer { try? FileManager.default.removeItem(at: checkpoint.archiveURL.deletingLastPathComponent()) }
+    let archive = try await makeCoreBrainArchive(for: brain, includeBiometricData: true)
+    defer { try? FileManager.default.removeItem(at: archive.scratchRoot) }
+    XCTAssertNoThrow(try BrainCloudArchive.validateArchiveData(Data(contentsOf: archive.archiveURL)))
+
+    var tampered = try Data(contentsOf: archive.archiveURL)
+    tampered[0] = 0
+    XCTAssertThrowsError(try BrainCloudArchive.validateArchiveData(tampered))
 
     let restored = FileManager.default.temporaryDirectory
       .appendingPathComponent("AffectiveRestored-\(UUID().uuidString)", isDirectory: true)
     temporaryRoots.append(restored)
-    try BrainCheckpointArchive.restoreCheckpoint(at: checkpoint.archiveURL, to: restored)
+    _ = try await BrainLibrary.importBrainFileWithCore(from: archive.archiveURL, to: restored, expectedBrainID: brain.id)
 
     XCTAssertTrue(FileManager.default.fileExists(atPath: restored.appendingPathComponent("generated/notes/one.txt").path))
     XCTAssertFalse(FileManager.default.fileExists(atPath: restored.appendingPathComponent("secrets.json").path))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: restored.appendingPathComponent("host_permission_grants.json").path))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: restored.appendingPathComponent("host_pairing.json").path))
     XCTAssertNoThrow(try BrainDescriptor(
       id: brain.id,
       displayName: brain.displayName,
@@ -3827,7 +4853,8 @@ final class AffectiveTests: XCTestCase {
     ).validateForCoreConnection())
   }
 
-  func testBrainCheckpointExcludesBiometricsWhenPolicyOptOut() throws {
+  @MainActor
+  func testBrainArchiveExcludesBiometricsWhenPolicyOptOut() async throws {
     let brain = try makeBrain()
     try "template".write(
       to: brain.faceEmbeddingsURL.appendingPathComponent("user.embedding"),
@@ -3841,7 +4868,7 @@ final class AffectiveTests: XCTestCase {
     )
     try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
     {
-      "schema_version": 2,
+      "schema_version": 1,
       "subjects": [
         {
           "subject_id": "person-1",
@@ -3849,33 +4876,25 @@ final class AffectiveTests: XCTestCase {
           "notes": "friend",
           "biometric_records": [{"embedding_id": "emb_1", "quality_score": 0.91}],
           "representative_image_path": "memory/faces/person-1.jpg",
-          "representative_quality_score": 0.91
+          "representative_quality_score": 0.91,
+          "lifecycle": { "created_at": "1", "updated_at": "1" }
         }
       ]
     }
     """)
 
-    let checkpoint = try BrainCheckpointArchive.createCheckpoint(
-      for: brain,
-      schemaVersion: 1,
-      deviceID: "test-device",
-      revision: 1,
-      includeBiometricData: false
-    )
-    defer { try? FileManager.default.removeItem(at: checkpoint.archiveURL.deletingLastPathComponent()) }
+    let archive = try await makeCoreBrainArchive(for: brain, includeBiometricData: false)
+    defer { try? FileManager.default.removeItem(at: archive.scratchRoot) }
+    let restored = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveRestoredNoBiometrics-\(UUID().uuidString)", isDirectory: true)
+    temporaryRoots.append(restored)
+    _ = try await BrainLibrary.importBrainFileWithCore(from: archive.archiveURL, to: restored, expectedBrainID: brain.id)
 
-    let archiveObject = try XCTUnwrap(
-      JSONSerialization.jsonObject(with: Data(contentsOf: checkpoint.archiveURL)) as? [String: Any])
-    XCTAssertEqual(archiveObject["containsBiometricData"] as? Bool, false)
-    let components = try XCTUnwrap(archiveObject["components"] as? [[String: Any]])
-    let paths = Set(components.compactMap { $0["path"] as? String })
+    XCTAssertFalse(FileManager.default.fileExists(atPath: restored.appendingPathComponent("memory/face_embeddings/user.embedding").path))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: restored.appendingPathComponent("memory/biometric_identities.json").path))
+    XCTAssertEqual(try exportManifestContainsBiometricData(in: restored), false)
 
-    XCTAssertFalse(paths.contains("memory/face_embeddings"))
-    XCTAssertFalse(paths.contains("memory/face_embeddings/user.embedding"))
-    XCTAssertFalse(paths.contains("memory/biometric_identities.json"))
-    XCTAssertTrue(paths.contains("export_manifest.json"))
-
-    let peopleData = try XCTUnwrap(archiveComponentData("memory/people.sqlite", in: components))
+    let peopleData = try Data(contentsOf: restored.appendingPathComponent("memory/people.sqlite"))
     let scrubbedDatabaseURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("AffectiveScrubbedPeople-Test-\(UUID().uuidString).sqlite")
     temporaryRoots.append(scrubbedDatabaseURL)
@@ -3892,7 +4911,8 @@ final class AffectiveTests: XCTestCase {
     XCTAssertNil(subject["representative_quality_score"])
   }
 
-  func testBrainCheckpointIncludesBiometricsWhenPolicyOptIn() throws {
+  @MainActor
+  func testBrainArchiveIncludesBiometricsWhenPolicyOptIn() async throws {
     let brain = try makeBrain()
     try "template".write(
       to: brain.faceEmbeddingsURL.appendingPathComponent("user.embedding"),
@@ -3906,39 +4926,32 @@ final class AffectiveTests: XCTestCase {
     )
     try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
     {
-      "schema_version": 2,
+      "schema_version": 1,
       "subjects": [
         {
           "subject_id": "person-1",
           "display_name": "User",
           "biometric_records": [{"embedding_id": "emb_1", "quality_score": 0.91}],
           "representative_image_path": "memory/faces/person-1.jpg",
-          "representative_quality_score": 0.91
+          "representative_quality_score": 0.91,
+          "lifecycle": { "created_at": "1", "updated_at": "1" }
         }
       ]
     }
     """)
 
-    let checkpoint = try BrainCheckpointArchive.createCheckpoint(
-      for: brain,
-      schemaVersion: 1,
-      deviceID: "test-device",
-      revision: 1,
-      includeBiometricData: true
-    )
-    defer { try? FileManager.default.removeItem(at: checkpoint.archiveURL.deletingLastPathComponent()) }
+    let archive = try await makeCoreBrainArchive(for: brain, includeBiometricData: true)
+    defer { try? FileManager.default.removeItem(at: archive.scratchRoot) }
+    let restored = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveRestoredWithBiometrics-\(UUID().uuidString)", isDirectory: true)
+    temporaryRoots.append(restored)
+    _ = try await BrainLibrary.importBrainFileWithCore(from: archive.archiveURL, to: restored, expectedBrainID: brain.id)
 
-    let archiveObject = try XCTUnwrap(
-      JSONSerialization.jsonObject(with: Data(contentsOf: checkpoint.archiveURL)) as? [String: Any])
-    XCTAssertEqual(archiveObject["containsBiometricData"] as? Bool, true)
-    let components = try XCTUnwrap(archiveObject["components"] as? [[String: Any]])
-    let paths = Set(components.compactMap { $0["path"] as? String })
+    XCTAssertTrue(FileManager.default.fileExists(atPath: restored.appendingPathComponent("memory/face_embeddings/user.embedding").path))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: restored.appendingPathComponent("memory/biometric_identities.json").path))
+    XCTAssertEqual(try exportManifestContainsBiometricData(in: restored), true)
 
-    XCTAssertTrue(paths.contains("memory/face_embeddings"))
-    XCTAssertTrue(paths.contains("memory/face_embeddings/user.embedding"))
-    XCTAssertTrue(paths.contains("memory/biometric_identities.json"))
-
-    let peopleData = try XCTUnwrap(archiveComponentData("memory/people.sqlite", in: components))
+    let peopleData = try Data(contentsOf: restored.appendingPathComponent("memory/people.sqlite"))
     let databaseURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("AffectiveIncludedPeople-Test-\(UUID().uuidString).sqlite")
     temporaryRoots.append(databaseURL)
@@ -3953,9 +4966,9 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
-  func testBrainSyncCheckpointUsesSharedBiometricExportToggle() async throws {
+  func testBrainSyncArchiveUsesSharedBiometricExportToggle() async throws {
     let defaults = try makeUserDefaults()
-    let store = FakeBrainCloudCheckpointStore()
+    let store = FakeBrainCloudArchiveStore()
     let excludedBrain = try makeBrain()
     try "template".write(
       to: excludedBrain.faceEmbeddingsURL.appendingPathComponent("excluded.embedding"),
@@ -3963,7 +4976,7 @@ final class AffectiveTests: XCTestCase {
       encoding: .utf8
     )
     try writeCognitiveStore(at: excludedBrain.memoryDatabaseURL, dataJSON: """
-    {"schema_version":2,"subjects":[{"subject_id":"person-1","display_name":"User","biometric_records":[{"embedding_id":"emb_1","quality_score":0.91}],"representative_image_path":"memory/faces/person-1.jpg","representative_quality_score":0.91}]}
+    {"schema_version":1,"subjects":[{"subject_id":"person-1","display_name":"User","biometric_records":[{"embedding_id":"emb_1","quality_score":0.91}],"representative_image_path":"memory/faces/person-1.jpg","representative_quality_score":0.91,"lifecycle":{"created_at":"1","updated_at":"1"}}]}
     """)
 
     let excludedManager = BrainSyncManager(store: store, userDefaults: defaults, deviceID: "test-device")
@@ -3971,10 +4984,9 @@ final class AffectiveTests: XCTestCase {
     try await waitForSyncState(.synced, manager: excludedManager, brain: excludedBrain)
 
     let excludedArchive = try XCTUnwrap(store.archives[excludedBrain.id])
-    let excludedComponents = try archiveComponents(from: excludedArchive)
-    let excludedPaths = Set(excludedComponents.compactMap { $0["path"] as? String })
-    XCTAssertFalse(excludedPaths.contains("memory/face_embeddings/excluded.embedding"))
-    XCTAssertEqual(try archiveContainsBiometricData(excludedArchive), false)
+    let excludedRestored = try await restoreCoreArchiveData(excludedArchive, brainID: excludedBrain.id)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: excludedRestored.appendingPathComponent("memory/face_embeddings/excluded.embedding").path))
+    XCTAssertEqual(try exportManifestContainsBiometricData(in: excludedRestored), false)
 
     let includedBrain = try makeBrain()
     try "template".write(
@@ -3993,10 +5005,9 @@ final class AffectiveTests: XCTestCase {
     try await waitForSyncState(.synced, manager: includedManager, brain: includedBrain)
 
     let includedArchive = try XCTUnwrap(store.archives[includedBrain.id])
-    let includedComponents = try archiveComponents(from: includedArchive)
-    let includedPaths = Set(includedComponents.compactMap { $0["path"] as? String })
-    XCTAssertTrue(includedPaths.contains("memory/face_embeddings/included.embedding"))
-    XCTAssertEqual(try archiveContainsBiometricData(includedArchive), true)
+    let includedRestored = try await restoreCoreArchiveData(includedArchive, brainID: includedBrain.id)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: includedRestored.appendingPathComponent("memory/face_embeddings/included.embedding").path))
+    XCTAssertEqual(try exportManifestContainsBiometricData(in: includedRestored), true)
   }
 
   func testBrainStatsJournalRecordsDailySizeSnapshots() throws {
@@ -4056,106 +5067,25 @@ final class AffectiveTests: XCTestCase {
     XCTAssertThrowsError(try BrainStatsJournal.load(from: brain.statsJournalURL))
   }
 
-  func testDreamReportCollectorParsesCognitiveStoreDreamsAndArtifacts() throws {
-    let brain = try makeBrain(events: dreamImageEventJSONL())
-    try writeCognitiveStore(
-      at: brain.memoryDatabaseURL,
-      dataJSON: cognitiveFixtureJSON(dreamID: "dream_1", artifactPath: "generated/images/dream.png")
-    )
+  func testVisibleMailboxItemsArchivedFilterOnlyShowsArchivedReports() throws {
+    let inbox = mailboxItem(sourceDreamID: "inbox", dayKey: "2026-06-25", isArchived: false)
+    let archived = mailboxItem(sourceDreamID: "archived", dayKey: "2026-06-24", isArchived: true)
 
-    let drafts = try DreamReportCollector.loadDrafts(brain: brain)
-
-    XCTAssertEqual(drafts.count, 1)
-    let draft = try XCTUnwrap(drafts.first)
-    XCTAssertEqual(draft.dreamID, "dream_1")
-    XCTAssertEqual(draft.imagePath, "generated/images/dream.png")
-    XCTAssertEqual(draft.imageMimeType, "image/png")
-    XCTAssertEqual(draft.imagePrompt, "Create a quiet symbolic dream image.")
-    XCTAssertEqual(draft.style, "associative_synthesis")
-    XCTAssertEqual(try XCTUnwrap(draft.confidence), DreamReportCollector.confidence(forHeat: 0.5), accuracy: 0.0001)
-  }
-
-  func testDreamEventReaderRecoversPromptByImagePath() throws {
-    let brain = try makeBrain(events: dreamImageEventJSONL())
-
-    let events = try DreamEventReader.loadDreamImageEvents(from: brain.eventsURL)
-
-    let event = try XCTUnwrap(events["generated/images/dream.png"])
-    XCTAssertEqual(event.prompt, "Create a quiet symbolic dream image.")
-  }
-
-  func testDreamReportCollectionDedupesByDayAndDreamID() async throws {
-    let brain = try makeBrain(events: dreamImageEventJSONL())
-    try writeCognitiveStore(
-      at: brain.memoryDatabaseURL,
-      dataJSON: cognitiveFixtureJSON(dreamID: "dream_1", artifactPath: "generated/images/dream.png")
-    )
-    let existing = DreamReportJournal(reports: [
-      DreamReportCollector.report(
-        from: DreamReportDraft(
-          dreamID: "dream_1",
-          dayKey: "2026-06-25",
-          createdAt: try XCTUnwrap(DreamReportDateFormatter.date(from: "2026-06-25T22:30:00Z")),
-          reflection: "existing",
-          heat: 0.5,
-          style: "associative_synthesis",
-          confidence: 0.575,
-          sourceTraceIDs: ["trace_1"],
-          generatedArtifactID: "artifact_dream_1",
-          imagePath: "generated/images/dream.png",
-          imageMimeType: "image/png",
-          imagePrompt: "Create a quiet symbolic dream image."
-        ),
-        summary: .init(text: "Existing report.", source: "fallback")
-      )
-    ])
-
-    let updated = try await DreamReportCollector.collect(
-      brain: brain,
-      existing: existing,
-      summaryProvider: FailingDreamReportSummaryProvider()
-    )
-
-    XCTAssertEqual(updated.reports.count, 1)
-    XCTAssertEqual(updated.reports.first?.summary, "Existing report.")
-  }
-
-  func testDreamReportCollectionDedupesDuplicateDreamsInSingleScan() async throws {
-    let brain = try makeBrain(events: dreamImageEventJSONL())
-    try writeCognitiveStore(
-      at: brain.memoryDatabaseURL,
-      dataJSON: duplicateDreamsFixtureJSON(dreamID: "dream_1", artifactPath: "generated/images/dream.png")
-    )
-
-    let updated = try await DreamReportCollector.collect(
-      brain: brain,
-      existing: DreamReportJournal(),
-      summaryProvider: FailingDreamReportSummaryProvider()
-    )
-
-    XCTAssertEqual(updated.reports.count, 1)
-    XCTAssertEqual(updated.reports.first?.dreamID, "dream_1")
-  }
-
-  func testVisibleDreamReportsArchivedFilterOnlyShowsArchivedReports() throws {
-    let inbox = dreamReport(dreamID: "inbox", dayKey: "2026-06-25", isArchived: false)
-    let archived = dreamReport(dreamID: "archived", dayKey: "2026-06-24", isArchived: true)
-
-    XCTAssertTrue(AffectiveViewModel.isDreamReportVisible(inbox, showsArchived: false))
-    XCTAssertFalse(AffectiveViewModel.isDreamReportVisible(archived, showsArchived: false))
-    XCTAssertFalse(AffectiveViewModel.isDreamReportVisible(inbox, showsArchived: true))
-    XCTAssertTrue(AffectiveViewModel.isDreamReportVisible(archived, showsArchived: true))
+    XCTAssertTrue(AffectiveViewModel.isMailboxItemVisible(inbox, showsArchived: false))
+    XCTAssertFalse(AffectiveViewModel.isMailboxItemVisible(archived, showsArchived: false))
+    XCTAssertFalse(AffectiveViewModel.isMailboxItemVisible(inbox, showsArchived: true))
+    XCTAssertTrue(AffectiveViewModel.isMailboxItemVisible(archived, showsArchived: true))
   }
 
   @MainActor
-  func testDreamReportMergePreservesCurrentReadAndArchiveState() throws {
-    let staleScanned = dreamReport(dreamID: "dream_1", dayKey: "2026-06-25", isRead: false, isArchived: false)
-    let current = dreamReport(dreamID: "dream_1", dayKey: "2026-06-25", isRead: true, isArchived: true)
-    let newScanned = dreamReport(dreamID: "dream_2", dayKey: "2026-06-26", isRead: false, isArchived: false)
+  func testMailboxItemMergePreservesCurrentReadAndArchiveState() throws {
+    let staleScanned = mailboxItem(sourceDreamID: "dream_1", dayKey: "2026-06-25", isRead: false, isArchived: false)
+    let current = mailboxItem(sourceDreamID: "dream_1", dayKey: "2026-06-25", isRead: true, isArchived: true)
+    let newScanned = mailboxItem(sourceDreamID: "dream_2", dayKey: "2026-06-26", isRead: false, isArchived: false)
 
-    let merged = AffectiveViewModel.mergedDreamReports(scanned: [staleScanned, newScanned], current: [current])
-    let dreamOne = try XCTUnwrap(merged.first { $0.dreamID == "dream_1" })
-    let dreamTwo = try XCTUnwrap(merged.first { $0.dreamID == "dream_2" })
+    let merged = AffectiveViewModel.mergedMailboxItems(scanned: [staleScanned, newScanned], current: [current])
+    let dreamOne = try XCTUnwrap(merged.first { $0.sourceDreamID == "dream_1" })
+    let dreamTwo = try XCTUnwrap(merged.first { $0.sourceDreamID == "dream_2" })
 
     XCTAssertTrue(dreamOne.isRead)
     XCTAssertTrue(dreamOne.isArchived)
@@ -4163,48 +5093,26 @@ final class AffectiveTests: XCTestCase {
     XCTAssertFalse(dreamTwo.isArchived)
   }
 
-  func testDreamReportJournalPersistsReadAndArchiveState() throws {
+  func testMailboxUIStateJournalPersistsReadAndArchiveState() throws {
     let brain = try makeBrain()
-    var report = DreamReportCollector.report(
-      from: DreamReportDraft(
-        dreamID: "dream_1",
-        dayKey: "2026-06-25",
-        createdAt: Date(timeIntervalSince1970: 1_782_437_400),
-        reflection: "A memory linked to a summary.",
-        heat: 0.5,
-        style: "associative_synthesis",
-        confidence: 0.575,
-        sourceTraceIDs: ["trace_1"],
-        generatedArtifactID: "artifact_dream_1",
-        imagePath: "generated/images/dream.png",
-        imageMimeType: "image/png",
-        imagePrompt: "Create a quiet symbolic dream image."
-      ),
-      summary: .init(text: "A dream linked memory and summary.", source: "fallback")
-    )
-    report.isRead = true
-    report.isArchived = true
+    let journal = MailboxUIStateJournal(items: [
+      MailboxUIState(mailboxID: "mail_dream_1", isRead: true, isArchived: true)
+    ])
 
-    try DreamReportJournal(reports: [report]).write(to: brain.dreamReportsURL)
-    let restored = DreamReportJournal.load(from: brain.dreamReportsURL)
+    try journal.write(to: brain.mailboxUIStateURL)
+    let restored = MailboxUIStateJournal.load(from: brain.mailboxUIStateURL)
 
-    XCTAssertEqual(restored.reports.first?.isRead, true)
-    XCTAssertEqual(restored.reports.first?.isArchived, true)
+    XCTAssertEqual(restored.items, journal.items)
   }
 
-  func testForgetTodayPrunesTodaysExperienceButKeepsOlderRecords() throws {
+  func testForgetTodayClearsLocalMailboxUIStateAndBacksUpBrain() throws {
     let brain = try makeBrain()
     let today = "2026-06-25"
     let yesterday = "2026-06-24"
 
-    try """
-    {"event_id":"today","time":"\(today)T15:30:00Z","title":"conversation","body":"bad turn"}
-    {"event_id":"older","time":"\(yesterday)T15:30:00Z","title":"conversation","body":"keep me"}
-    """.write(to: brain.eventsURL, atomically: true, encoding: .utf8)
-
     try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
     {
-      "schema_version": 2,
+      "schema_version": 1,
       "traces": [
         { "trace_id": "today_trace", "created_at": "\(today)T15:30:00Z", "text": "bad turn" },
         { "trace_id": "older_touched_trace", "created_at": "\(yesterday)T15:30:00Z", "updated_at": "\(today)T15:45:00Z", "text": "forget me too" },
@@ -4221,309 +5129,126 @@ final class AffectiveTests: XCTestCase {
     }
     """)
 
-    try DreamReportJournal(reports: [
-      dreamReport(dreamID: "today-dream", dayKey: today),
-      dreamReport(dreamID: "older-dream", dayKey: yesterday),
-    ]).write(to: brain.dreamReportsURL)
+    try MailboxUIStateJournal(items: [
+      MailboxUIState(mailboxID: "mail_today", isRead: true, isArchived: false),
+      MailboxUIState(mailboxID: "mail_older", isRead: false, isArchived: true),
+    ]).write(to: brain.mailboxUIStateURL)
 
-    let now = try XCTUnwrap(DreamReportDateFormatter.date(from: "\(today)T18:00:00Z"))
+    let now = try XCTUnwrap(MailboxItemDateFormatter.date(from: "\(today)T18:00:00Z"))
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(secondsFromGMT: 0)!
 
     let result = try BrainExperienceForgetter.forgetToday(in: brain, now: now, calendar: calendar)
 
-    XCTAssertEqual(result.removedEventCount, 1)
-    XCTAssertEqual(result.removedCognitiveItemCount, 4)
-    XCTAssertEqual(result.markedCognitiveItemCount, 2)
-    XCTAssertEqual(result.removedDreamReportCount, 1)
+    XCTAssertEqual(result.clearedMailboxUIStateCount, 2)
     XCTAssertNotNil(result.backupURL)
 
-    let events = try String(contentsOf: brain.eventsURL, encoding: .utf8)
-    XCTAssertFalse(events.contains("\"event_id\":\"today\""))
-    XCTAssertTrue(events.contains("\"event_id\":\"older\""))
-
-    let cognitiveJSON = try XCTUnwrap(CognitiveStoreReader.readCognitiveJSON(from: brain.memoryDatabaseURL))
-    XCTAssertFalse(cognitiveJSON.contains("today_trace"))
-    XCTAssertFalse(cognitiveJSON.contains("today_artifact"))
-    XCTAssertFalse(cognitiveJSON.contains("older_touched_trace"))
-    XCTAssertFalse(cognitiveJSON.contains("older_touched_artifact"))
+    let cognitiveJSON = try XCTUnwrap(readCognitiveJSON(from: brain.memoryDatabaseURL))
+    XCTAssertTrue(cognitiveJSON.contains("today_trace"))
+    XCTAssertTrue(cognitiveJSON.contains("today_artifact"))
+    XCTAssertTrue(cognitiveJSON.contains("older_touched_trace"))
+    XCTAssertTrue(cognitiveJSON.contains("older_touched_artifact"))
     XCTAssertTrue(cognitiveJSON.contains("older_untouched_trace"))
     XCTAssertTrue(cognitiveJSON.contains("older_untouched_artifact"))
-    XCTAssertTrue(cognitiveJSON.contains(#""status" : "pending_deletion""#))
-    XCTAssertTrue(cognitiveJSON.contains(#""pending_deletion_source" : "forget_today""#))
 
-    let reports = DreamReportJournal.load(from: brain.dreamReportsURL)
-    XCTAssertEqual(reports.reports.map(\.dreamID), ["older-dream"])
+    let mailboxUIState = MailboxUIStateJournal.load(from: brain.mailboxUIStateURL)
+    XCTAssertEqual(mailboxUIState.items, [])
 
     let backupURL = try XCTUnwrap(result.backupURL)
-    XCTAssertTrue(FileManager.default.fileExists(atPath: backupURL.appendingPathComponent("events.jsonl").path))
     XCTAssertTrue(FileManager.default.fileExists(atPath: backupURL.appendingPathComponent("memory/people.sqlite").path))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: backupURL.appendingPathComponent("mailbox_ui_state.json").path))
   }
 
-  func testDailyCompactionMarksUnreferencedItemsThenDeletesThemOnNextDream() throws {
-    let brain = try makeBrain()
-    try DreamReportJournal().write(to: brain.dreamReportsURL)
-    try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
-    {
-      "schema_version": 2,
-      "traces": [
-        { "trace_id": "orphan_trace", "created_at": "2026-06-24T15:30:00Z" },
-        { "trace_id": "referenced_trace", "created_at": "2026-06-24T15:30:00Z" }
-      ],
-      "beliefs": [],
-      "subjects": [],
-      "artifacts": [],
-      "dreams": [
-        { "dream_id": "dream_1", "selected_trace_ids": ["referenced_trace"], "created_at": "2026-06-25T22:00:00Z" }
-      ]
-    }
-    """)
-
-    var calendar = Calendar(identifier: .gregorian)
-    calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-    let firstDream = try XCTUnwrap(DreamReportDateFormatter.date(from: "2026-06-25T22:30:00Z"))
-    let secondDream = try XCTUnwrap(DreamReportDateFormatter.date(from: "2026-06-26T22:30:00Z"))
-    let dailyBackupContainer = FileManager.default.temporaryDirectory
-      .appendingPathComponent("Affective-DailyMemoryCompactionBackups", isDirectory: true)
-      .appendingPathComponent(brain.id, isDirectory: true)
-    temporaryRoots.append(dailyBackupContainer)
-
-    let first = try BrainCognitiveCompactor.compactAfterDailyDream(in: brain, now: firstDream, calendar: calendar)
-    XCTAssertEqual(first.markedCount, 2)
-    XCTAssertEqual(first.removedCount, 0)
-    let backupChildren = try FileManager.default.contentsOfDirectory(at: dailyBackupContainer, includingPropertiesForKeys: nil)
-    let firstBackup = try XCTUnwrap(backupChildren.first)
-    XCTAssertTrue(FileManager.default.fileExists(atPath: firstBackup.appendingPathComponent("events.jsonl").path))
-    XCTAssertTrue(FileManager.default.fileExists(atPath: firstBackup.appendingPathComponent("dream_reports.json").path))
-    XCTAssertTrue(FileManager.default.fileExists(atPath: firstBackup.appendingPathComponent("memory/people.sqlite").path))
-    var cognitiveJSON = try XCTUnwrap(CognitiveStoreReader.readCognitiveJSON(from: brain.memoryDatabaseURL))
-    XCTAssertTrue(cognitiveJSON.contains("orphan_trace"))
-    XCTAssertTrue(cognitiveJSON.contains("dream_1"))
-    XCTAssertTrue(cognitiveJSON.contains(#""pending_deletion_source" : "daily_dream""#))
-    XCTAssertTrue(cognitiveJSON.contains("referenced_trace"))
-
-    let second = try BrainCognitiveCompactor.compactAfterDailyDream(in: brain, now: secondDream, calendar: calendar)
-    XCTAssertEqual(second.removedCount, 2)
-    cognitiveJSON = try XCTUnwrap(CognitiveStoreReader.readCognitiveJSON(from: brain.memoryDatabaseURL))
-    XCTAssertFalse(cognitiveJSON.contains("orphan_trace"))
-    XCTAssertFalse(cognitiveJSON.contains("dream_1"))
-    XCTAssertTrue(cognitiveJSON.contains("referenced_trace"))
-  }
-
-  func testDailyCompactionRestoresPendingItemWhenReferencedAgain() throws {
+  @MainActor
+  func testBrainKnowledgeReaderLoadsStoredMemoriesAndFiltersSearch() throws {
     let brain = try makeBrain()
     try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
     {
-      "schema_version": 2,
-      "traces": [
+      "schema_version": 1,
+      "events": [
         {
-          "trace_id": "recovered_trace",
-          "created_at": "2026-06-24T15:30:00Z",
-          "lifecycle": {
-            "status": "pending_deletion",
-            "pending_deletion_at": "2026-06-25T22:30:00Z",
-            "pending_deletion_reason": "unreferenced",
-            "pending_deletion_source": "daily_dream"
-          }
+          "id": "event_memory_recall",
+          "timestamp_ms": 1782605136000,
+          "source": "memory",
+          "kind": "Memory.MemoryRecalled",
+          "payload": "query=Zelda enrollment"
+        },
+        {
+          "id": "event_unrelated",
+          "timestamp_ms": 1782605137000,
+          "source": "host",
+          "kind": "Host.Attached",
+          "payload": "platform=macOS"
         }
       ],
+      "memories": [
+        {
+          "memory_id": "memory_zelda",
+          "status": "active",
+          "scope": "long_term",
+          "text": "Zelda enrolled successfully.",
+          "interpretation": "identity memory",
+          "tags": ["identity"],
+          "created_at": "1782605136",
+          "access_count": 1
+        }
+      ],
+      "dream_time_records": [
+        {
+          "dream_id": "dream_1",
+          "title": "Rain workshop dream",
+          "text": "A dream about Zelda and rain.",
+          "created_at_ms": 1782605138000
+        }
+      ],
+      "appraisals": [],
+      "impressions": [],
       "beliefs": [],
       "subjects": [],
       "artifacts": [],
-      "dreams": [
-        { "dream_id": "dream_2", "selected_trace_ids": ["recovered_trace"], "created_at": "2026-06-26T22:00:00Z" }
-      ]
+      "dreams": []
     }
     """)
 
-    var calendar = Calendar(identifier: .gregorian)
-    calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-    let nextDream = try XCTUnwrap(DreamReportDateFormatter.date(from: "2026-06-26T22:30:00Z"))
+    let entries = try BrainKnowledgeReader.loadEntries(from: brain)
+    XCTAssertTrue(entries.contains { $0.metadata["memory_id"] == "memory_zelda" })
+    XCTAssertTrue(entries.contains { $0.metadata["event_id"] == "event_memory_recall" })
+    XCTAssertFalse(entries.contains { $0.metadata["event_id"] == "event_unrelated" })
 
-    let result = try BrainCognitiveCompactor.compactAfterDailyDream(in: brain, now: nextDream, calendar: calendar)
+    let model = AffectiveViewModel(brain: brain)
+    model.refreshKnowledgeEntries()
+    XCTAssertEqual(model.filteredKnowledgeEntries.count, entries.count)
 
-    XCTAssertEqual(result.restoredCount, 1)
-    XCTAssertEqual(result.removedCount, 0)
-    let cognitiveJSON = try XCTUnwrap(CognitiveStoreReader.readCognitiveJSON(from: brain.memoryDatabaseURL))
-    XCTAssertTrue(cognitiveJSON.contains("recovered_trace"))
-    let data = try XCTUnwrap(cognitiveJSON.data(using: .utf8))
-    let root = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-    let traces = try XCTUnwrap(root["traces"] as? [[String: Any]])
-    let recoveredTrace = try XCTUnwrap(traces.first { $0["trace_id"] as? String == "recovered_trace" })
-    let lifecycle = try XCTUnwrap(recoveredTrace["lifecycle"] as? [String: Any])
-    XCTAssertNil(lifecycle["pending_deletion_at"])
-    XCTAssertEqual(lifecycle["status"] as? String, "active")
-  }
-
-  func testDreamReportProviderSummarizerOffersOnlyConfiguredProvidersToRandomPicker() async throws {
-    var offeredRoutes: [HostLLMCompletionProvider] = []
-    let summarizer = DreamReportProviderSummarizer(
-      credentialProvider: {
-        [
-          .openAI: " openai-key ",
-          .anthropic: "   ",
-          .google: "google-key",
-        ]
-      },
-      textRoutePicker: { routes in
-        offeredRoutes = routes
-        return nil
-      }
-    )
-
-    do {
-      _ = try await summarizer.summarize(dreamReportDraft())
-      XCTFail("Summarizer should fail when the picker declines all configured providers.")
-    } catch DreamReportSummaryError.missingProviderCredential {
-      XCTAssertEqual(offeredRoutes.filter { $0 != .appleFoundationModels }, [.credential(.openAI), .credential(.google)])
-    }
-  }
-
-  func testDreamReportProviderSummarizerUsesRandomlySelectedProvider() async throws {
-    var requestedURL: URL?
-    var requestedBody: [String: Any] = [:]
-    let summarizer = DreamReportProviderSummarizer(
-      credentialProvider: {
-        [
-          .openAI: "openai-key",
-          .anthropic: "anthropic-key",
-          .google: "google-key",
-        ]
-      },
-      textRoutePicker: { routes in
-        XCTAssertTrue(routes.contains(.credential(.openAI)))
-        XCTAssertTrue(routes.contains(.credential(.anthropic)))
-        XCTAssertTrue(routes.contains(.credential(.google)))
-        return .credential(.google)
-      },
-      jsonLoader: { request in
-        requestedURL = request.url
-        if let body = request.httpBody {
-          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
-        }
-        return [
-          "candidates": [
-            [
-              "content": [
-                "parts": [
-                  ["text": "  A generated dream summary.  "]
-                ]
-              ]
-            ]
-          ]
-        ]
-      }
-    )
-
-    let summary = try await summarizer.summarize(dreamReportDraft())
-
-    XCTAssertEqual(summary, DreamReportSummaryResult(text: "A generated dream summary.", source: "google"))
-    XCTAssertEqual(requestedURL?.host, "generativelanguage.googleapis.com")
-    XCTAssertEqual(URLComponents(url: try XCTUnwrap(requestedURL), resolvingAgainstBaseURL: false)?
-      .queryItems?.first { $0.name == "key" }?.value, "google-key")
-    XCTAssertNotNil(requestedBody["contents"])
-  }
-
-  func testDreamReportSummaryFallsBackWhenProviderFails() async throws {
-    let brain = try makeBrain(events: dreamImageEventJSONL())
-    try writeCognitiveStore(
-      at: brain.memoryDatabaseURL,
-      dataJSON: cognitiveFixtureJSON(dreamID: "dream_1", artifactPath: "generated/images/dream.png")
-    )
-
-    let updated = try await DreamReportCollector.collect(
-      brain: brain,
-      existing: DreamReportJournal(),
-      summaryProvider: FailingDreamReportSummaryProvider()
-    )
-
-    let report = try XCTUnwrap(updated.reports.first)
-    XCTAssertEqual(report.summarySource, "fallback")
-    XCTAssertTrue(report.summary.contains("0.50"))
-    XCTAssertTrue(report.summary.contains("source trace"))
+    model.knowledgeSearchText = "Zelda"
+    let filtered = model.filteredKnowledgeEntries
+    XCTAssertTrue(filtered.contains { $0.metadata["memory_id"] == "memory_zelda" })
+    XCTAssertTrue(filtered.contains { $0.metadata["event_id"] == "event_memory_recall" })
+    XCTAssertTrue(filtered.contains { $0.metadata["dream_id"] == "dream_1" })
   }
 
   func testDreamLoadCheckRequestsDreamWhenNoDreamExists() throws {
-    let brain = try makeBrain()
-    let now = try XCTUnwrap(DreamReportDateFormatter.date(from: "2026-06-25T22:30:00Z"))
+    let now = try XCTUnwrap(MailboxItemDateFormatter.date(from: "2026-06-25T22:30:00Z"))
 
-    XCTAssertTrue(DreamReportCollector.shouldEnterDreamOnLoad(
-      brain: brain,
-      journal: DreamReportJournal(),
-      now: now
-    ))
+    XCTAssertTrue(AffectiveViewModel.shouldRequestDreamTimeFromMailbox([], now: now))
   }
 
-  func testDreamLoadCheckSkipsRecentDreamReport() throws {
-    let brain = try makeBrain()
-    let now = try XCTUnwrap(DreamReportDateFormatter.date(from: "2026-06-25T22:30:00Z"))
-    let reportDate = try XCTUnwrap(DreamReportDateFormatter.date(from: "2026-06-24T23:30:00Z"))
-    let report = DreamReportCollector.report(
-      from: DreamReportDraft(
-        dreamID: "dream_recent",
-        dayKey: "2026-06-24",
-        createdAt: reportDate,
-        reflection: "A recent report exists.",
-        heat: 0.4,
-        style: "associative_synthesis",
-        confidence: 0.63,
-        sourceTraceIDs: [],
-        generatedArtifactID: nil,
-        imagePath: nil,
-        imageMimeType: nil,
-        imagePrompt: nil
-      ),
-      summary: .init(text: "Recent dream.", source: "fallback")
-    )
+  func testDreamLoadCheckSkipsRecentMailboxDream() throws {
+    let now = try XCTUnwrap(MailboxItemDateFormatter.date(from: "2026-06-25T22:30:00Z"))
+    let reportDate = try XCTUnwrap(MailboxItemDateFormatter.date(from: "2026-06-24T23:30:00Z"))
+    let item = mailboxItem(sourceDreamID: "dream_recent", dayKey: "2026-06-24", createdAt: reportDate)
 
-    XCTAssertFalse(DreamReportCollector.shouldEnterDreamOnLoad(
-      brain: brain,
-      journal: DreamReportJournal(reports: [report]),
-      now: now
-    ))
+    XCTAssertFalse(AffectiveViewModel.shouldRequestDreamTimeFromMailbox([item], now: now))
   }
 
-  func testDreamLoadCheckSkipsRecentCognitiveDreamBeforeReportCollection() throws {
-    let brain = try makeBrain(events: dreamImageEventJSONL())
-    try writeCognitiveStore(
-      at: brain.memoryDatabaseURL,
-      dataJSON: cognitiveFixtureJSON(
-        dreamID: "dream_recent",
-        artifactPath: "generated/images/dream.png",
-        createdAt: "2026-06-24T23:30:00Z"
-      )
-    )
-    let now = try XCTUnwrap(DreamReportDateFormatter.date(from: "2026-06-25T22:30:00Z"))
+  func testDreamLoadCheckRequestsDreamWhenLatestMailboxDreamIsAtLeastTwentyFourHoursOld() throws {
+    let now = try XCTUnwrap(MailboxItemDateFormatter.date(from: "2026-06-25T22:30:00Z"))
+    let item = mailboxItem(sourceDreamID: "dream_old", dayKey: "2026-06-24")
 
-    XCTAssertFalse(DreamReportCollector.shouldEnterDreamOnLoad(
-      brain: brain,
-      journal: DreamReportJournal(),
-      now: now
-    ))
-  }
-
-  func testDreamLoadCheckRequestsDreamWhenLatestDreamIsAtLeastTwentyFourHoursOld() throws {
-    let brain = try makeBrain(events: dreamImageEventJSONL())
-    try writeCognitiveStore(
-      at: brain.memoryDatabaseURL,
-      dataJSON: cognitiveFixtureJSON(
-        dreamID: "dream_old",
-        artifactPath: "generated/images/dream.png",
-        createdAt: "2026-06-24T22:30:00Z"
-      )
-    )
-    let now = try XCTUnwrap(DreamReportDateFormatter.date(from: "2026-06-25T22:30:00Z"))
-
-    XCTAssertTrue(DreamReportCollector.shouldEnterDreamOnLoad(
-      brain: brain,
-      journal: DreamReportJournal(),
-      now: now
-    ))
+    XCTAssertTrue(AffectiveViewModel.shouldRequestDreamTimeFromMailbox([item], now: now))
   }
 
   private func makeBrain(
     profile: String = #"{"schema_version":1,"display_name":"Test Brain"}"#,
-    events: String = "",
     runtimeOptions: String = "{}",
     displayName: String = "Test Brain"
   ) throws -> BrainDescriptor {
@@ -4536,8 +5261,6 @@ final class AffectiveTests: XCTestCase {
     try FileManager.default.createDirectory(at: faceEmbeddings, withIntermediateDirectories: true)
     try profile.write(
       to: root.appendingPathComponent("brain_profile.json"), atomically: true, encoding: .utf8)
-    try events.write(
-      to: root.appendingPathComponent("events.jsonl"), atomically: true, encoding: .utf8)
     try "Maintenance".write(
       to: root.appendingPathComponent("maintenance.md"), atomically: true, encoding: .utf8)
     try runtimeOptions.write(
@@ -4639,6 +5362,68 @@ final class AffectiveTests: XCTestCase {
     #endif
   }
 
+  private static func jpegFixture(
+    width: Int,
+    height: Int,
+    pixel: (Int, Int) -> (red: UInt8, green: UInt8, blue: UInt8, alpha: UInt8)
+  ) throws -> Data {
+    let pngData = try pngFixture(width: width, height: height, pixel: pixel)
+    guard let source = CGImageSourceCreateWithData(pngData as CFData, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+      throw CameraCaptureError.invalidImageData
+    }
+    let data = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(
+      data,
+      "public.jpeg" as CFString,
+      1,
+      [kCGImageDestinationLossyCompressionQuality: 0.95] as CFDictionary
+    ) else {
+      throw CameraCaptureError.invalidImageData
+    }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else {
+      throw CameraCaptureError.invalidImageData
+    }
+    return data as Data
+  }
+
+  private static func pngPixelAlpha(data: Data, x: Int, y: Int) throws -> UInt8 {
+    #if canImport(ImageIO)
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+      throw CameraCaptureError.invalidImageData
+    }
+    let width = image.width
+    let height = image.height
+    guard x >= 0, y >= 0, x < width, y < height else {
+      throw CameraCaptureError.invalidImageData
+    }
+
+    let bytesPerPixel = 4
+    let bytesPerRow = width * bytesPerPixel
+    var pixels = [UInt8](repeating: 0, count: height * bytesPerRow)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+    guard let context = CGContext(
+      data: &pixels,
+      width: width,
+      height: height,
+      bitsPerComponent: 8,
+      bytesPerRow: bytesPerRow,
+      space: colorSpace,
+      bitmapInfo: CGBitmapInfo(rawValue: bitmapInfo).rawValue
+    ) else {
+      throw CameraCaptureError.invalidImageData
+    }
+    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    let index = (y * bytesPerRow) + (x * bytesPerPixel) + 3
+    return pixels[index]
+    #else
+    throw CameraCaptureError.invalidImageData
+    #endif
+  }
+
   private func makeBrainWithExpressionAvatar() throws -> BrainDescriptor {
     let brain = try makeBrain()
     let manifest = BrainAvatarManifest(
@@ -4679,9 +5464,9 @@ final class AffectiveTests: XCTestCase {
     var database: OpaquePointer?
     XCTAssertEqual(sqlite3_open(url.path, &database), SQLITE_OK)
     defer { sqlite3_close(database) }
-    XCTAssertEqual(sqlite3_exec(database, "CREATE TABLE cognitive_memory (id INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, data_json TEXT NOT NULL)", nil, nil, nil), SQLITE_OK)
+    XCTAssertEqual(sqlite3_exec(database, "CREATE TABLE cognitive_memory (id INTEGER PRIMARY KEY, data_json TEXT NOT NULL)", nil, nil, nil), SQLITE_OK)
     let escaped = dataJSON.replacingOccurrences(of: "'", with: "''")
-    let sql = "INSERT INTO cognitive_memory (id, schema_version, data_json) VALUES (1, 2, '\(escaped)')"
+    let sql = "INSERT INTO cognitive_memory (id, data_json) VALUES (1, '\(escaped)')"
     XCTAssertEqual(sqlite3_exec(database, sql, nil, nil, nil), SQLITE_OK)
   }
 
@@ -4701,22 +5486,86 @@ final class AffectiveTests: XCTestCase {
     return String(cString: textPointer)
   }
 
-  private func archiveComponents(from data: Data) throws -> [[String: Any]] {
-    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-    return try XCTUnwrap(object["components"] as? [[String: Any]])
-  }
+  @MainActor
+  private func makeCoreBrainArchive(
+    for brain: BrainDescriptor,
+    deviceID: String = "test-device",
+    revision: Int = 1,
+    includeBiometricData: Bool = true
+  ) async throws -> BrainCloudArchive.Created {
+    let scratch = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveTestBrainArchive-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+    let archiveURL = scratch.appendingPathComponent(BrainCloudArchive.archiveFileName(for: brain.id))
 
-  private func archiveContainsBiometricData(_ data: Data) throws -> Bool? {
-    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-    return object["containsBiometricData"] as? Bool
-  }
-
-  private func archiveComponentData(_ path: String, in components: [[String: Any]]) throws -> Data? {
-    guard let component = components.first(where: { $0["path"] as? String == path }),
-          let dataBase64 = component["dataBase64"] as? String else {
-      return nil
+    let exportBrain: BrainDescriptor
+    if includeBiometricData {
+      exportBrain = brain
+    } else {
+      let scrubbedRoot = scratch.appendingPathComponent("scrubbed", isDirectory: true)
+      try BrainLibrary.copyBrain(
+        from: brain.rootURL,
+        to: scrubbedRoot,
+        includeBiometricData: false,
+        fileManager: .default
+      )
+      exportBrain = BrainDescriptor(
+        id: brain.id,
+        displayName: brain.displayName,
+        rootURL: scrubbedRoot,
+        avatarURL: nil,
+        avatarManifest: nil,
+        modifiedAt: brain.modifiedAt,
+        isRecent: brain.isRecent
+      )
     }
-    return Data(base64Encoded: dataBase64)
+
+    let core = BrainCore(brain: exportBrain)
+    do {
+      _ = try await BrainArchiveOperationGate.shared.run {
+        try await core.exportBrain(to: archiveURL)
+      }
+      await core.disconnect()
+    } catch {
+      await core.disconnect()
+      throw error
+    }
+
+    let modifiedAt = brain.modifiedAt ?? Date()
+    return BrainCloudArchive.Created(
+      archiveURL: archiveURL,
+      scratchRoot: scratch,
+      manifest: BrainCloudManifest(
+        brainID: brain.id,
+        displayName: brain.displayName,
+        schemaVersion: 1,
+        archiveHash: try BrainCloudArchive.archiveHash(at: archiveURL),
+        createdAt: modifiedAt,
+        modifiedAt: modifiedAt,
+        uploadedAt: Date(),
+        deviceID: deviceID,
+        revision: revision
+      )
+    )
+  }
+
+  @MainActor
+  private func restoreCoreArchiveData(_ data: Data, brainID: String) async throws -> URL {
+    let scratch = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveTestBrainRestore-\(UUID().uuidString)", isDirectory: true)
+    let archiveURL = scratch.appendingPathComponent(BrainCloudArchive.archiveFileName(for: brainID))
+    let restored = scratch.appendingPathComponent("restored", isDirectory: true)
+    temporaryRoots.append(scratch)
+    try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+    try data.write(to: archiveURL, options: .atomic)
+    _ = try await BrainLibrary.importBrainFileWithCore(from: archiveURL, to: restored, expectedBrainID: brainID)
+    return restored
+  }
+
+  private func exportManifestContainsBiometricData(in rootURL: URL) throws -> Bool? {
+    let data = try Data(contentsOf: rootURL.appendingPathComponent("export_manifest.json"))
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    return object["contains_biometric_data"] as? Bool
   }
 
   private func fixtureURL(_ name: String, extension ext: String, subdirectory: String) throws -> URL {
@@ -4875,7 +5724,7 @@ final class AffectiveTests: XCTestCase {
       target: .host,
       visibility: .public,
       presentation: presentation,
-      payload: .actionRequest(BrainActionRequestPayload(
+      payload: .capabilityRequest(BrainActionRequestPayload(
         actionID: actionID,
         action: action,
         arguments: .object(arguments),
@@ -4999,165 +5848,34 @@ final class AffectiveTests: XCTestCase {
     return String(decoding: data, as: UTF8.self)
   }
 
-  private func cognitiveFixtureJSON(
-    dreamID: String,
-    artifactPath: String,
-    createdAt: String = "2026-06-25T22:30:00Z"
-  ) -> String {
-    """
-    {
-      "schema_version": 2,
-      "traces": [],
-      "beliefs": [],
-      "subjects": [],
-      "artifacts": [
-        {
-          "artifact_id": "artifact_\(dreamID)",
-          "kind": "image",
-          "path": "\(artifactPath)",
-          "mime_type": "image/png",
-          "provenance": "dream",
-          "retention": "episode",
-          "linked_trace_ids": ["trace_1"],
-          "lifecycle": {
-            "status": "active",
-            "created_at": "\(createdAt)",
-            "updated_at": "\(createdAt)"
-          }
-        }
-      ],
-      "dreams": [
-        {
-          "dream_id": "\(dreamID)",
-          "selected_trace_ids": ["trace_1"],
-          "belief_change_ids": [],
-          "generated_artifact_id": "artifact_\(dreamID)",
-          "reflection": "A memory linked itself to the end-of-day summary.",
-          "heat": 0.5,
-          "promoted_count": 0,
-          "decayed_count": 0,
-          "removed_count": 0,
-          "revised_belief_count": 0,
-          "created_at": "\(createdAt)"
-        }
-      ]
-    }
-    """
-  }
-
-  private func duplicateDreamsFixtureJSON(
-    dreamID: String,
-    artifactPath: String,
-    createdAt: String = "2026-06-25T22:30:00Z"
-  ) -> String {
-    """
-    {
-      "schema_version": 2,
-      "traces": [],
-      "beliefs": [],
-      "subjects": [],
-      "artifacts": [
-        {
-          "artifact_id": "artifact_\(dreamID)",
-          "kind": "image",
-          "path": "\(artifactPath)",
-          "mime_type": "image/png",
-          "provenance": "dream",
-          "retention": "episode",
-          "linked_trace_ids": ["trace_1"],
-          "lifecycle": {
-            "status": "active",
-            "created_at": "\(createdAt)",
-            "updated_at": "\(createdAt)"
-          }
-        }
-      ],
-      "dreams": [
-        {
-          "dream_id": "\(dreamID)",
-          "selected_trace_ids": ["trace_1"],
-          "belief_change_ids": [],
-          "generated_artifact_id": "artifact_\(dreamID)",
-          "reflection": "First copy of a dream row.",
-          "heat": 0.5,
-          "promoted_count": 0,
-          "decayed_count": 0,
-          "removed_count": 0,
-          "revised_belief_count": 0,
-          "created_at": "\(createdAt)"
-        },
-        {
-          "dream_id": "\(dreamID)",
-          "selected_trace_ids": ["trace_2"],
-          "belief_change_ids": [],
-          "generated_artifact_id": "artifact_\(dreamID)",
-          "reflection": "Duplicate copy of the same dream row.",
-          "heat": 0.6,
-          "promoted_count": 0,
-          "decayed_count": 0,
-          "removed_count": 0,
-          "revised_belief_count": 0,
-          "created_at": "\(createdAt)"
-        }
-      ]
-    }
-    """
-  }
-
-  private func dreamReport(
-    dreamID: String,
+  private func mailboxItem(
+    sourceDreamID: String,
     dayKey: String,
+    createdAt: Date? = nil,
     isRead: Bool = false,
     isArchived: Bool = false
-  ) -> DreamReport {
-    let createdAt = DreamReportDateFormatter.date(from: "\(dayKey)T22:30:00Z") ?? Date()
-    return DreamReport(
-      reportID: DreamReportCollector.reportKey(dayKey: dayKey, dreamID: dreamID),
-      dreamID: dreamID,
+  ) -> MailboxItem {
+    let createdAt = createdAt ?? MailboxItemDateFormatter.date(from: "\(dayKey)T22:30:00Z") ?? Date()
+    return MailboxItem(
+      mailboxID: "\(dayKey)-\(sourceDreamID)",
+      sourceDreamID: sourceDreamID,
       dayKey: dayKey,
       createdAt: createdAt,
-      summary: "Summary for \(dreamID).",
-      summarySource: "fallback",
-      fullReportText: "Full report for \(dreamID).",
-      reflection: "Reflection for \(dreamID).",
+      summary: "Summary for \(sourceDreamID).",
+      summarySource: "test_mailbox",
+      bodyText: "DreamMail body for \(sourceDreamID).",
+      reflection: "Reflection for \(sourceDreamID).",
       heat: 0.5,
       style: "associative_synthesis",
       confidence: 0.575,
-      sourceTraceIDs: ["trace_1"],
-      generatedArtifactID: "artifact_\(dreamID)",
+      sourceEventIDs: ["trace_1"],
+      artifactID: "artifact_\(sourceDreamID)",
       imagePath: nil,
       imageMimeType: nil,
-      imagePrompt: nil,
+      imageSpec: nil,
       isRead: isRead,
       isArchived: isArchived
     )
-  }
-
-  private func dreamReportDraft(
-    dreamID: String = "dream_1",
-    dayKey: String = "2026-06-25"
-  ) -> DreamReportDraft {
-    DreamReportDraft(
-      dreamID: dreamID,
-      dayKey: dayKey,
-      createdAt: DreamReportDateFormatter.date(from: "\(dayKey)T22:30:00Z") ?? Date(),
-      reflection: "A dream linked a memory to a quiet symbol.",
-      heat: 0.5,
-      style: "associative_synthesis",
-      confidence: 0.575,
-      sourceTraceIDs: ["trace_1"],
-      generatedArtifactID: "artifact_\(dreamID)",
-      imagePath: "generated/images/dream.png",
-      imageMimeType: "image/png",
-      imagePrompt: "Create a quiet symbolic dream image."
-    )
-  }
-
-  private func dreamImageEventJSONL() -> String {
-    """
-    {"event_id":"event_1","time":"2026-06-25T22:30:01Z","kind":"autonomy","source":"brain","title":"dream_image","body":"generated/images/dream.png","subject":"dream_image","raw":"Create a quiet symbolic dream image.","interpretation":"generated/images/dream.png","tags":["dream","image"]}
-
-    """
   }
 
   private func makeUserDefaults() throws -> UserDefaults {
@@ -5263,6 +5981,9 @@ final class AffectiveTests: XCTestCase {
     {
       credentials[.google] = value
     }
+    if let value = nonEmptyEnvironmentValue("DEEPSEEK_API_KEY", in: environment) {
+      credentials[.deepseek] = value
+    }
     return credentials
   }
 
@@ -5275,6 +5996,8 @@ final class AffectiveTests: XCTestCase {
   private static var hostCapabilityE2ECoverage: [String: HostCapabilityE2ECoverage] {
     [
       "text_input": .providerBackedDispatch,
+      "text_input": .typedOperation,
+      "speech_input": .typedOperation,
       "speech_input": .hostAdapter,
       "speech_output": .hostAdapter,
       "camera_capture": .permissionGatedHostAdapter,
@@ -5288,9 +6011,21 @@ final class AffectiveTests: XCTestCase {
       "reminder_write": .hostAdapter,
       "notification_schedule": .hostAdapter,
       "stored_image_read": .hostAdapter,
+      "stored_memory_read": .hostAdapter,
+      "stored_memory_write": .hostAdapter,
       "face_identification": .hostAdapter,
       "face_enrollment": .hostAdapter,
-      "introspection": .embeddedRoute,
+      "identity_recognition": .hostAdapter,
+      "face_picture_update": .hostAdapter,
+      "event_envelope": .embeddedRoute,
+      "event_drain": .embeddedRoute,
+      "sense_catalog": .embeddedRoute,
+      "sense_status": .embeddedRoute,
+      "sense_observation": .embeddedRoute,
+      "orientation_query": .permissionGatedHostAdapter,
+      "reminder_io": .hostAdapter,
+      "image_generation": .providerBackedHostAdapter,
+      "facial_expression_output": .hostAdapter,
       "time_lookup": .hostAdapter,
       "power_status": .hostAdapter,
       "storage_fullness": .hostAdapter,
@@ -5298,6 +6033,8 @@ final class AffectiveTests: XCTestCase {
       "local_process_io": .hostAdapter,
       "file_import": .hostAdapter,
       "file_export": .hostAdapter,
+      "import_brain": .embeddedRoute,
+      "export_brain": .embeddedRoute,
       "provider_image_generation": .providerBackedHostAdapter,
       "provider_vision_completion": .providerBackedHostAdapter,
       "provider_text_completion": .providerBackedHostAdapter,
@@ -5357,6 +6094,7 @@ final class AffectiveTests: XCTestCase {
     )
     return BrainToolResponse(toolName: toolName, envelope: envelope, rawText: envelope.rawText)
   }
+
 }
 
 private enum HostCapabilityE2ECoverage: Equatable {
@@ -5366,6 +6104,7 @@ private enum HostCapabilityE2ECoverage: Equatable {
   case permissionGatedHostAdapter
   case providerBackedDispatch
   case providerBackedHostAdapter
+  case typedOperation
 }
 
 private struct RecognitionIdentityResponse: Decodable {
@@ -5456,19 +6195,26 @@ private actor ScriptedBrainCore: BrainCoreClient {
   private let orientationObservationResponse: BrainToolResponse
   private let motionGestureObservationResponse: BrainToolResponse
   private let cameraObservationResponse: BrainToolResponse
+  private let mailboxItems: [BrainMailboxItem]
+  private let brainModeValue: String
   private let cameraObservationDelayNanoseconds: UInt64
   private let pullSenseStatusError: Error?
   private(set) var didConnect = false
   private(set) var didDisconnect = false
   private(set) var toolCalls: [ToolCall] = []
+  private(set) var hostAttachCalls: [ToolCall] = []
+  private(set) var hostCapabilityManifestCalls: [ToolCall] = []
+  private(set) var sendExperienceEventCalls: [ToolCall] = []
   private(set) var textCalls: [TextCall] = []
   private(set) var pokeSequences: [[PokePulse]] = []
   private var textCallContinuations: [(minimumCount: Int, continuation: CheckedContinuation<[TextCall], Never>)] = []
+  private var experienceEventCallContinuations: [(minimumCount: Int, continuation: CheckedContinuation<[ToolCall], Never>)] = []
   private(set) var orientationObservations: [OrientationObservationCall] = []
   private(set) var motionGestureObservations: [MotionGestureObservationCall] = []
   private(set) var cameraObservations: [CameraObservation] = []
   private(set) var senseCatalogRequests: [String?] = []
   private(set) var pullSenseStatuses: [PullSenseStatusCall] = []
+  private(set) var mailboxMarkReadIDs: [String] = []
 
   init(
     toolResponse: BrainToolResponse,
@@ -5477,6 +6223,8 @@ private actor ScriptedBrainCore: BrainCoreClient {
     orientationObservationResponse: BrainToolResponse? = nil,
     motionGestureObservationResponse: BrainToolResponse? = nil,
     cameraObservationResponse: BrainToolResponse,
+    mailboxItems: [BrainMailboxItem] = [],
+    brainMode: String = "waking",
     cameraObservationDelayNanoseconds: UInt64 = 0,
     pullSenseStatusError: Error? = nil
   ) {
@@ -5486,12 +6234,15 @@ private actor ScriptedBrainCore: BrainCoreClient {
     self.orientationObservationResponse = orientationObservationResponse ?? toolResponse
     self.motionGestureObservationResponse = motionGestureObservationResponse ?? toolResponse
     self.cameraObservationResponse = cameraObservationResponse
+    self.mailboxItems = mailboxItems
+    self.brainModeValue = brainMode
     self.cameraObservationDelayNanoseconds = cameraObservationDelayNanoseconds
     self.pullSenseStatusError = pullSenseStatusError
   }
 
-  func connect() async throws {
+  func connect() async throws -> BrainDispatchEnvelope {
     didConnect = true
+    return BrainDispatchEnvelope(requestID: "mock-connect", ok: true, events: [], result: nil, error: nil)
   }
 
   func disconnect() async {
@@ -5500,16 +6251,7 @@ private actor ScriptedBrainCore: BrainCoreClient {
 
   func sendEvent(_ event: BrainEvent) async throws -> BrainToolResponse {
     switch event.payload {
-    case .memoryRequest(let payload):
-      var arguments: [String: JSONValue] = [
-        "operation": .string(payload.operation.rawValue),
-        "layers": .array(payload.layers.map { .string($0.rawValue) }),
-        "tags": .array(payload.tags.map { .string($0) }),
-      ]
-      if let query = payload.query { arguments["query"] = .string(query) }
-      if let text = payload.text { arguments["text"] = .string(text) }
-      toolCalls.append(ToolCall(name: "memory_request", arguments: arguments))
-    case .actionRequest(let payload):
+    case .capabilityRequest(let payload):
       toolCalls.append(ToolCall(
         name: payload.action,
         arguments: payload.arguments.objectValue ?? [:]
@@ -5524,6 +6266,70 @@ private actor ScriptedBrainCore: BrainCoreClient {
     for event in events {
       _ = try await sendEvent(event)
     }
+    return toolResponse
+  }
+
+  func hostAttach(
+    hostID: String,
+    platform: String,
+    permissions: [String],
+    capabilityIDs: [String],
+    providerAvailability: String,
+    sensorQuality: String,
+    localPolicy: String
+  ) async throws -> BrainToolResponse {
+    hostAttachCalls.append(ToolCall(name: "host_attach", arguments: [
+      "host_id": .string(hostID),
+      "platform": .string(platform),
+      "permissions": .array(permissions.map(JSONValue.string)),
+      "capability_ids": .array(capabilityIDs.map(JSONValue.string)),
+      "provider_availability": .string(providerAvailability),
+      "sensor_quality": .string(sensorQuality),
+      "local_policy": .string(localPolicy),
+    ]))
+    return toolResponse
+  }
+
+  func hostCapabilityManifest(hostID: String, capabilityIDs: [String]) async throws -> BrainToolResponse {
+    hostCapabilityManifestCalls.append(ToolCall(name: "host_capability_manifest", arguments: [
+      "host_id": .string(hostID),
+      "capability_ids": .array(capabilityIDs.map(JSONValue.string)),
+    ]))
+    return toolResponse
+  }
+
+  func sendExperienceEvent(
+    hostID: String?,
+    source: String,
+    kind: String,
+    payload: String,
+    salience: Double,
+    confidence: Double,
+    valence: Double,
+    arousal: Double,
+    uncertainty: Double,
+    causalParentIDs: [String],
+    retention: String,
+    visibility: String
+  ) async throws -> BrainToolResponse {
+    var arguments: [String: JSONValue] = [
+      "source": .string(source),
+      "kind": .string(kind),
+      "payload": .string(payload),
+      "salience": .number(salience),
+      "confidence": .number(confidence),
+      "valence": .number(valence),
+      "arousal": .number(arousal),
+      "uncertainty": .number(uncertainty),
+      "causal_parent_ids": .array(causalParentIDs.map(JSONValue.string)),
+      "retention": .string(retention),
+      "visibility": .string(visibility),
+    ]
+    if let hostID {
+      arguments["host_id"] = .string(hostID)
+    }
+    sendExperienceEventCalls.append(ToolCall(name: "send_experience_event", arguments: arguments))
+    fulfillExperienceEventCallContinuations()
     return toolResponse
   }
 
@@ -5620,7 +6426,7 @@ private actor ScriptedBrainCore: BrainCoreClient {
     return toolResponse
   }
 
-  func hostCapabilityStatus(
+  func capabilityStatus(
     capability _: String,
     status _: String,
     requestID _: String?,
@@ -5656,11 +6462,101 @@ private actor ScriptedBrainCore: BrainCoreClient {
     return textResponse
   }
 
+  func requestDreamTime(prompt _: String?) async throws -> BrainMailboxResponse {
+    BrainMailboxResponse(
+      toolName: "request_dream_time",
+      item: mailboxItems.first ?? Self.fixtureMailboxItem(),
+      metadata: [:]
+    )
+  }
+
+  func brainMode() async throws -> BrainModeResponse {
+    BrainModeResponse(toolName: "brain_mode", mode: brainModeValue, metadata: ["brain_mode": brainModeValue])
+  }
+
+  func readModelsSnapshot() async throws -> BrainReadModelsSnapshotResponse {
+    BrainReadModelsSnapshotResponse(
+      toolName: "read_models_snapshot",
+      readModels: .object(["brain_mode": .string(brainModeValue)]),
+      metadata: ["brain_mode": brainModeValue]
+    )
+  }
+
+  func mailboxList() async throws -> BrainMailboxListResponse {
+    BrainMailboxListResponse(toolName: "mailbox_list", items: mailboxItems, metadata: [:])
+  }
+
+  func mailboxMarkRead(mailboxID: String) async throws -> BrainMailboxListResponse {
+    mailboxMarkReadIDs.append(mailboxID)
+    return BrainMailboxListResponse(toolName: "mailbox_mark_read", items: mailboxItems, metadata: [:])
+  }
+
+  func exportBrain(to fileURL: URL) async throws -> BrainArchiveResponse {
+    toolCalls.append(ToolCall(
+      name: "export_brain",
+      arguments: ["brain_file_path": .string(fileURL.path)]
+    ))
+    return BrainArchiveResponse(toolName: "export_brain", manifest: Self.fixtureArchiveManifest(), metadata: [:])
+  }
+
+  func importBrain(
+    from fileURL: URL,
+    brainID: String?,
+    brainRoot: URL,
+    hostID: String?
+  ) async throws -> BrainArchiveResponse {
+    var arguments: [String: JSONValue] = [
+      "brain_file_path": .string(fileURL.path),
+      "brain_root": .string(brainRoot.path),
+    ]
+    if let brainID {
+      arguments["brain_id"] = .string(brainID)
+    }
+    if let hostID {
+      arguments["host_id"] = .string(hostID)
+    }
+    toolCalls.append(ToolCall(name: "import_brain", arguments: arguments))
+    return BrainArchiveResponse(toolName: "import_brain", manifest: Self.fixtureArchiveManifest(), metadata: [:])
+  }
+
+  private static func fixtureMailboxItem() -> BrainMailboxItem {
+    BrainMailboxItem(
+      mailboxID: "mail_fixture",
+      kind: "DreamMail",
+      title: "Fixture dream",
+      text: "A fixture dream arrived.",
+      imageArtifactID: nil,
+      imageSpecJSON: "",
+      wakingThought: "",
+      visibleLesson: "",
+      debugDetails: "",
+      sourceEventIDs: [],
+      sourceDreamID: "dream_fixture",
+      createdAtMS: 1_782_515_600_000
+    )
+  }
+
+  private static func fixtureArchiveManifest() -> JSONValue {
+    .object([
+      "brain_id": .string("fixture-brain"),
+      "schema_version": .number(3),
+      "component_count": .number(0),
+    ])
+  }
+
   func waitForTextCallCount(_ minimumCount: Int) async -> [TextCall] {
     guard textCalls.count < minimumCount else { return textCalls }
 
     return await withCheckedContinuation { continuation in
       textCallContinuations.append((minimumCount, continuation))
+    }
+  }
+
+  func waitForExperienceEventCallCount(_ minimumCount: Int) async -> [ToolCall] {
+    guard sendExperienceEventCalls.count < minimumCount else { return sendExperienceEventCalls }
+
+    return await withCheckedContinuation { continuation in
+      experienceEventCallContinuations.append((minimumCount, continuation))
     }
   }
 
@@ -5679,18 +6575,24 @@ private actor ScriptedBrainCore: BrainCoreClient {
     textCallContinuations = pendingContinuations
   }
 
-  func refreshState() async throws -> BrainStateSnapshot {
-    BrainStateSnapshot(toolName: "state", text: "ready", metadata: [:])
+  private func fulfillExperienceEventCallContinuations() {
+    let completedCalls = sendExperienceEventCalls
+    var pendingContinuations: [(minimumCount: Int, continuation: CheckedContinuation<[ToolCall], Never>)] = []
+
+    for waiter in experienceEventCallContinuations {
+      if completedCalls.count >= waiter.minimumCount {
+        waiter.continuation.resume(returning: completedCalls)
+      } else {
+        pendingContinuations.append(waiter)
+      }
+    }
+
+    experienceEventCallContinuations = pendingContinuations
   }
+
 }
 
-private struct FailingDreamReportSummaryProvider: DreamReportSummaryProviding {
-  func summarize(_ draft: DreamReportDraft) async throws -> DreamReportSummaryResult {
-    throw DreamReportSummaryError.missingProviderCredential
-  }
-}
-
-private final class FakeBrainCloudCheckpointStore: BrainCloudCheckpointStore {
+private final class FakeBrainCloudArchiveStore: BrainCloudArchiveStore {
   var manifests: [String: BrainCloudManifest] = [:]
   var archives: [String: Data] = [:]
   var uploads: [BrainCloudManifest] = []
@@ -5726,29 +6628,29 @@ private final class FakeBrainCloudCheckpointStore: BrainCloudCheckpointStore {
     guard let archive = archives[manifest.brainID] else {
       return .syncing
     }
-    guard BrainCheckpointArchive.sha256Hex(archive) == manifest.archiveHash else {
+    guard BrainCloudArchive.sha256Hex(archive) == manifest.archiveHash else {
       return .invalid("The archive checksum does not match its manifest.")
     }
     do {
-      try BrainCheckpointArchive.validateCheckpointPayload(archive, expectedBrainID: manifest.brainID)
+      try BrainCloudArchive.validateArchiveData(archive)
       return .available
     } catch {
       return .invalid(error.localizedDescription)
     }
   }
 
-  func downloadCheckpoint(brainID: String, to localURL: URL) async throws -> BrainCloudManifest {
+  func downloadArchive(brainID: String, to localURL: URL) async throws -> BrainCloudManifest {
     if let error {
       throw error
     }
     guard let manifest = manifests[brainID], let archive = archives[brainID] else {
-      throw BrainSyncError.missingCheckpoint
+      throw BrainSyncError.missingArchive
     }
     try archive.write(to: localURL, options: .atomic)
     return manifest
   }
 
-  func uploadCheckpoint(from localURL: URL, manifest: BrainCloudManifest) async throws {
+  func uploadArchive(from localURL: URL, manifest: BrainCloudManifest) async throws {
     if let error {
       throw error
     }
@@ -5757,3 +6659,115 @@ private final class FakeBrainCloudCheckpointStore: BrainCloudCheckpointStore {
     uploads.append(manifest)
   }
 }
+
+#if os(macOS)
+private final class AvatarKitMockImageGenerator: AvatarKitImageGenerating, @unchecked Sendable {
+  let responses: [AvatarKitAssetKind: Data]
+  private(set) var prompts: [String] = []
+
+  init(responses: [AvatarKitAssetKind: Data]) {
+    self.responses = responses
+  }
+
+  func generate(
+    prompt: String,
+    outputDirectory: URL,
+    referenceImage: HostGeneratedImage?
+  ) async throws -> HostGeneratedImage {
+    prompts.append(prompt)
+    let kind = AvatarKitAssetKind.allCases.first { prompt.contains($0.generateOnlyLine) }
+      ?? .baseHead
+    guard let data = responses[kind] else {
+      throw AvatarKitGenerationError.generationFailed("Missing mock image for \(kind.rawValue)")
+    }
+    try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+    let path = outputDirectory.appendingPathComponent("\(kind.rawValue)-\(prompts.count).png")
+    try data.write(to: path, options: .atomic)
+    return HostGeneratedImage(path: path.path, mimeType: "image/png")
+  }
+}
+
+private final class AvatarKitRetryMockImageGenerator: AvatarKitImageGenerating, @unchecked Sendable {
+  let opaqueData: Data
+  let transparentData: Data
+  private(set) var prompts: [String] = []
+  private(set) var referencePaths: [String?] = []
+
+  init(opaqueData: Data, transparentData: Data) {
+    self.opaqueData = opaqueData
+    self.transparentData = transparentData
+  }
+
+  func generate(
+    prompt: String,
+    outputDirectory: URL,
+    referenceImage: HostGeneratedImage?
+  ) async throws -> HostGeneratedImage {
+    prompts.append(prompt)
+    referencePaths.append(referenceImage?.path)
+    let kind = AvatarKitAssetKind.allCases.first { prompt.contains($0.generateOnlyLine) }
+      ?? .baseHead
+    let data = referenceImage == nil ? opaqueData : transparentData
+    try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+    let path = outputDirectory.appendingPathComponent("\(kind.rawValue)-\(prompts.count).png")
+    try data.write(to: path, options: .atomic)
+    return HostGeneratedImage(path: path.path, mimeType: "image/png")
+  }
+}
+
+private final class AvatarKitPerKindMockImageGenerator: AvatarKitImageGenerating, @unchecked Sendable {
+  let initial: [AvatarKitAssetKind: Data]
+  let replacements: [AvatarKitAssetKind: Data]
+  private var counts: [AvatarKitAssetKind: Int] = [:]
+
+  init(initial: [AvatarKitAssetKind: Data], replacements: [AvatarKitAssetKind: Data]) {
+    self.initial = initial
+    self.replacements = replacements
+  }
+
+  func generationCount(for kind: AvatarKitAssetKind) -> Int {
+    counts[kind, default: 0]
+  }
+
+  func generate(
+    prompt: String,
+    outputDirectory: URL,
+    referenceImage: HostGeneratedImage?
+  ) async throws -> HostGeneratedImage {
+    let kind = AvatarKitAssetKind.allCases.first { prompt.contains($0.generateOnlyLine) }
+      ?? .baseHead
+    let count = counts[kind, default: 0] + 1
+    counts[kind] = count
+    let data: Data
+    if count == 1 {
+      guard let initialData = initial[kind] else {
+        throw AvatarKitGenerationError.generationFailed("Missing initial mock for \(kind.rawValue)")
+      }
+      data = initialData
+    } else {
+      guard let replacement = replacements[kind] ?? initial[kind] else {
+        throw AvatarKitGenerationError.generationFailed("Missing replacement mock for \(kind.rawValue)")
+      }
+      data = replacement
+    }
+    try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+    let path = outputDirectory.appendingPathComponent("\(kind.rawValue)-\(count).png")
+    try data.write(to: path, options: .atomic)
+    return HostGeneratedImage(path: path.path, mimeType: "image/png")
+  }
+}
+
+private final class AvatarKitMockVisionClient: AvatarKitVisionCompleting, @unchecked Sendable {
+  let response: String
+  private(set) var imagePaths: [String] = []
+
+  init(response: String) {
+    self.response = response
+  }
+
+  func complete(_ request: HostVisionCompletionRequest) async throws -> HostVisionCompletionResponse {
+    imagePaths = request.imagePaths
+    return HostVisionCompletionResponse(text: response, provider: .openAI)
+  }
+}
+#endif

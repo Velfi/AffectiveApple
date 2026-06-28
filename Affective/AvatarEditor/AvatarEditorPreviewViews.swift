@@ -19,7 +19,7 @@ struct AtlasSheetPreview: View {
 
     var body: some View {
         if let imageURL,
-           let image = NSImage(contentsOf: imageURL),
+           let image = AvatarAssetImageLoader.loadImage(from: imageURL, layerID: slot.id),
            let imageSize = image.pixelSize {
             GeometryReader { proxy in
                 ZStack {
@@ -121,19 +121,17 @@ struct AtlasSheetPreview: View {
 struct LayerResizeOverlay: View {
     @Binding var slot: AvatarSlot
     let scale: Double
-    let canvasWidth: Double
-    let canvasHeight: Double
+    let worldBounds: CGRect
     @State private var dragState: LayerResizeDragState?
 
     var body: some View {
-        let safeCanvasWidth = normalizedDimension(canvasWidth, fallback: 1024)
-        let safeCanvasHeight = normalizedDimension(canvasHeight, fallback: 1024)
-        let safeScale = normalizedDimension(scale, fallback: 1)
+        let safeScale = normalizedDimension(scale, defaultValue: 1)
+        let topLeft = slot.topLeftOrigin()
         let rect = CGRect(
-            x: slot.x * safeScale,
-            y: slot.y * safeScale,
-            width: normalizedDimension(slot.width, fallback: 1) * safeScale,
-            height: normalizedDimension(slot.height, fallback: 1) * safeScale
+            x: (topLeft.x - worldBounds.minX) * safeScale,
+            y: (topLeft.y - worldBounds.minY) * safeScale,
+            width: normalizedDimension(slot.width, defaultValue: 1) * safeScale,
+            height: normalizedDimension(slot.height, defaultValue: 1) * safeScale
         )
 
         ZStack(alignment: .topLeading) {
@@ -159,63 +157,43 @@ struct LayerResizeOverlay: View {
                 }
             }
         }
-        .frame(width: safeCanvasWidth * safeScale, height: safeCanvasHeight * safeScale, alignment: .topLeading)
+        .frame(width: worldBounds.width * safeScale, height: worldBounds.height * safeScale, alignment: .topLeading)
     }
 
     func resize(handle: LayerResizeHandle, value: DragGesture.Value) {
         if dragState == nil {
             dragState = LayerResizeDragState(
-                x: slot.x,
-                y: slot.y,
                 width: slot.width,
                 height: slot.height
             )
         }
         guard let dragState else { return }
 
-        let safeScale = normalizedDimension(scale, fallback: 1)
+        let safeScale = normalizedDimension(scale, defaultValue: 1)
         let dx = value.translation.width / safeScale
         let dy = value.translation.height / safeScale
         let minimumSize = 16.0
-        let right = dragState.x + dragState.width
-        let bottom = dragState.y + dragState.height
 
         switch handle {
         case .topLeading:
-            let newX = clamped(dragState.x + dx, lowerBound: 0, upperBound: right - minimumSize)
-            let newY = clamped(dragState.y + dy, lowerBound: 0, upperBound: bottom - minimumSize)
-            slot.x = newX
-            slot.y = newY
-            slot.width = right - newX
-            slot.height = bottom - newY
+            slot.width = max(dragState.width - dx, minimumSize)
+            slot.height = max(dragState.height - dy, minimumSize)
         case .topTrailing:
-            let newRight = clamped(right + dx, lowerBound: dragState.x + minimumSize, upperBound: canvasWidth)
-            let newY = clamped(dragState.y + dy, lowerBound: 0, upperBound: bottom - minimumSize)
-            slot.y = newY
-            slot.width = newRight - dragState.x
-            slot.height = bottom - newY
+            slot.width = max(dragState.width + dx, minimumSize)
+            slot.height = max(dragState.height - dy, minimumSize)
         case .bottomLeading:
-            let newX = clamped(dragState.x + dx, lowerBound: 0, upperBound: right - minimumSize)
-            let newBottom = clamped(bottom + dy, lowerBound: dragState.y + minimumSize, upperBound: canvasHeight)
-            slot.x = newX
-            slot.width = right - newX
-            slot.height = newBottom - dragState.y
+            slot.width = max(dragState.width - dx, minimumSize)
+            slot.height = max(dragState.height + dy, minimumSize)
         case .bottomTrailing:
-            let newRight = clamped(right + dx, lowerBound: dragState.x + minimumSize, upperBound: canvasWidth)
-            let newBottom = clamped(bottom + dy, lowerBound: dragState.y + minimumSize, upperBound: canvasHeight)
-            slot.width = newRight - dragState.x
-            slot.height = newBottom - dragState.y
+            slot.width = max(dragState.width + dx, minimumSize)
+            slot.height = max(dragState.height + dy, minimumSize)
         }
     }
 
-    func clamped(_ value: Double, lowerBound: Double, upperBound: Double) -> Double {
-        min(max(value, lowerBound), max(upperBound, lowerBound))
-    }
-
-    func normalizedDimension(_ value: Double, fallback: Double) -> Double {
+    func normalizedDimension(_ value: Double, defaultValue: Double) -> Double {
         guard value.isFinite, value > 0 else {
             avatarPreviewLogger.error("Invalid resize canvas dimension value=\(value, privacy: .public)")
-            return fallback
+            return defaultValue
         }
         return value
     }
@@ -257,8 +235,6 @@ enum LayerResizeHandle: CaseIterable, Hashable, Identifiable {
 }
 
 struct LayerResizeDragState {
-    let x: Double
-    let y: Double
     let width: Double
     let height: Double
 }
@@ -279,7 +255,7 @@ struct AtlasSheetGrid: View {
             let frameHeight = CGFloat(max(slot.frameHeight, 1))
             let columns = max(slot.columns, 1)
             let rows = max(slot.rows, 1)
-            let frames = max(slot.frames, 1)
+            let frames = slot.effectiveFrameCount
             let crossLength = max(min(frameWidth * scaleX, frameHeight * scaleY) * 0.06, 4)
 
             for index in 0..<min(frames, columns * rows) {
@@ -391,14 +367,14 @@ struct AtlasFramePicker: View {
                 Text(title)
                     .font(.headline)
                 Spacer()
-                Text("\(max(slot.frames, 1)) frames")
+                Text("\(slot.effectiveFrameCount) frames")
                     .font(.caption)
                     .foregroundStyle(AppTheme.secondaryText)
             }
 
-            if let imageURL, let image = NSImage(contentsOf: imageURL) {
+            if let imageURL, let image = AvatarAssetImageLoader.loadImage(from: imageURL, layerID: slot.id) {
                 LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
-                    ForEach(0..<max(slot.frames, 1), id: \.self) { frame in
+                    ForEach(0..<slot.effectiveFrameCount, id: \.self) { frame in
                         Button {
                             selectedFrame = frame
                         } label: {
@@ -454,6 +430,310 @@ struct AtlasFramePicker: View {
                 .stroke(.white.opacity(0.08))
         )
     }
+}
+
+struct AvatarEditorCanvasViewport<Content: View>: View {
+    @Binding var zoom: Double
+    @Binding var pan: CGSize
+    let worldBounds: CGRect
+    @ViewBuilder let content: (_ scale: Double) -> Content
+
+    @State private var panDragOrigin: CGSize?
+    @State private var magnificationBaseZoom: Double?
+
+    var body: some View {
+        GeometryReader { geo in
+            let viewSize = geo.size
+            let fitScale = fittedScale(viewSize: viewSize, worldBounds: worldBounds)
+            let effectiveScale = fitScale * zoom
+            let contentWidth = worldBounds.width * effectiveScale
+            let contentHeight = worldBounds.height * effectiveScale
+
+            ZStack {
+                content(effectiveScale)
+                    .frame(width: contentWidth, height: contentHeight)
+                    .offset(x: pan.width, y: pan.height)
+            }
+            .frame(width: viewSize.width, height: viewSize.height)
+            .clipped()
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture()
+                    .modifiers(.option)
+                    .onChanged { value in
+                        if panDragOrigin == nil {
+                            panDragOrigin = pan
+                        }
+                        guard let panDragOrigin else { return }
+                        pan = CGSize(
+                            width: panDragOrigin.width + value.translation.width,
+                            height: panDragOrigin.height + value.translation.height
+                        )
+                    }
+                    .onEnded { _ in panDragOrigin = nil }
+            )
+            .simultaneousGesture(
+                MagnificationGesture()
+                    .onChanged { value in
+                        if magnificationBaseZoom == nil {
+                            magnificationBaseZoom = zoom
+                        }
+                        guard let magnificationBaseZoom else { return }
+                        zoom = clampedZoom(magnificationBaseZoom * value)
+                    }
+                    .onEnded { _ in magnificationBaseZoom = nil }
+            )
+            .background(ScrollWheelZoomCapture(onZoom: { delta in
+                zoom = clampedZoom(zoom * (1 + delta))
+            }))
+        }
+    }
+
+    func fittedScale(viewSize: CGSize, worldBounds: CGRect) -> Double {
+        guard viewSize.width > 0, viewSize.height > 0,
+              worldBounds.width > 0, worldBounds.height > 0 else {
+            return 1
+        }
+        let horizontal = (viewSize.width * 0.9) / worldBounds.width
+        let vertical = (viewSize.height * 0.9) / worldBounds.height
+        return min(horizontal, vertical)
+    }
+
+    func clampedZoom(_ value: Double) -> Double {
+        min(max(value, 0.25), 4)
+    }
+}
+
+struct ScrollWheelZoomCapture: NSViewRepresentable {
+    let onZoom: (Double) -> Void
+
+    func makeNSView(context: Context) -> ScrollWheelZoomNSView {
+        let view = ScrollWheelZoomNSView()
+        view.onZoom = onZoom
+        return view
+    }
+
+    func updateNSView(_ nsView: ScrollWheelZoomNSView, context: Context) {
+        nsView.onZoom = onZoom
+    }
+}
+
+final class ScrollWheelZoomNSView: NSView {
+    var onZoom: ((Double) -> Void)?
+
+    override func scrollWheel(with event: NSEvent) {
+        if event.modifierFlags.contains(.command) {
+            let delta = event.deltaY * 0.02
+            onZoom?(delta)
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
+}
+
+struct ClipDimmingOverlay: View {
+    let clipX: Double
+    let clipY: Double
+    let clipWidth: Double
+    let clipHeight: Double
+    let worldBounds: CGRect
+    let scale: Double
+
+    var body: some View {
+        let clipRect = CGRect(
+            x: (clipX - worldBounds.minX) * scale,
+            y: (clipY - worldBounds.minY) * scale,
+            width: clipWidth * scale,
+            height: clipHeight * scale
+        )
+        let fullRect = CGRect(
+            x: 0,
+            y: 0,
+            width: worldBounds.width * scale,
+            height: worldBounds.height * scale
+        )
+
+        Canvas { context, _ in
+            var dimPath = Path()
+            dimPath.addRect(fullRect)
+            dimPath.addRect(clipRect)
+            context.fill(dimPath, with: .color(.black.opacity(0.35)), style: FillStyle(eoFill: true))
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+struct ClipFrameOverlay: View {
+    @Binding var clipX: Double
+    @Binding var clipY: Double
+    @Binding var clipWidth: Double
+    @Binding var clipHeight: Double
+    let aspectMode: ClipAspectMode
+    let worldBounds: CGRect
+    let scale: Double
+  @State private var dragState: ClipFrameDragState?
+
+    var body: some View {
+        let safeScale = normalizedDimension(scale, defaultValue: 1)
+        let rect = CGRect(
+            x: (clipX - worldBounds.minX) * safeScale,
+            y: (clipY - worldBounds.minY) * safeScale,
+            width: normalizedDimension(clipWidth, defaultValue: 1) * safeScale,
+            height: normalizedDimension(clipHeight, defaultValue: 1) * safeScale
+        )
+
+        ZStack(alignment: .topLeading) {
+            if rect.isValidAvatarEditorFrame {
+                Rectangle()
+                    .stroke(AppTheme.accent, style: StrokeStyle(lineWidth: 3, dash: [10, 6]))
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture()
+                            .onChanged { value in
+                                if dragState == nil {
+                                    dragState = .move(x: clipX, y: clipY)
+                                }
+                                guard case .move(let startX, let startY) = dragState else { return }
+                                clipX = startX + value.translation.width / safeScale
+                                clipY = startY + value.translation.height / safeScale
+                            }
+                            .onEnded { _ in dragState = nil }
+                    )
+
+                Text("\(Int(clipWidth)) x \(Int(clipHeight))")
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(AppTheme.accent.opacity(0.92), in: Capsule())
+                    .foregroundStyle(AppTheme.textOnAccent)
+                    .position(x: rect.minX + 52, y: rect.minY + 22)
+
+                ForEach(ClipResizeHandle.allCases) { handle in
+                    ResizeHandleView()
+                        .position(handle.position(in: rect))
+                        .highPriorityGesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { value in
+                                    resize(handle: handle, value: value, rect: rect, safeScale: safeScale)
+                                }
+                                .onEnded { _ in dragState = nil }
+                        )
+                }
+            }
+        }
+        .frame(width: worldBounds.width * safeScale, height: worldBounds.height * safeScale, alignment: .topLeading)
+    }
+
+    func resize(handle: ClipResizeHandle, value: DragGesture.Value, rect: CGRect, safeScale: Double) {
+        if dragState == nil {
+            dragState = .resize(x: clipX, y: clipY, width: clipWidth, height: clipHeight)
+        }
+        guard case .resize(let startX, let startY, let startWidth, let startHeight) = dragState else { return }
+
+        let dx = value.translation.width / safeScale
+        let dy = value.translation.height / safeScale
+        let minimumSize = 16.0
+        let right = startX + startWidth
+        let bottom = startY + startHeight
+
+        if let ratio = aspectMode.ratio {
+            switch handle {
+            case .bottomTrailing:
+                let delta = max(dx, dy * ratio)
+                let newWidth = max(startWidth + delta, minimumSize)
+                clipX = startX
+                clipY = startY
+                clipWidth = newWidth
+                clipHeight = newWidth / ratio
+            case .topLeading:
+                let newWidth = max(startWidth - dx, minimumSize)
+                let newHeight = max(newWidth / ratio, minimumSize)
+                clipWidth = newWidth
+                clipHeight = newHeight
+                clipX = right - newWidth
+                clipY = bottom - newHeight
+            case .topTrailing:
+                let newWidth = max(startWidth + dx, minimumSize)
+                let newHeight = max(newWidth / ratio, minimumSize)
+                clipX = startX
+                clipY = bottom - newHeight
+                clipWidth = newWidth
+                clipHeight = newHeight
+            case .bottomLeading:
+                let newWidth = max(startWidth - dx, minimumSize)
+                let newHeight = max(newWidth / ratio, minimumSize)
+                clipX = right - newWidth
+                clipY = startY
+                clipWidth = newWidth
+                clipHeight = newHeight
+            }
+        } else {
+            switch handle {
+            case .topLeading:
+                let newX = startX + dx
+                let newY = startY + dy
+                clipX = newX
+                clipY = newY
+                clipWidth = max(right - newX, minimumSize)
+                clipHeight = max(bottom - newY, minimumSize)
+            case .topTrailing:
+                let newY = startY + dy
+                let newRight = right + dx
+                clipX = startX
+                clipY = newY
+                clipWidth = max(newRight - startX, minimumSize)
+                clipHeight = max(bottom - newY, minimumSize)
+            case .bottomLeading:
+                let newX = startX + dx
+                let newBottom = bottom + dy
+                clipX = newX
+                clipY = startY
+                clipWidth = max(right - newX, minimumSize)
+                clipHeight = max(newBottom - startY, minimumSize)
+            case .bottomTrailing:
+                let newRight = right + dx
+                let newBottom = bottom + dy
+                clipX = startX
+                clipY = startY
+                clipWidth = max(newRight - startX, minimumSize)
+                clipHeight = max(newBottom - startY, minimumSize)
+            }
+        }
+    }
+
+    func normalizedDimension(_ value: Double, defaultValue: Double) -> Double {
+        guard value.isFinite, value > 0 else { return defaultValue }
+        return value
+    }
+}
+
+enum ClipResizeHandle: CaseIterable, Hashable, Identifiable {
+    case topLeading
+    case topTrailing
+    case bottomLeading
+    case bottomTrailing
+
+    var id: Self { self }
+
+    func position(in rect: CGRect) -> CGPoint {
+        switch self {
+        case .topLeading:
+            CGPoint(x: rect.minX, y: rect.minY)
+        case .topTrailing:
+            CGPoint(x: rect.maxX, y: rect.minY)
+        case .bottomLeading:
+            CGPoint(x: rect.minX, y: rect.maxY)
+        case .bottomTrailing:
+            CGPoint(x: rect.maxX, y: rect.maxY)
+        }
+    }
+}
+
+enum ClipFrameDragState {
+    case move(x: Double, y: Double)
+    case resize(x: Double, y: Double, width: Double, height: Double)
 }
 
 #endif

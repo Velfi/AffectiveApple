@@ -10,6 +10,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum AvatarEditorSection: String, CaseIterable, Identifiable {
+    case generate
     case layout
     case atlases
     case expressions
@@ -19,6 +20,7 @@ enum AvatarEditorSection: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .generate: "Generate"
         case .layout: "Layout"
         case .atlases: "Atlases"
         case .expressions: "Expressions"
@@ -28,6 +30,7 @@ enum AvatarEditorSection: String, CaseIterable, Identifiable {
 
     var systemImage: String {
         switch self {
+        case .generate: "sparkles"
         case .layout: "square.on.square"
         case .atlases: "rectangle.grid.3x2"
         case .expressions: "face.smiling"
@@ -38,61 +41,42 @@ enum AvatarEditorSection: String, CaseIterable, Identifiable {
     var sidebarWidth: Double {
         switch self {
         case .expressions:
-            620
+            560
+        case .generate:
+            420
         case .layout, .atlases, .clip:
             380
         }
     }
 }
 
-struct AvatarExpressionPreset: Identifiable, Equatable {
-    let id: String
-    var name: String
-    var eyesFrame: Int
-    var mouthFrame: Int
-    var blinkFramesText: String
-    var blinkFPS: Double
+enum ClipAspectMode: Equatable {
+    case free
+    case locked(width: Double, height: Double)
 
-    var blinkFrames: [Int] {
-        blinkFramesText
-            .split(separator: ",")
-            .compactMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-            .filter { $0 >= 0 }
-    }
-
-    mutating func apply(_ expression: BrainAvatarManifest.Expression) {
-        name = expression.name
-        if let eyes = expression.layers[AvatarSlot.Kind.eyes.rawValue]?.frame {
-            eyesFrame = eyes
-        }
-        if let mouth = expression.layers[AvatarSlot.Kind.mouth.rawValue]?.frame {
-            mouthFrame = mouth
-        }
-        if let blink = expression.layers[AvatarSlot.Kind.blink.rawValue] {
-            if let frames = blink.frames, !frames.isEmpty {
-                blinkFramesText = frames.map(String.init).joined(separator: ",")
-            }
-            if let fps = blink.fps {
-                blinkFPS = fps
-            }
+    var ratio: Double? {
+        switch self {
+        case .free:
+            return nil
+        case .locked(let width, let height):
+            guard width > 0, height > 0 else { return nil }
+            return width / height
         }
     }
 
-    static func defaults(neutralEyes: Int, neutralMouth: Int, blinkFPS: Double) -> [AvatarExpressionPreset] {
-        [
-            .init(id: "neutral", name: "Neutral", eyesFrame: neutralEyes, mouthFrame: neutralMouth, blinkFramesText: "0,1,2,1", blinkFPS: blinkFPS),
-            .init(id: "happy", name: "Happy", eyesFrame: neutralEyes, mouthFrame: neutralMouth, blinkFramesText: "0,1,2,1", blinkFPS: blinkFPS),
-            .init(id: "thinking", name: "Thinking", eyesFrame: neutralEyes, mouthFrame: neutralMouth, blinkFramesText: "0,1,2,1", blinkFPS: blinkFPS),
-            .init(id: "surprised", name: "Surprised", eyesFrame: neutralEyes, mouthFrame: neutralMouth, blinkFramesText: "0,1,2,1", blinkFPS: blinkFPS),
-            .init(id: "concerned", name: "Concerned", eyesFrame: neutralEyes, mouthFrame: neutralMouth, blinkFramesText: "0,1,2,1", blinkFPS: blinkFPS),
-            .init(id: "laughing", name: "Laughing", eyesFrame: neutralEyes, mouthFrame: neutralMouth, blinkFramesText: "0,1,2,1", blinkFPS: blinkFPS),
-            .init(id: "speaking", name: "Speaking", eyesFrame: neutralEyes, mouthFrame: neutralMouth, blinkFramesText: "0,1,2,1", blinkFPS: blinkFPS),
-            .init(id: "sleepy", name: "Sleepy", eyesFrame: neutralEyes, mouthFrame: neutralMouth, blinkFramesText: "0,1,2,1", blinkFPS: blinkFPS),
-        ]
+    var label: String {
+        switch self {
+        case .free:
+            "Free"
+        case .locked(let width, let height):
+            "\(Int(width)):\(Int(height))"
+        }
     }
 }
 
-struct SpriteAtlasDetection {
+typealias AvatarAtlasSprite = BrainAvatarManifest.AtlasSprite
+
+nonisolated struct SpriteAtlasDetection {
     let columns: Int
     let rows: Int
     let frameX: Double
@@ -102,6 +86,26 @@ struct SpriteAtlasDetection {
 
     var frames: Int {
         columns * rows
+    }
+
+    static func detect(imageSize: CGSize, columns: Int, rows: Int) -> SpriteAtlasDetection? {
+        let width = max(Int(imageSize.width), 1)
+        let height = max(Int(imageSize.height), 1)
+        guard columns > 0, rows > 0,
+              width.isMultiple(of: columns),
+              height.isMultiple(of: rows) else {
+            return nil
+        }
+        let frameWidth = width / columns
+        let frameHeight = height / rows
+        return SpriteAtlasDetection(
+            columns: columns,
+            rows: rows,
+            frameX: 0,
+            frameY: 0,
+            frameWidth: Double(frameWidth),
+            frameHeight: Double(frameHeight)
+        )
     }
 
     static func detect(imageSize: CGSize, kind: AvatarSlot.Kind, current: AvatarSlot) -> SpriteAtlasDetection {
@@ -120,17 +124,17 @@ struct SpriteAtlasDetection {
             frameHeight: Double(height)
         )
         var bestScore = Double.greatestFiniteMagnitude
+        let maxGrid = maxGridDimension(width: width, height: height)
 
-        for columns in 1...8 {
+        for columns in 1...maxGrid {
             guard width.isMultiple(of: columns) else { continue }
-            for rows in 1...8 {
+            for rows in 1...maxGrid {
                 guard height.isMultiple(of: rows), columns * rows > 1 else { continue }
                 let frameWidth = width / columns
                 let frameHeight = height / rows
                 let ratioScore = abs(log(Double(frameWidth) / Double(frameHeight)))
-                let countScore = preferredCountScore(columns * rows, kind: kind)
                 let shapeScore = columns >= rows ? 0 : 0.35
-                let score = ratioScore + countScore + shapeScore
+                let score = ratioScore + shapeScore
                 if score < bestScore {
                     bestScore = score
                     best = SpriteAtlasDetection(
@@ -146,6 +150,13 @@ struct SpriteAtlasDetection {
         }
 
         return best
+    }
+
+    static func maxGridDimension(width: Int, height: Int) -> Int {
+        let minFrame = 16
+        let fromWidth = max(width / minFrame, 1)
+        let fromHeight = max(height / minFrame, 1)
+        return min(max(fromWidth, fromHeight), 32)
     }
 
     static func constrainedDetection(width: Int, height: Int, current: AvatarSlot) -> SpriteAtlasDetection? {
@@ -210,20 +221,6 @@ struct SpriteAtlasDetection {
         }
         return max((imageSize - frameSize * count) / 2, 0)
     }
-
-    static func preferredCountScore(_ count: Int, kind: AvatarSlot.Kind) -> Double {
-        switch kind {
-        case .eyes, .mouth:
-            if count == 12 { return -0.8 }
-            if count == 8 || count == 16 { return -0.2 }
-            return Double(abs(count - 12)) * 0.08
-        case .blink:
-            if count == 4 || count == 8 { return -0.5 }
-            return Double(abs(count - 6)) * 0.08
-        case .background, .head, .hair:
-            return 0
-        }
-    }
 }
 
 struct AvatarSlot: Identifiable, Equatable {
@@ -278,11 +275,11 @@ struct AvatarSlot: Identifiable, Equatable {
         }
 
         var defaultsToAtlas: Bool {
-            self == .blink
+            false
         }
 
         var defaultsToAnimatedAtlas: Bool {
-            self == .blink
+            false
         }
 
         var supportsAnimationToggle: Bool {
@@ -300,10 +297,11 @@ struct AvatarSlot: Identifiable, Equatable {
     var isEnabled = true
     var relativePath: String?
     var sourceURL: URL?
-    var x: Double = 0
-    var y: Double = 0
+    var x: Double = 256
+    var y: Double = 256
     var width: Double = 512
     var height: Double = 512
+    var anchor: BrainAvatarManifest.LayerAnchor = .center
     var usesAtlas: Bool
     var isAnimatedAtlas: Bool
     var columns = 1
@@ -315,14 +313,58 @@ struct AvatarSlot: Identifiable, Equatable {
     var frames = 1
     var selectedFrame = 0
     var fps: Double = 8
+    var backgroundColor: Color?
+    var isBackgroundTransparent = false
 
     var title: String { kind.title }
     var systemImage: String { kind.systemImage }
     var supportsAtlas: Bool { kind.supportsAtlas }
     var supportsAnimationToggle: Bool { kind.supportsAnimationToggle }
 
+    var effectiveFrameCount: Int {
+        max(columns * rows, 1)
+    }
+
+    func topLeftOrigin() -> (x: Double, y: Double) {
+        (x - width / 2, y - height / 2)
+    }
+
+    mutating func syncAtlasGrid() {
+        frames = effectiveFrameCount
+        selectedFrame = min(max(selectedFrame, 0), max(frames - 1, 0))
+    }
+
+    var hasRenderableContent: Bool {
+        if relativePath != nil {
+            return true
+        }
+        if kind == .background {
+            return backgroundColor != nil || isBackgroundTransparent
+        }
+        return false
+    }
+
     var manifestLayer: BrainAvatarManifest.Layer? {
-        guard isEnabled, let relativePath else { return nil }
+        guard isEnabled else { return nil }
+
+        if kind == .background, relativePath == nil {
+            guard backgroundColor != nil || isBackgroundTransparent else { return nil }
+            return BrainAvatarManifest.Layer(
+                id: id,
+                name: title,
+                image: nil,
+                atlas: nil,
+                x: x,
+                y: y,
+                width: width,
+                height: height,
+                z: kind.z,
+                color: isBackgroundTransparent ? nil : backgroundColor?.avatarHexString,
+                anchor: .center
+            )
+        }
+
+        guard let relativePath else { return nil }
         return BrainAvatarManifest.Layer(
             id: id,
             name: title,
@@ -337,10 +379,11 @@ struct AvatarSlot: Identifiable, Equatable {
             frameY: usesAtlas ? frameY : nil,
             frameWidth: usesAtlas ? frameWidth : nil,
             frameHeight: usesAtlas ? frameHeight : nil,
-            frames: usesAtlas ? max(frames, 1) : nil,
+            frames: usesAtlas ? effectiveFrameCount : nil,
             frame: usesAtlas && !isAnimatedAtlas ? clampedSelectedFrame : nil,
             fps: usesAtlas && isAnimatedAtlas ? max(fps, 1) : nil,
-            opacity: nil
+            opacity: nil,
+            anchor: .center
         )
     }
 
@@ -356,10 +399,29 @@ struct AvatarSlot: Identifiable, Equatable {
         sourceURL = nil
         usesAtlas = layer.atlas != nil
         isAnimatedAtlas = layer.atlas != nil && layer.fps != nil && layer.frame == nil
-        x = layer.x
-        y = layer.y
         width = layer.width
         height = layer.height
+
+        switch layer.resolvedAnchor {
+        case .topLeading:
+            x = layer.x + layer.width / 2
+            y = layer.y + layer.height / 2
+        case .center:
+            x = layer.x
+            y = layer.y
+        }
+        anchor = .center
+
+        if kind == .background {
+            if let colorHex = layer.color {
+                backgroundColor = Color.avatarColor(fromHex: colorHex)
+                isBackgroundTransparent = false
+            } else if layer.image == nil {
+                isBackgroundTransparent = true
+                backgroundColor = nil
+            }
+        }
+
         frameX = layer.frameX ?? 0
         frameY = layer.frameY ?? 0
         frameWidth = layer.frameWidth ?? layer.width
@@ -372,6 +434,7 @@ struct AvatarSlot: Identifiable, Equatable {
         let inferredColumns = Int(((inferredWidth - max(frameX, 0)) / max(frameWidth, 1)).rounded(.down))
         columns = max(inferredColumns, 1)
         rows = max(Int(ceil(Double(max(frames, 1)) / Double(columns))), 1)
+        syncAtlasGrid()
         selectedFrame = layer.frame ?? 0
         fps = layer.fps ?? 8
     }

@@ -5,7 +5,7 @@
 
 import Foundation
 
-struct BrainAvatarManifest: Codable, Equatable {
+nonisolated struct BrainAvatarManifest: Codable, Equatable {
     struct Canvas: Codable, Equatable {
         let width: Double
         let height: Double
@@ -39,14 +39,25 @@ struct BrainAvatarManifest: Codable, Equatable {
 
     struct LayerOverride: Codable, Equatable {
         let frame: Int?
+        let sprite: String?
         let frames: [Int]?
         let fps: Double?
 
-        init(frame: Int? = nil, frames: [Int]? = nil, fps: Double? = nil) {
+        init(frame: Int? = nil, sprite: String? = nil, frames: [Int]? = nil, fps: Double? = nil) {
             self.frame = frame
+            self.sprite = sprite
             self.frames = frames
             self.fps = fps
         }
+    }
+
+    struct AtlasSprite: Codable, Equatable, Identifiable {
+        let frame: Int
+        let row: Int
+        let column: Int
+        var name: String
+
+        var id: Int { frame }
     }
 
     struct AtlasPlayback: Equatable {
@@ -72,6 +83,11 @@ struct BrainAvatarManifest: Codable, Equatable {
         let y: Int
     }
 
+    enum LayerAnchor: String, Codable, Equatable {
+        case topLeading
+        case center
+    }
+
     struct Layer: Codable, Identifiable, Equatable {
         var id: String
         let name: String?
@@ -90,6 +106,8 @@ struct BrainAvatarManifest: Codable, Equatable {
         let frame: Int?
         let fps: Double?
         let opacity: Double?
+        let color: String?
+        let anchor: LayerAnchor?
 
         enum CodingKeys: String, CodingKey {
             case id
@@ -109,6 +127,8 @@ struct BrainAvatarManifest: Codable, Equatable {
             case frame
             case fps
             case opacity
+            case color
+            case anchor
         }
 
         init(
@@ -128,7 +148,9 @@ struct BrainAvatarManifest: Codable, Equatable {
             frames: Int? = nil,
             frame: Int? = nil,
             fps: Double? = nil,
-            opacity: Double? = nil
+            opacity: Double? = nil,
+            color: String? = nil,
+            anchor: LayerAnchor? = nil
         ) {
             self.id = id
             self.name = name
@@ -147,6 +169,21 @@ struct BrainAvatarManifest: Codable, Equatable {
             self.frame = frame
             self.fps = fps
             self.opacity = opacity
+            self.color = color
+            self.anchor = anchor
+        }
+
+        var resolvedAnchor: LayerAnchor {
+            anchor ?? .topLeading
+        }
+
+        func topLeftOrigin() -> (x: Double, y: Double) {
+            switch resolvedAnchor {
+            case .topLeading:
+                (x, y)
+            case .center:
+                (x - width / 2, y - height / 2)
+            }
         }
 
         init(from decoder: Decoder) throws {
@@ -167,6 +204,8 @@ struct BrainAvatarManifest: Codable, Equatable {
             frame = try container.decodeIfPresent(Int.self, forKey: .frame)
             fps = try container.decodeIfPresent(Double.self, forKey: .fps)
             opacity = try container.decodeIfPresent(Double.self, forKey: .opacity)
+            color = try container.decodeIfPresent(String.self, forKey: .color)
+            anchor = try container.decodeIfPresent(LayerAnchor.self, forKey: .anchor)
             id = try container.decodeIfPresent(String.self, forKey: .id)
                 ?? name
                 ?? image
@@ -178,6 +217,8 @@ struct BrainAvatarManifest: Codable, Equatable {
     let canvas: Canvas
     let clip: ClipFrame?
     let layers: [Layer]
+    let eyeSprites: [AtlasSprite]
+    let mouthSprites: [AtlasSprite]
     let defaultExpression: String?
     let expressions: [Expression]
     let rootURL: URL
@@ -186,6 +227,8 @@ struct BrainAvatarManifest: Codable, Equatable {
         case canvas
         case clip
         case layers
+        case eyeSprites
+        case mouthSprites
         case defaultExpression
         case expressions
     }
@@ -194,6 +237,8 @@ struct BrainAvatarManifest: Codable, Equatable {
         canvas: Canvas,
         clip: ClipFrame? = nil,
         layers: [Layer],
+        eyeSprites: [AtlasSprite] = [],
+        mouthSprites: [AtlasSprite] = [],
         defaultExpression: String? = nil,
         expressions: [Expression] = [],
         rootURL: URL
@@ -201,6 +246,8 @@ struct BrainAvatarManifest: Codable, Equatable {
         self.canvas = canvas
         self.clip = clip
         self.layers = layers.sorted { $0.z < $1.z }
+        self.eyeSprites = eyeSprites
+        self.mouthSprites = mouthSprites
         self.defaultExpression = defaultExpression
         self.expressions = expressions
         self.rootURL = rootURL
@@ -211,6 +258,8 @@ struct BrainAvatarManifest: Codable, Equatable {
         canvas = try container.decode(Canvas.self, forKey: .canvas)
         clip = try container.decodeIfPresent(ClipFrame.self, forKey: .clip)
         layers = try container.decode([Layer].self, forKey: .layers).sorted { $0.z < $1.z }
+        eyeSprites = try container.decodeIfPresent([AtlasSprite].self, forKey: .eyeSprites) ?? []
+        mouthSprites = try container.decodeIfPresent([AtlasSprite].self, forKey: .mouthSprites) ?? []
         defaultExpression = try container.decodeIfPresent(String.self, forKey: .defaultExpression)
         expressions = try container.decodeIfPresent([Expression].self, forKey: .expressions) ?? []
         rootURL = URL(fileURLWithPath: "/")
@@ -221,6 +270,12 @@ struct BrainAvatarManifest: Codable, Equatable {
         try container.encode(canvas, forKey: .canvas)
         try container.encodeIfPresent(clip, forKey: .clip)
         try container.encode(layers.sorted { $0.z < $1.z }, forKey: .layers)
+        if !eyeSprites.isEmpty {
+            try container.encode(eyeSprites, forKey: .eyeSprites)
+        }
+        if !mouthSprites.isEmpty {
+            try container.encode(mouthSprites, forKey: .mouthSprites)
+        }
         try container.encodeIfPresent(defaultExpression, forKey: .defaultExpression)
         if !expressions.isEmpty {
             try container.encode(expressions, forKey: .expressions)
@@ -232,6 +287,8 @@ struct BrainAvatarManifest: Codable, Equatable {
             let canvas: Canvas
             let clip: ClipFrame?
             let layers: [Layer]
+            let eyeSprites: [AtlasSprite]?
+            let mouthSprites: [AtlasSprite]?
             let defaultExpression: String?
             let expressions: [Expression]?
         }
@@ -241,6 +298,8 @@ struct BrainAvatarManifest: Codable, Equatable {
             canvas: payload.canvas,
             clip: payload.clip,
             layers: payload.layers,
+            eyeSprites: payload.eyeSprites ?? [],
+            mouthSprites: payload.mouthSprites ?? [],
             defaultExpression: payload.defaultExpression,
             expressions: payload.expressions ?? [],
             rootURL: rootURL
@@ -254,8 +313,8 @@ struct BrainAvatarManifest: Codable, Equatable {
             return ClipFrame(width: canvasWidth, height: canvasHeight)
         }
         return ClipFrame(
-            x: max(0, clip.x.isFinite ? clip.x : 0),
-            y: max(0, clip.y.isFinite ? clip.y : 0),
+            x: clip.x.isFinite ? clip.x : 0,
+            y: clip.y.isFinite ? clip.y : 0,
             width: max(1, clip.width.isFinite ? clip.width : canvasWidth),
             height: max(1, clip.height.isFinite ? clip.height : canvasHeight)
         )
@@ -281,10 +340,227 @@ struct BrainAvatarManifest: Codable, Equatable {
         return expressions.first
     }
 
-    func atlasPlayback(for layer: Layer, expressionID: String? = nil) -> AtlasPlayback {
+    func eyeFrame(named name: String) -> Int? {
+        eyeSprites.first(where: { $0.name == name })?.frame
+    }
+
+    func mouthFrame(named name: String) -> Int? {
+        mouthSprites.first(where: { $0.name == name })?.frame
+    }
+
+    var availableEyeSpriteNames: [String] {
+        eyeSprites.map(\.name)
+    }
+
+    var availableMouthSpriteNames: [String] {
+        mouthSprites.map(\.name)
+    }
+
+    static func syncedSprites(
+        existing: [AtlasSprite],
+        columns: Int,
+        rows: Int,
+        prefix: String
+    ) -> [AtlasSprite] {
+        let safeColumns = max(columns, 1)
+        let safeRows = max(rows, 1)
+        let frameCount = safeColumns * safeRows
+        let byFrame = Dictionary(uniqueKeysWithValues: existing.map { ($0.frame, $0) })
+        return (0..<frameCount).map { frame in
+            let row = frame / safeColumns
+            let column = frame % safeColumns
+            if let sprite = byFrame[frame] {
+                return AtlasSprite(frame: frame, row: row, column: column, name: sprite.name)
+            }
+            return AtlasSprite(frame: frame, row: row, column: column, name: "\(prefix)_\(frame)")
+        }
+    }
+
+    func blinkExpressionID() -> String? {
+        if expression(id: "neutral") != nil {
+            return "neutral"
+        }
+        if let defaultExpression, expression(id: defaultExpression) != nil {
+            return defaultExpression
+        }
+        return expressions.first?.id
+    }
+
+    func hasSeparateBlinkLayer() -> Bool {
+        layers.contains { $0.id == "blink" && $0.atlas != nil }
+    }
+
+    func blinkTargetLayerID(expressionID: String? = nil) -> String? {
+        if hasSeparateBlinkLayer() {
+            return "blink"
+        }
+        if resolvedEyeBlinkPlayback(expressionID: expressionID ?? blinkExpressionID()) != nil {
+            return "eyes"
+        }
+        return nil
+    }
+
+    func resolvedEyeBlinkPlayback(expressionID: String?) -> AtlasPlayback? {
+        guard !hasSeparateBlinkLayer(), let expression = expression(id: expressionID) else { return nil }
+
+        if let override = expression.layers["eyes"],
+           let frames = override.frames,
+           !frames.isEmpty,
+           let fps = override.fps {
+            return AtlasPlayback(frame: nil, frames: frames, fps: fps)
+        }
+
+        if let override = expression.layers["blink"],
+           let frames = override.frames,
+           !frames.isEmpty {
+            return AtlasPlayback(frame: nil, frames: frames, fps: override.fps ?? 12)
+        }
+
+        return nil
+    }
+
+    func resolvedBlinkLayerPlayback(expressionID: String?) -> AtlasPlayback? {
+        guard hasSeparateBlinkLayer(), let expression = expression(id: expressionID) else { return nil }
+
+        if let override = expression.layers["blink"],
+           let frames = override.frames,
+           !frames.isEmpty {
+            let blinkLayer = layers.first(where: { $0.id == "blink" })
+            return AtlasPlayback(
+                frame: nil,
+                frames: frames,
+                fps: override.fps ?? blinkLayer?.fps ?? 12
+            )
+        }
+
+        if let blinkLayer = layers.first(where: { $0.id == "blink" }),
+           blinkLayer.frame == nil,
+           let fps = blinkLayer.fps,
+           let frameCount = blinkLayer.frames,
+           frameCount > 1 {
+            return AtlasPlayback(frame: nil, frames: Array(0..<frameCount), fps: fps)
+        }
+
+        return nil
+    }
+
+    func resolvedBlinkPlayback(expressionID: String?) -> AtlasPlayback? {
+        if hasSeparateBlinkLayer() {
+            return resolvedBlinkLayerPlayback(expressionID: expressionID)
+        }
+        return resolvedEyeBlinkPlayback(expressionID: expressionID)
+    }
+
+    func shouldApplyEyeSpriteOverride(_ eyeSprite: String?) -> Bool {
+        guard let eyeSprite, !eyeSprite.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        guard let neutral = neutralEyeSpriteName() else { return true }
+        if eyeSprite != neutral {
+            return true
+        }
+        return resolvedEyeBlinkPlayback(expressionID: blinkExpressionID()) == nil
+    }
+
+    func neutralEyeSpriteName() -> String? {
+        if let expression = expression(id: "neutral"),
+           let sprite = expression.layers["eyes"]?.sprite {
+            return sprite
+        }
+        if let expression = expression(id: "neutral"),
+           let frame = expression.layers["eyes"]?.frame,
+           let sprite = eyeSprites.first(where: { $0.frame == frame }) {
+            return sprite.name
+        }
+        return eyeSprites.first?.name
+    }
+
+    func neutralMouthSpriteName() -> String? {
+        if let expression = expression(id: "neutral"),
+           let sprite = expression.layers["mouth"]?.sprite {
+            return sprite
+        }
+        if let expression = expression(id: "neutral"),
+           let frame = expression.layers["mouth"]?.frame,
+           let sprite = mouthSprites.first(where: { $0.frame == frame }) {
+            return sprite.name
+        }
+        return mouthSprites.first?.name
+    }
+
+    func atlasColumns(for layer: Layer) -> Int {
+        let frameWidth = max(Int((layer.frameWidth ?? layer.width).rounded()), 1)
+        let frameX = max(Int((layer.frameX ?? 0).rounded()), 0)
+        return max(Int(((layer.width - Double(frameX)) / Double(frameWidth)).rounded(.down)), 1)
+    }
+
+    func resolvedEyeFrame(matching brainName: String) -> Int? {
+        let name = brainName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return nil }
+        if let frame = eyeFrame(named: name) {
+            return frame
+        }
+        if let grid = LegacyFacialSprites.eyeGrid[name],
+           let sprite = eyeSprites.first(where: { $0.column == grid.column && $0.row == grid.row }) {
+            return sprite.frame
+        }
+        guard let grid = LegacyFacialSprites.eyeGrid[name],
+              let layer = layers.first(where: { $0.id == "eyes" })
+        else { return nil }
+        return grid.row * atlasColumns(for: layer) + grid.column
+    }
+
+    func resolvedMouthFrame(matching brainName: String) -> Int? {
+        let name = brainName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return nil }
+        if let frame = mouthFrame(named: name) {
+            return frame
+        }
+        if let grid = LegacyFacialSprites.mouthGrid[name],
+           let sprite = mouthSprites.first(where: { $0.column == grid.column && $0.row == grid.row }) {
+            return sprite.frame
+        }
+        guard let grid = LegacyFacialSprites.mouthGrid[name],
+              let layer = layers.first(where: { $0.id == "mouth" })
+        else { return nil }
+        return grid.row * atlasColumns(for: layer) + grid.column
+    }
+
+    func atlasPlayback(
+        for layer: Layer,
+        expressionID: String? = nil,
+        eyeSprite: String? = nil,
+        mouthSprite: String? = nil
+    ) -> AtlasPlayback {
+        if layer.id == "eyes", shouldApplyEyeSpriteOverride(eyeSprite), let eyeSprite,
+           let frame = resolvedEyeFrame(matching: eyeSprite) {
+            return AtlasPlayback(frame: frame, frames: nil, fps: nil)
+        }
+        if layer.id == "eyes",
+           let eyeBlink = resolvedEyeBlinkPlayback(expressionID: expressionID) {
+            return eyeBlink
+        }
+        if layer.id == "blink",
+           let blinkPlayback = resolvedBlinkLayerPlayback(expressionID: expressionID) {
+            return blinkPlayback
+        }
+        if layer.id == "mouth", let mouthSprite, let frame = resolvedMouthFrame(matching: mouthSprite) {
+            return AtlasPlayback(frame: frame, frames: nil, fps: nil)
+        }
+
         if let override = expression(id: expressionID)?.layers[layer.id] {
             if let frames = override.frames, !frames.isEmpty {
                 return AtlasPlayback(frame: nil, frames: frames, fps: override.fps ?? layer.fps ?? 12)
+            }
+            if let sprite = override.sprite {
+                let resolvedFrame: Int? = switch layer.id {
+                case "eyes": eyeFrame(named: sprite)
+                case "mouth": mouthFrame(named: sprite)
+                default: nil
+                }
+                if let resolvedFrame {
+                    return AtlasPlayback(frame: resolvedFrame, frames: nil, fps: nil)
+                }
             }
             if let frame = override.frame {
                 return AtlasPlayback(frame: frame, frames: nil, fps: nil)

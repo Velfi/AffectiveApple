@@ -38,7 +38,7 @@ struct WorkspaceSidebar: View {
                     WorkspaceSidebarButton(
                         section: section,
                         isSelected: model.selectedSection == section,
-                        badge: section == .mailbox && model.unreadDreamReportCount > 0 ? "\(model.unreadDreamReportCount)" : nil,
+                        badge: section == .mailbox && model.unreadMailboxItemCount > 0 ? "\(model.unreadMailboxItemCount)" : nil,
                         select: { model.selectedSection = section }
                     )
                 }
@@ -81,6 +81,8 @@ struct WorkspaceSidebarButton: View {
                         .accessibilityLabel("\(badge) unread reports")
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .background(isSelected ? AppTheme.activePanelBackground : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -151,7 +153,7 @@ struct ChatWorkspace: View {
             if horizontalSizeClass == .compact {
                 if !composerFocused.wrappedValue {
                     WorkspaceHeader(
-                        title: model.brain.displayName,
+                        title: model.workspaceBrainTitle,
                         subtitle: "Chat with the selected brain and choose how much autonomy it has.",
                         model: model
                     )
@@ -165,43 +167,47 @@ struct ChatWorkspace: View {
                     .overlay(AppTheme.softSeparator)
             }
 
-            ChatTranscriptView(
-                entries: model.chatEntries,
-                brainRootURL: model.brain.rootURL,
-                isResponding: model.isAwaitingChatResponse
-            )
-            .frame(maxHeight: .infinity)
-            .layoutPriority(1)
+            if horizontalSizeClass == .compact {
+                ChatTranscriptView(
+                    entries: model.chatEntries,
+                    brainRootURL: model.brain.rootURL,
+                    isResponding: model.isAwaitingChatResponse
+                )
+                .frame(maxHeight: .infinity)
+                .layoutPriority(1)
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    compactPortraitComposer
+                }
+            } else {
+                ChatTranscriptView(
+                    entries: model.chatEntries,
+                    brainRootURL: model.brain.rootURL,
+                    isResponding: model.isAwaitingChatResponse
+                )
+                .frame(maxHeight: .infinity)
+                .layoutPriority(1)
 
+                Divider()
+                    .overlay(AppTheme.softSeparator)
+
+                ComposerPanel(model: model, composerFocused: composerFocused)
+                    .padding(24)
+                    .background(AppTheme.sidebarBackground.opacity(0.45))
+            }
+        }
+    }
+
+    var compactPortraitComposer: some View {
+        VStack(spacing: 0) {
             Divider()
                 .overlay(AppTheme.softSeparator)
 
-            if horizontalSizeClass == .compact {
-                VStack(spacing: composerFocused.wrappedValue ? 6 : 8) {
-                    if !composerFocused.wrappedValue {
-                        ChatControlsStrip(model: model, isCompact: true)
-                    }
-                    AutonomyOptionsPanel(model: model, isCompact: true)
-                    ComposerPanel(model: model, composerFocused: composerFocused, includesVoiceButton: true, isCompact: true)
-                }
+            ComposerPanel(model: model, composerFocused: composerFocused, isCompact: true)
                 .padding(.horizontal, 10)
                 .padding(.top, composerFocused.wrappedValue ? 7 : 8)
                 .padding(.bottom, composerFocused.wrappedValue ? 8 : 10)
                 .background(AppTheme.sidebarBackground.opacity(0.86))
                 .animation(.smooth(duration: 0.18), value: composerFocused.wrappedValue)
-            } else {
-                VStack(spacing: 14) {
-                    ChatControlsStrip(model: model)
-                    AutonomyOptionsPanel(model: model)
-                    HStack(alignment: .top, spacing: 14) {
-                        PrimaryHoldButton(model: model)
-                            .frame(maxWidth: 360)
-                        ComposerPanel(model: model, composerFocused: composerFocused, includesVoiceButton: false)
-                    }
-                }
-                .padding(24)
-                .background(AppTheme.sidebarBackground.opacity(0.45))
-            }
         }
     }
 
@@ -223,10 +229,7 @@ struct ChatWorkspace: View {
                 VStack(alignment: .leading, spacing: 12) {
                     HeaderStrip(model: model)
                         .panelStyle()
-                    ChatControlsStrip(model: model)
-                    AutonomyOptionsPanel(model: model)
-                    PrimaryHoldButton(model: model)
-                    ComposerPanel(model: model, composerFocused: composerFocused, includesVoiceButton: false)
+                    ComposerPanel(model: model, composerFocused: composerFocused)
                 }
                 .padding(12)
             }
@@ -305,7 +308,7 @@ struct DreamMailboxWorkspace: View {
             VStack(alignment: .leading, spacing: 14) {
                 WorkspaceHeader(
                     title: "Mailbox",
-                    subtitle: "Daily dream reports generated on the player side.",
+                    subtitle: "Brain-owned mailbox items with local read and archive state.",
                     model: model
                 )
 
@@ -330,20 +333,20 @@ struct DreamMailboxWorkspace: View {
 
             ScrollView {
                 LazyVStack(spacing: 10) {
-                    if model.visibleDreamReports.isEmpty {
+                    if model.visibleMailboxItems.isEmpty {
                         EmptyStateCard(
-                            title: model.showsArchivedDreamReports ? "Archived dream reports will appear here." : "New daily dream reports will appear here.",
+                            title: model.showsArchivedMailboxItems ? "Archived mailbox items will appear here." : "New mailbox items will appear here.",
                             systemImage: "tray.full"
                         )
                         .padding(.top, 36)
                     } else {
-                        ForEach(model.visibleDreamReports) { report in
-                            DreamReportRow(
-                                report: report,
+                        ForEach(model.visibleMailboxItems) { item in
+                            MailboxItemRow(
+                                item: item,
                                 brainRootURL: model.brain.rootURL,
-                                isSelected: model.selectedDreamReport?.id == report.id
+                                isSelected: model.selectedMailboxItem?.id == item.id
                             ) {
-                                model.selectDreamReport(report)
+                                model.selectMailboxItem(item)
                             }
                         }
                     }
@@ -355,11 +358,11 @@ struct DreamMailboxWorkspace: View {
 
     var mailboxDetail: some View {
         ScrollView {
-            if let report = model.selectedDreamReport {
-                DreamReportDetail(model: model, report: report)
+            if let item = model.selectedMailboxItem {
+                MailboxItemDetail(model: model, item: item)
                     .padding(horizontalSizeClass == .compact ? 14 : 24)
             } else {
-                EmptyStateCard(title: "Select a dream report to read it.", systemImage: "envelope.open")
+                EmptyStateCard(title: "Select a mailbox item to read it.", systemImage: "envelope.open")
                     .padding(.top, 48)
                     .frame(maxWidth: .infinity)
             }
@@ -368,7 +371,7 @@ struct DreamMailboxWorkspace: View {
 
     var archiveToggle: some View {
         SegmentedControl(
-            selection: $model.showsArchivedDreamReports,
+            selection: $model.showsArchivedMailboxItems,
             options: [
                 .init(value: false, title: "Inbox", systemImage: "tray"),
                 .init(value: true, title: "Archived", systemImage: "archivebox"),
@@ -379,18 +382,18 @@ struct DreamMailboxWorkspace: View {
 
     var refreshButton: some View {
         Button {
-            model.refreshDreamReports()
+            model.refreshMailboxItems()
         } label: {
             Label("Scan", systemImage: "arrow.clockwise")
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
-        .help("Scan the selected brain for new dream reports")
+        .help("Refresh mailbox items from the selected brain")
     }
 }
 
-struct DreamReportRow: View {
-    let report: DreamReport
+struct MailboxItemRow: View {
+    let item: MailboxItem
     let brainRootURL: URL
     let isSelected: Bool
     let select: () -> Void
@@ -398,20 +401,21 @@ struct DreamReportRow: View {
     var body: some View {
         Button(action: select) {
             HStack(alignment: .top, spacing: 12) {
-                DreamReportImage(
-                    path: report.imagePath,
-                    mimeType: report.imageMimeType,
+                MailboxItemImage(
+                    path: item.imagePath,
+                    mimeType: item.imageMimeType,
                     brainRootURL: brainRootURL
                 )
-                .frame(width: 74, height: 74)
+                .frame(width: 74, height: 74, alignment: .top)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 7) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(report.createdAt, format: .dateTime.month().day().hour().minute())
+                        Text(item.createdAt, format: .dateTime.month().day().hour().minute())
                             .font(.caption.monospacedDigit().weight(.semibold))
                             .foregroundStyle(AppTheme.secondaryText)
 
-                        if !report.isRead {
+                        if !item.isRead {
                             Text("UNREAD")
                                 .font(.system(size: 9, weight: .bold, design: .rounded))
                                 .foregroundStyle(AppTheme.textOnAccent)
@@ -423,15 +427,18 @@ struct DreamReportRow: View {
                         Spacer(minLength: 4)
                     }
 
-                    Text(report.summary)
+                    Text(item.summary)
                         .font(.callout.weight(.semibold))
                         .foregroundStyle(AppTheme.primaryText)
                         .lineLimit(3)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    DreamReportMetricLine(report: report)
+                    MailboxItemMetricLine(item: item)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .fixedSize(horizontal: false, vertical: true)
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(isSelected ? AppTheme.activePanelBackground : AppTheme.panelBackground.opacity(0.74), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -444,24 +451,24 @@ struct DreamReportRow: View {
     }
 }
 
-struct DreamReportDetail: View {
+struct MailboxItemDetail: View {
     @ObservedObject var model: AffectiveViewModel
-    let report: DreamReport
+    let item: MailboxItem
 
     var body: some View {
-        DreamReportDetailContent(
-            report: report,
+        MailboxItemDetailContent(
+            item: item,
             brainRootURL: model.brain.rootURL
         ) {
-            model.setDreamReport(report.id, isRead: !report.isRead)
+            model.setMailboxItem(item.id, isRead: !item.isRead)
         } toggleArchived: {
-            model.setDreamReport(report.id, isArchived: !report.isArchived)
+            model.setMailboxItem(item.id, isArchived: !item.isArchived)
         }
     }
 }
 
-struct DreamReportDetailContent: View {
-    let report: DreamReport
+struct MailboxItemDetailContent: View {
+    let item: MailboxItem
     let brainRootURL: URL
     let toggleRead: () -> Void
     let toggleArchived: () -> Void
@@ -470,47 +477,47 @@ struct DreamReportDetailContent: View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text(report.createdAt, format: .dateTime.month().day().year().hour().minute())
+                    Text(item.createdAt, format: .dateTime.month().day().year().hour().minute())
                         .font(.caption.monospacedDigit().weight(.semibold))
                         .foregroundStyle(AppTheme.secondaryText)
 
-                    CompactStatusPill(text: report.summarySource.optionDisplayName)
+                    CompactStatusPill(text: item.summarySource.optionDisplayName)
 
                     Spacer(minLength: 8)
                 }
 
-                Text(report.summary)
+                Text(item.summary)
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(AppTheme.primaryText)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            DreamReportImage(
-                path: report.imagePath,
-                mimeType: report.imageMimeType,
+            MailboxItemImage(
+                path: item.imagePath,
+                mimeType: item.imageMimeType,
                 brainRootURL: brainRootURL
             )
             .frame(maxWidth: 560, minHeight: 220, maxHeight: 420)
 
-            DreamReportMetricLine(report: report)
+            MailboxItemMetricLine(item: item)
 
-            DreamReportSection(title: "Reflection", text: report.reflection)
-            DreamReportSection(title: "Image Prompt", text: report.imagePrompt ?? "No prompt recovered.")
-            DreamReportSection(title: "Source Traces", text: report.sourceTraceIDs.isEmpty ? "None recorded." : report.sourceTraceIDs.joined(separator: "\n"))
-            DreamReportSection(title: "Report", text: report.fullReportText)
+            MailboxItemSection(title: "Waking Thought", text: item.reflection)
+            MailboxItemSection(title: "Image Spec", text: item.imageSpec ?? "No spec recovered.")
+            MailboxItemSection(title: "Source Events", text: item.sourceEventIDs.isEmpty ? "None recorded." : item.sourceEventIDs.joined(separator: "\n"))
+            MailboxItemSection(title: "DreamMail Body", text: item.bodyText)
 
             HStack(spacing: 10) {
                 Button {
                     toggleRead()
                 } label: {
-                    Label(report.isRead ? "Mark Unread" : "Mark Read", systemImage: report.isRead ? "envelope.badge" : "envelope.open")
+                    Label(item.isRead ? "Mark Unread" : "Mark Read", systemImage: item.isRead ? "envelope.badge" : "envelope.open")
                 }
                 .buttonStyle(.bordered)
 
                 Button {
                     toggleArchived()
                 } label: {
-                    Label(report.isArchived ? "Unarchive" : "Archive", systemImage: report.isArchived ? "tray.and.arrow.up" : "archivebox")
+                    Label(item.isArchived ? "Unarchive" : "Archive", systemImage: item.isArchived ? "tray.and.arrow.up" : "archivebox")
                 }
                 .buttonStyle(.borderedProminent)
 
@@ -521,26 +528,26 @@ struct DreamReportDetailContent: View {
     }
 }
 
-struct DreamReportMetricLine: View {
-    let report: DreamReport
+struct MailboxItemMetricLine: View {
+    let item: MailboxItem
 
     var body: some View {
         FlowLayout(spacing: 6) {
-            if let heat = report.heat {
-                DreamReportChip(text: "heat \(heat.formatted(.number.precision(.fractionLength(2))))")
+            if let heat = item.heat {
+                MailboxItemChip(text: "heat \(heat.formatted(.number.precision(.fractionLength(2))))")
             }
-            if let style = report.style {
-                DreamReportChip(text: style.optionDisplayName)
+            if let style = item.style {
+                MailboxItemChip(text: style.optionDisplayName)
             }
-            if let confidence = report.confidence {
-                DreamReportChip(text: "confidence \(confidence.formatted(.number.precision(.fractionLength(2))))")
+            if let confidence = item.confidence {
+                MailboxItemChip(text: "confidence \(confidence.formatted(.number.precision(.fractionLength(2))))")
             }
-            DreamReportChip(text: "\(report.sourceTraceIDs.count) traces")
+            MailboxItemChip(text: "\(item.sourceEventIDs.count) events")
         }
     }
 }
 
-struct DreamReportChip: View {
+struct MailboxItemChip: View {
     let text: String
 
     var body: some View {
@@ -555,7 +562,7 @@ struct DreamReportChip: View {
     }
 }
 
-struct DreamReportSection: View {
+struct MailboxItemSection: View {
     let title: String
     let text: String
 
@@ -565,7 +572,7 @@ struct DreamReportSection: View {
                 .font(.caption.weight(.bold))
                 .foregroundStyle(AppTheme.accent)
             Text(text)
-                .font(title == "Report" ? .system(size: 12, weight: .regular, design: .monospaced) : .callout)
+                .font(title == "DreamMail Body" ? .system(size: 12, weight: .regular, design: .monospaced) : .callout)
                 .foregroundStyle(AppTheme.primaryText)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
@@ -580,7 +587,7 @@ struct DreamReportSection: View {
     }
 }
 
-struct DreamReportImage: View {
+struct MailboxItemImage: View {
     let path: String?
     let mimeType: String?
     let brainRootURL: URL
@@ -609,12 +616,14 @@ struct DreamReportImage: View {
                 missingImage
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(AppTheme.separator)
         )
-        .accessibilityLabel("Dream image")
+        .accessibilityLabel("Mailbox item image")
     }
 
     @ViewBuilder
@@ -654,18 +663,18 @@ struct DreamReportImage: View {
 }
 
 #if DEBUG
-private enum DreamReportPreviewData {
-    static let rootURL = URL(fileURLWithPath: "/tmp/Affective-DreamReportPreview", isDirectory: true)
+private enum MailboxItemPreviewData {
+    static let rootURL = URL(fileURLWithPath: "/tmp/Affective-MailboxItemPreview", isDirectory: true)
 
-    static let unread = DreamReport(
-        reportID: "dream-report-2026-06-25-dream-01",
-        dreamID: "dream-01",
+    static let unread = MailboxItem(
+        mailboxID: "dreammail-2026-06-25-dream-01",
+        sourceDreamID: "dream-01",
         dayKey: "2026-06-25",
         createdAt: Date(timeIntervalSinceReferenceDate: 804_492_000),
         summary: "A warm, high-heat dream linked the workshop light, a half-finished promise, and the image of a door opening into rain.",
-        summarySource: "fallback",
-        fullReportText: """
-        Daily Dream Report
+        summarySource: "preview_mailbox",
+        bodyText: """
+        DreamMail
 
         Dream ID: dream-01
         Day: 2026-06-25
@@ -673,7 +682,7 @@ private enum DreamReportPreviewData {
         Style: vivid
         Confidence: 0.82
 
-        Reflection:
+        Waking Thought:
         The dream circled around unfinished repair work and turned it into a threshold image.
 
         Connection:
@@ -683,69 +692,69 @@ private enum DreamReportPreviewData {
         heat: 0.84,
         style: "vivid",
         confidence: 0.82,
-        sourceTraceIDs: ["memory:workshop-light", "artifact:door-rain", "event:dream-image-01"],
-        generatedArtifactID: "artifact-door-rain",
+        sourceEventIDs: ["memory:workshop-light", "artifact:door-rain", "event:dream-image-01"],
+        artifactID: "artifact-door-rain",
         imagePath: nil,
         imageMimeType: "image/png",
-        imagePrompt: "A blue door opening into rain, with warm workshop light spilling from inside.",
+        imageSpec: "A blue door opening into rain, with warm workshop light spilling from inside.",
         isRead: false,
         isArchived: false
     )
 
-    static let read = DreamReport(
-        reportID: "dream-report-2026-06-24-dream-02",
-        dreamID: "dream-02",
+    static let read = MailboxItem(
+        mailboxID: "dreammail-2026-06-24-dream-02",
+        sourceDreamID: "dream-02",
         dayKey: "2026-06-24",
         createdAt: Date(timeIntervalSinceReferenceDate: 804_405_600),
         summary: "A quieter dream compared two remembered rooms and resolved them into a small, steady image of continuity.",
         summarySource: "openai",
-        fullReportText: "Daily Dream Report\n\nA quieter report fixture for opened/read mailbox coverage.",
+        bodyText: "DreamMail\n\nA quieter mailbox item for opened/read mailbox coverage.",
         reflection: "Two remembered rooms folded into one continuous place.",
         heat: 0.41,
         style: "quiet",
         confidence: 0.58,
-        sourceTraceIDs: ["memory:room-a", "memory:room-b"],
-        generatedArtifactID: nil,
+        sourceEventIDs: ["memory:room-a", "memory:room-b"],
+        artifactID: nil,
         imagePath: nil,
         imageMimeType: nil,
-        imagePrompt: nil,
+        imageSpec: nil,
         isRead: true,
         isArchived: false
     )
 
-    static let archived = DreamReport(
-        reportID: "dream-report-2026-06-23-dream-03",
-        dreamID: "dream-03",
+    static let archived = MailboxItem(
+        mailboxID: "dreammail-2026-06-23-dream-03",
+        sourceDreamID: "dream-03",
         dayKey: "2026-06-23",
         createdAt: Date(timeIntervalSinceReferenceDate: 804_319_200),
-        summary: "Archived report preview with a recovered image prompt and reversible archive state.",
-        summarySource: "fallback",
-        fullReportText: "Daily Dream Report\n\nArchived report fixture.",
-        reflection: "A completed report that has been moved out of the active inbox.",
+        summary: "Archived DreamMail preview with a recovered image prompt and reversible archive state.",
+        summarySource: "preview_mailbox",
+        bodyText: "DreamMail\n\nArchived mailbox item fixture.",
+        reflection: "A completed waking thought that has been moved out of the active inbox.",
         heat: 0.62,
         style: "symbolic",
         confidence: 0.70,
-        sourceTraceIDs: ["event:dream-image-archived"],
-        generatedArtifactID: "artifact-archived",
+        sourceEventIDs: ["event:dream-image-archived"],
+        artifactID: "artifact-archived",
         imagePath: nil,
         imageMimeType: "image/png",
-        imagePrompt: "A neatly folded letter beside a glowing image frame.",
+        imageSpec: "A neatly folded letter beside a glowing image frame.",
         isRead: true,
         isArchived: true
     )
 }
 
 #Preview("Mailbox Empty") {
-    EmptyStateCard(title: "New daily dream reports will appear here.", systemImage: "tray.full")
+    EmptyStateCard(title: "New mailbox items will appear here.", systemImage: "tray.full")
         .padding(24)
         .frame(width: 390)
         .background(AppTheme.background)
 }
 
-#Preview("Mailbox Unread Report") {
-    DreamReportRow(
-        report: DreamReportPreviewData.unread,
-        brainRootURL: DreamReportPreviewData.rootURL,
+#Preview("Mailbox Unread Item") {
+    MailboxItemRow(
+        item: MailboxItemPreviewData.unread,
+        brainRootURL: MailboxItemPreviewData.rootURL,
         isSelected: true
     ) {}
     .padding(18)
@@ -753,11 +762,11 @@ private enum DreamReportPreviewData {
     .background(AppTheme.background)
 }
 
-#Preview("Mailbox Opened Report") {
+#Preview("Mailbox Opened Item") {
     ScrollView {
-        DreamReportDetailContent(
-            report: DreamReportPreviewData.read,
-            brainRootURL: DreamReportPreviewData.rootURL
+        MailboxItemDetailContent(
+            item: MailboxItemPreviewData.read,
+            brainRootURL: MailboxItemPreviewData.rootURL
         ) {} toggleArchived: {}
         .padding(24)
     }
@@ -765,10 +774,10 @@ private enum DreamReportPreviewData {
     .background(AppTheme.background)
 }
 
-#Preview("Mailbox Archived Report") {
-    DreamReportRow(
-        report: DreamReportPreviewData.archived,
-        brainRootURL: DreamReportPreviewData.rootURL,
+#Preview("Mailbox Archived Item") {
+    MailboxItemRow(
+        item: MailboxItemPreviewData.archived,
+        brainRootURL: MailboxItemPreviewData.rootURL,
         isSelected: false
     ) {}
     .padding(18)
@@ -807,7 +816,6 @@ struct DeveloperWorkspace: View {
                     VStack(alignment: .leading, spacing: 12) {
                         HeaderStrip(model: model)
                             .panelStyle()
-                        LiveCorePanel(model: model)
                         ReminderToolsPanel(model: model)
                     }
                     .padding(12)
@@ -825,7 +833,6 @@ struct DeveloperWorkspace: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         HeaderStrip(model: model)
-                        LiveCorePanel(model: model)
                         ReminderToolsPanel(model: model)
                     }
                     .padding(24)
@@ -843,9 +850,6 @@ struct DeveloperWorkspace: View {
     func compactDeveloperTools(maxHeight: CGFloat) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(alignment: .top, spacing: 12) {
-                compactToolPanel(maxHeight: maxHeight) {
-                    LiveCorePanel(model: model)
-                }
                 compactToolPanel(maxHeight: maxHeight) {
                     ReminderToolsPanel(model: model)
                 }
@@ -880,11 +884,11 @@ struct DeveloperWorkspace: View {
 
                     Spacer(minLength: 8)
 
-                    CompactStatusPill(text: "\(model.filteredCommandEntries.count)")
-                        .accessibilityLabel("\(model.filteredCommandEntries.count) command entries")
+                    CompactStatusPill(text: "\(model.filteredEventEntries.count)")
+                        .accessibilityLabel("\(model.filteredEventEntries.count) event entries")
                 }
 
-                CommandFilterBar(model: model)
+                EventFilterBar(model: model)
             }
             .padding(.horizontal, horizontalPadding)
             .padding(.top, topPadding)
@@ -894,8 +898,8 @@ struct DeveloperWorkspace: View {
                 .overlay(AppTheme.softSeparator)
 
             DeveloperConsoleList(
-                entries: model.filteredCommandEntries,
-                emptyTitle: "Raw commands and results will appear here."
+                entries: model.filteredEventEntries,
+                emptyTitle: "Brain events and capability results will appear here."
             )
         }
     }
@@ -904,14 +908,14 @@ struct DeveloperWorkspace: View {
         VStack(spacing: 0) {
             WorkspaceHeader(
                 title: "Developer",
-                subtitle: "Inspect every command, filter by kind, and observe live tool results.",
+                subtitle: "Inspect Brain events, filter by kind, and observe capability results.",
                 model: model
             )
             .padding(.horizontal, horizontalPadding)
             .padding(.top, topPadding)
             .padding(.bottom, 16)
 
-            CommandFilterBar(model: model)
+            EventFilterBar(model: model)
                 .padding(.horizontal, horizontalPadding)
                 .padding(.bottom, 16)
 
@@ -919,8 +923,8 @@ struct DeveloperWorkspace: View {
                 .overlay(AppTheme.softSeparator)
 
             EntriesList(
-                entries: model.filteredCommandEntries,
-                emptyTitle: "Raw commands and results will appear here.",
+                entries: model.filteredEventEntries,
+                emptyTitle: "Brain events and capability results will appear here.",
                 brainRootURL: model.brain.rootURL,
                 showsCopyButton: true
             )
@@ -1496,11 +1500,15 @@ struct SidebarBrainPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            ResizableChatAvatar(brain: model.brain)
+            SidebarChatAvatar(
+                brain: model.brain,
+                eyeSprite: model.avatarEyeSprite,
+                mouthSprite: model.avatarMouthSprite
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             VStack(alignment: .leading, spacing: 6) {
-                Text(model.brain.displayName)
+                Text(model.workspaceBrainTitle)
                     .font(.system(size: 24, weight: .semibold, design: .rounded))
                     .lineLimit(2)
                     .minimumScaleFactor(0.8)
@@ -1516,105 +1524,31 @@ struct SidebarBrainPanel: View {
     }
 }
 
-struct ResizableChatAvatar: View {
-    static let defaultSize: CGFloat = 76
-    static let minSize: CGFloat = 58
-    static let maxSize: CGFloat = 220
+struct SidebarChatAvatar: View {
+    static let compactMaxHeight: CGFloat = 82
 
     let brain: BrainDescriptor
-    @State private var size = Self.defaultSize
-    @State private var dragStartSize = Self.defaultSize
-    @State private var isHovering = false
-    @State private var isDragging = false
+    var eyeSprite: String? = nil
+    var mouthSprite: String? = nil
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            BrainAvatar(brain: brain, size: displaySize)
-
-            resizeHandle
-                .opacity(handleVisible ? 1 : 0)
-                .animation(.smooth(duration: 0.16), value: handleVisible)
-        }
-        .frame(width: avatarWidth, height: displaySize, alignment: .topTrailing)
-        .onHover { isHovering = $0 }
-        .onAppear(perform: loadSavedSize)
-        .onChange(of: brain.id) { _, _ in loadSavedSize() }
-    }
-
-    /// On macOS the handle reveals on hover; touch devices have no hover, so it stays visible
-    /// — otherwise the grip is undiscoverable until a drag that can't be started.
-    var handleVisible: Bool {
-        #if os(macOS)
-        isHovering || isDragging
-        #else
-        true
-        #endif
-    }
-
-    var displaySize: CGFloat {
-        let clampedSize = size.isFinite ? min(max(size, Self.minSize), Self.maxSize) : Self.defaultSize
-        return horizontalSizeClass == .compact ? min(clampedSize, 82) : clampedSize
-    }
-
-    var avatarWidth: CGFloat {
-        let aspectRatio = brain.avatarManifest.map { manifest in
-            let clip = manifest.effectiveClip
-            let rawRatio = clip.width / max(clip.height, 1)
-            return rawRatio.isFinite && rawRatio > 0 ? rawRatio : 1
-        } ?? 1
-        return displaySize * aspectRatio
-    }
-
-    var resizeHandle: some View {
-        Circle()
-            .fill(AppTheme.accent)
-            .frame(width: 18, height: 18)
+        Color.clear
+            .aspectRatio(brain.avatarClipAspectRatio, contentMode: .fit)
+            .frame(maxWidth: .infinity)
+            .frame(maxHeight: maxAvatarHeight)
             .overlay {
-                Image(systemName: "arrow.up.right")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(.black.opacity(0.82))
+                BrainAvatar(
+                    brain: brain,
+                    sizing: .fillContainer,
+                    eyeSprite: eyeSprite,
+                    mouthSprite: mouthSprite
+                )
             }
-            .overlay {
-                Circle()
-                    .stroke(.black.opacity(0.35), lineWidth: 1)
-            }
-            .shadow(color: .black.opacity(0.35), radius: 6, y: 3)
-            .padding(5)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { value in
-                        if !isDragging {
-                            dragStartSize = size
-                            isDragging = true
-                        }
-                        let growth = max(value.translation.width, -value.translation.height)
-                        size = clamped(dragStartSize + growth)
-                    }
-                    .onEnded { _ in
-                        isDragging = false
-                        saveSize()
-                    }
-            )
-            .help("Drag up or right to resize avatar")
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    var storageKey: String {
-        "Affective.chatAvatarSize.\(brain.id)"
-    }
-
-    func loadSavedSize() {
-        let saved = UserDefaults.standard.double(forKey: storageKey)
-        size = saved > 0 ? clamped(CGFloat(saved)) : Self.defaultSize
-        dragStartSize = size
-    }
-
-    func saveSize() {
-        UserDefaults.standard.set(Double(size), forKey: storageKey)
-    }
-
-    func clamped(_ value: CGFloat) -> CGFloat {
-        min(max(value, Self.minSize), Self.maxSize)
+    var maxAvatarHeight: CGFloat? {
+        horizontalSizeClass == .compact ? Self.compactMaxHeight : nil
     }
 }

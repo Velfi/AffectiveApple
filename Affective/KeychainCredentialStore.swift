@@ -12,6 +12,7 @@ nonisolated enum ProviderCredentialKey: String, CaseIterable {
     case openAI = "openai_api_key"
     case anthropic = "anthropic_api_key"
     case google = "google_api_key"
+    case deepseek = "deepseek_api_key"
 
     var account: String { rawValue }
 
@@ -20,6 +21,7 @@ nonisolated enum ProviderCredentialKey: String, CaseIterable {
         case .openAI: "OpenAI"
         case .anthropic: "Anthropic"
         case .google: "Google"
+        case .deepseek: "DeepSeek"
         }
     }
 
@@ -28,6 +30,7 @@ nonisolated enum ProviderCredentialKey: String, CaseIterable {
         case .openAI: "openai"
         case .anthropic: "anthropic"
         case .google: "google"
+        case .deepseek: "deepseek"
         }
     }
 
@@ -40,6 +43,7 @@ nonisolated enum ProviderCredentialKey: String, CaseIterable {
         case .openAI: URL(string: "https://platform.openai.com/api-keys")!
         case .anthropic: URL(string: "https://console.anthropic.com/settings/keys")!
         case .google: URL(string: "https://aistudio.google.com/app/apikey")!
+        case .deepseek: URL(string: "https://platform.deepseek.com/api_keys")!
         }
     }
 
@@ -51,9 +55,57 @@ nonisolated enum ProviderCredentialKey: String, CaseIterable {
             return .anthropic
         case "generativelanguage.googleapis.com":
             return .google
+        case "api.deepseek.com":
+            return .deepseek
         default:
             return nil
         }
+    }
+
+    static var supportedDisplayNames: String {
+        allCases.map(\.displayName).joined(separator: ", ")
+    }
+
+    static func environmentCredentialValues() -> [ProviderCredentialKey: String] {
+        let environment = ProcessInfo.processInfo.environment
+        func trimmedValue(_ key: String) -> String? {
+            let value = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return value.isEmpty ? nil : value
+        }
+
+        var credentials: [ProviderCredentialKey: String] = [:]
+        if let value = trimmedValue("OPENAI_API_KEY") {
+            credentials[.openAI] = value
+        }
+        if let value = trimmedValue("ANTHROPIC_API_KEY") {
+            credentials[.anthropic] = value
+        }
+        if let value = trimmedValue("GEMINI_API_KEY")
+            ?? trimmedValue("GOOGLE_API_KEY")
+            ?? trimmedValue("GOOGLE_AI_API_KEY") {
+            credentials[.google] = value
+        }
+        if let value = trimmedValue("DEEPSEEK_API_KEY") {
+            credentials[.deepseek] = value
+        }
+        return credentials
+    }
+
+    static func resolvedCredentials(using store: KeychainCredentialStore) -> [ProviderCredentialKey: String] {
+        var credentials = allCases.reduce(into: [ProviderCredentialKey: String]()) { values, key in
+            guard
+                let value = try? store.credential(for: key)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                !value.isEmpty
+            else {
+                return
+            }
+            values[key] = value
+        }
+        for (key, value) in environmentCredentialValues() where credentials[key] == nil {
+            credentials[key] = value
+        }
+        return credentials
     }
 }
 
@@ -103,7 +155,7 @@ nonisolated struct HostProviderRouter {
             throw HostProviderRoutingError.missingProviderCredential(provider.displayName)
         }
         switch provider {
-        case .openAI:
+        case .openAI, .deepseek:
             request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
         case .anthropic:
             request.setValue(credential, forHTTPHeaderField: "x-api-key")
@@ -158,6 +210,7 @@ nonisolated enum HostTextProviderPreference: String, CaseIterable, Equatable {
     case openAI = "openai"
     case anthropic
     case google
+    case deepseek
 
     var displayName: String {
         switch self {
@@ -171,6 +224,8 @@ nonisolated enum HostTextProviderPreference: String, CaseIterable, Equatable {
             return "Anthropic"
         case .google:
             return "Google"
+        case .deepseek:
+            return "DeepSeek"
         }
     }
 
@@ -184,6 +239,8 @@ nonisolated enum HostTextProviderPreference: String, CaseIterable, Equatable {
             return .anthropic
         case .google:
             return .google
+        case .deepseek:
+            return .deepseek
         }
     }
 }
@@ -217,7 +274,7 @@ nonisolated struct HostLLMCompletionResponse: Equatable {
 }
 
 nonisolated struct HostLLMCompletionClient {
-    typealias JSONLoader = (URLRequest) async throws -> [String: Any]
+    typealias JSONLoader = @Sendable (URLRequest) async throws -> [String: Any]
     typealias RoutePicker = ([HostLLMCompletionProvider]) -> HostLLMCompletionProvider?
 
     let providerRouter: HostProviderRouter
@@ -244,7 +301,27 @@ nonisolated struct HostLLMCompletionClient {
     }
 
     func complete(_ completionRequest: HostLLMCompletionRequest) async throws -> HostLLMCompletionResponse {
-        switch try selectedRoute() {
+        let routes = try orderedRoutes()
+        guard !routes.isEmpty else {
+            throw HostLLMCompletionError.unavailableProvider(textProviderPreference.rawValue)
+        }
+
+        var failures: [String] = []
+        for route in routes {
+            do {
+                return try await complete(route, completionRequest)
+            } catch {
+                failures.append("\(route.displayName): \(String(describing: error))")
+            }
+        }
+        throw HostLLMCompletionError.allRoutesFailed(failures)
+    }
+
+    private func complete(
+        _ route: HostLLMCompletionProvider,
+        _ completionRequest: HostLLMCompletionRequest
+    ) async throws -> HostLLMCompletionResponse {
+        switch route {
         case .appleFoundationModels:
             let text = try await appleFoundationModelsClient.complete(
                 Self.appleRequest(from: completionRequest)
@@ -283,23 +360,35 @@ nonisolated struct HostLLMCompletionClient {
         return routes
     }
 
-    private func selectedRoute() throws -> HostLLMCompletionProvider {
+    private func orderedRoutes() throws -> [HostLLMCompletionProvider] {
         let routes = try availableRoutes()
-        let selected: HostLLMCompletionProvider?
+        guard !routes.isEmpty else { return [] }
         switch textProviderPreference {
         case .random:
-            selected = routePicker(routes)
+            guard let first = routePicker(routes) else { return routes }
+            var ordered = [first]
+            ordered.append(contentsOf: routes.filter { $0 != first })
+            return ordered
         case .local:
-            selected = routes.first { $0 == .appleFoundationModels }
-        case .openAI, .anthropic, .google:
-            selected = textProviderPreference.credentialProvider.flatMap { provider in
+            return routes.filter { $0 == .appleFoundationModels }
+        case .openAI, .anthropic, .google, .deepseek:
+            guard let selected = try selectedRoute() else { return [] }
+            return [selected]
+        }
+    }
+
+    private func selectedRoute() throws -> HostLLMCompletionProvider? {
+        let routes = try availableRoutes()
+        switch textProviderPreference {
+        case .random:
+            return routePicker(routes)
+        case .local:
+            return routes.first { $0 == .appleFoundationModels }
+        case .openAI, .anthropic, .google, .deepseek:
+            return textProviderPreference.credentialProvider.flatMap { provider in
                 routes.first { $0 == .credential(provider) }
             }
         }
-        guard let selected else {
-            throw HostLLMCompletionError.unavailableProvider(textProviderPreference.rawValue)
-        }
-        return selected
     }
 
     private static func appleRequest(from request: HostLLMCompletionRequest) -> AppleFoundationModelsTextRequest {
@@ -395,6 +484,7 @@ nonisolated struct HostLLMCompletionClient {
             ]
             if completionRequest.responseFormat == .jsonObject {
                 generationConfig["responseMimeType"] = "application/json"
+                generationConfig["responseSchema"] = try jsonObject(from: completionRequest.jsonSchema)
             }
             var request = URLRequest(url: components.url!)
             request.httpMethod = "POST"
@@ -411,6 +501,24 @@ nonisolated struct HostLLMCompletionClient {
                 ],
                 "generationConfig": generationConfig,
             ])
+            return request
+        case .deepseek:
+            var body: [String: Any] = [
+                "model": "deepseek-chat",
+                "max_tokens": completionRequest.maxTokens,
+                "messages": [
+                    ["role": "user", "content": completionRequest.prompt]
+                ],
+            ]
+            if completionRequest.responseFormat == .jsonObject {
+                body["response_format"] = ["type": "json_object"]
+            }
+            var request = URLRequest(url: URL(string: "https://api.deepseek.com/v1/chat/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("Bearer host-managed:\(ProviderCredentialKey.deepseek.rawValue)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.timeoutInterval = 25
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
             return request
         }
     }
@@ -445,6 +553,8 @@ nonisolated struct HostLLMCompletionClient {
         switch provider {
         case .openAI:
             text = openAIText(from: object)
+        case .deepseek:
+            text = openAIChatCompletionsText(from: object)
         case .anthropic:
             text = anthropicText(from: object, responseFormat: responseFormat)
         case .google:
@@ -463,6 +573,17 @@ nonisolated struct HostLLMCompletionClient {
         case .jsonObject:
             return try normalizedJSONObjectText(text)
         }
+    }
+
+    private func openAIChatCompletionsText(from object: [String: Any]) -> String? {
+        guard let choices = object["choices"] as? [[String: Any]] else { return nil }
+        for choice in choices {
+            guard let message = choice["message"] as? [String: Any] else { continue }
+            if let content = message["content"] as? String {
+                return content
+            }
+        }
+        return nil
     }
 
     private func openAIText(from object: [String: Any]) -> String? {
@@ -628,6 +749,7 @@ nonisolated enum HostLLMCompletionError: Error, CustomStringConvertible {
     case unavailableProvider(String)
     case providerRejected(provider: String, status: Int, body: String)
     case invalidProviderResponse
+    case allRoutesFailed([String])
 
     var description: String {
         switch self {
@@ -639,6 +761,8 @@ nonisolated enum HostLLMCompletionError: Error, CustomStringConvertible {
             return "\(provider) rejected the completion request with HTTP \(status): \(body)"
         case .invalidProviderResponse:
             return "provider returned an invalid completion response"
+        case .allRoutesFailed(let failures):
+            return "all configured text routes failed: \(failures.joined(separator: "; "))"
         }
     }
 }
@@ -817,6 +941,38 @@ nonisolated struct HostVisionCompletionClient {
                 "generationConfig": generationConfig,
             ])
             return request
+        case .deepseek:
+            var content: [[String: Any]] = [
+                ["type": "text", "text": completionRequest.prompt]
+            ]
+            for path in completionRequest.imagePaths {
+                content.append([
+                    "type": "image_url",
+                    "image_url": [
+                        "url": try dataURL(for: path)
+                    ],
+                ])
+            }
+            var body: [String: Any] = [
+                "model": "deepseek-chat",
+                "temperature": completionRequest.temperature,
+                "messages": [
+                    [
+                        "role": "user",
+                        "content": content,
+                    ]
+                ],
+            ]
+            if completionRequest.responseFormat == .jsonObject {
+                body["response_format"] = ["type": "json_object"]
+            }
+            var request = URLRequest(url: URL(string: "https://api.deepseek.com/v1/chat/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("Bearer host-managed:\(ProviderCredentialKey.deepseek.rawValue)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.timeoutInterval = 60
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            return request
         }
     }
 
@@ -841,7 +997,7 @@ nonisolated struct HostVisionCompletionClient {
     ) throws -> String {
         let text: String?
         switch provider {
-        case .openAI:
+        case .openAI, .deepseek:
             text = openAIText(from: object)
         case .anthropic:
             text = anthropicText(from: object, responseFormat: responseFormat)
@@ -949,6 +1105,8 @@ nonisolated enum HostVisionCompletionError: Error {
 nonisolated struct HostImageGenerationRequest {
     var prompt: String
     var outputDirectory: URL
+    var referenceImagePath: String?
+    var referenceMimeType: String?
 }
 
 nonisolated struct HostGeneratedImage: Equatable {
@@ -980,7 +1138,11 @@ nonisolated struct HostImageGenerationClient {
         guard (try providerRouter.configuredCredentials()[.google]) != nil else {
             throw HostImageGenerationError.missingGoogleCredential
         }
-        var providerRequest = try request(prompt: imageRequest.prompt)
+        var providerRequest = try request(
+            prompt: imageRequest.prompt,
+            referenceImagePath: imageRequest.referenceImagePath,
+            referenceMimeType: imageRequest.referenceMimeType
+        )
         try providerRouter.authorizeProviderRequest(&providerRequest)
         let object = try await jsonObject(for: providerRequest)
         let image = try generatedImage(from: object)
@@ -997,7 +1159,22 @@ nonisolated struct HostImageGenerationClient {
         return HostGeneratedImage(path: path.path, mimeType: image.mimeType)
     }
 
-    private func request(prompt: String) throws -> URLRequest {
+    private func request(
+        prompt: String,
+        referenceImagePath: String?,
+        referenceMimeType: String?
+    ) throws -> URLRequest {
+        var parts: [[String: Any]] = [["text": prompt]]
+        if let referenceImagePath, let referenceMimeType {
+            let referenceData = try Data(contentsOf: URL(fileURLWithPath: referenceImagePath))
+            parts.append([
+                "inlineData": [
+                    "mimeType": referenceMimeType,
+                    "data": referenceData.base64EncodedString(),
+                ],
+            ])
+        }
+
         var components = URLComponents(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent")!
         components.queryItems = [URLQueryItem(name: "key", value: "host-managed:\(ProviderCredentialKey.google.rawValue)")]
         var request = URLRequest(url: components.url!)
@@ -1008,9 +1185,7 @@ nonisolated struct HostImageGenerationClient {
             "contents": [
                 [
                     "role": "user",
-                    "parts": [
-                        ["text": prompt]
-                    ],
+                    "parts": parts,
                 ]
             ],
             "generationConfig": [
@@ -1179,3 +1354,38 @@ nonisolated enum KeychainCredentialError: LocalizedError {
         }
     }
 }
+
+#if os(macOS)
+
+protocol AvatarKitImageGenerating: Sendable {
+    func generate(
+        prompt: String,
+        outputDirectory: URL,
+        referenceImage: HostGeneratedImage?
+    ) async throws -> HostGeneratedImage
+}
+
+protocol AvatarKitVisionCompleting: Sendable {
+    func complete(_ request: HostVisionCompletionRequest) async throws -> HostVisionCompletionResponse
+}
+
+extension HostImageGenerationClient: AvatarKitImageGenerating {
+    func generate(
+        prompt: String,
+        outputDirectory: URL,
+        referenceImage: HostGeneratedImage?
+    ) async throws -> HostGeneratedImage {
+        try await generate(
+            .init(
+                prompt: prompt,
+                outputDirectory: outputDirectory,
+                referenceImagePath: referenceImage?.path,
+                referenceMimeType: referenceImage?.mimeType
+            )
+        )
+    }
+}
+
+extension HostVisionCompletionClient: AvatarKitVisionCompleting {}
+
+#endif

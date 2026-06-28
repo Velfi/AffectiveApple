@@ -1,7 +1,12 @@
 #import "FaceRecognitionBridge.h"
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wquoted-include-in-framework-header"
+#pragma clang diagnostic ignored "-Wdocumentation"
+#pragma clang diagnostic ignored "-Wdocumentation-deprecated-sync"
 #import <opencv2/imgcodecs.hpp>
 #import <opencv2/objdetect.hpp>
+#pragma clang diagnostic pop
 
 static NSString *const AFFaceRecognitionErrorDomain = @"AFFaceRecognitionErrorDomain";
 
@@ -94,11 +99,12 @@ static NSString *const AFFaceRecognitionErrorDomain = @"AFFaceRecognitionErrorDo
   }
 }
 
-- (void)writeError:(NSError **)error code:(NSInteger)code message:(NSString *)message {
-  if (!error) { return; }
+- (BOOL)writeError:(NSError **)error code:(NSInteger)code message:(NSString *)message {
+  if (!error) { return NO; }
   *error = [NSError errorWithDomain:AFFaceRecognitionErrorDomain
                                code:code
                            userInfo:@{NSLocalizedDescriptionKey: message}];
+  return YES;
 }
 
 @end

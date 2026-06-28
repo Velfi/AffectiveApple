@@ -9,7 +9,14 @@ When `avatar.json` is present, Affective renders it before falling back to a sta
 
 ## Layered Manifest
 
-`avatar.json` uses a canvas coordinate system. Each layer is positioned with `x` and `y` from the top-left of the canvas, sized with `width` and `height`, and sorted by `z`. The optional `clip` rectangle defines the final avatar frame inside that canvas; omit it to render the full canvas.
+`avatar.json` uses a canvas coordinate system. Each layer is sized with `width` and `height`, sorted by `z`, and positioned with `x` and `y`. New avatars saved from the editor use `anchor: "center"`, so `x` and `y` are the layer center. Legacy manifests without `anchor` are treated as top-left positioning.
+
+Optional layer fields:
+
+- `anchor`: `"center"` or `"topLeading"` (default when omitted).
+- `color`: `#RRGGBB` or `#RRGGBBAA` hex fill for layers without `image` or `atlas` (for example a solid background).
+
+The optional `clip` rectangle defines the final avatar frame inside that canvas; omit it to render the full canvas.
 
 ```json
 {
@@ -89,13 +96,31 @@ Use `image` for a normal PNG or JPEG layer:
 {
   "id": "hat",
   "image": "avatar/hat.png",
-  "x": 128,
-  "y": 32,
+  "anchor": "center",
+  "x": 256,
+  "y": 200,
   "width": 256,
   "height": 160,
   "z": 20
 }
 ```
+
+Use `color` instead of `image` for a solid background fill:
+
+```json
+{
+  "id": "background",
+  "anchor": "center",
+  "x": 256,
+  "y": 256,
+  "width": 512,
+  "height": 512,
+  "color": "#1A1A2E",
+  "z": 0
+}
+```
+
+Omit `image` and `color` on the background layer to leave that region transparent.
 
 ## Atlas Animation
 

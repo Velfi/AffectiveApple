@@ -22,10 +22,6 @@ struct BrainDescriptor: Identifiable, Equatable {
         rootURL.appendingPathComponent("memory", isDirectory: true).appendingPathComponent("relationships.sqlite")
     }
 
-    nonisolated var eventsURL: URL {
-        rootURL.appendingPathComponent("events.jsonl")
-    }
-
     nonisolated var scheduleURL: URL {
         rootURL.appendingPathComponent("maintenance.md")
     }
@@ -42,8 +38,8 @@ struct BrainDescriptor: Identifiable, Equatable {
         rootURL.appendingPathComponent("brain_stats.json")
     }
 
-    nonisolated var dreamReportsURL: URL {
-        rootURL.appendingPathComponent("dream_reports.json")
+    nonisolated var mailboxUIStateURL: URL {
+        rootURL.appendingPathComponent("mailbox_ui_state.json")
     }
 
     nonisolated var profileURL: URL {
@@ -56,6 +52,31 @@ struct BrainDescriptor: Identifiable, Equatable {
 
     nonisolated var biometricMetadataURL: URL {
         rootURL.appendingPathComponent("memory", isDirectory: true).appendingPathComponent("biometric_identities.json")
+    }
+
+    /// Changes when layered or static avatar files on disk change, so views can force a fresh render.
+    nonisolated var avatarRenderToken: String {
+        let manifestURL = rootURL.appendingPathComponent("avatar.json")
+        let manifestStamp = fileModificationTimestamp(at: manifestURL)
+        if let avatarURL {
+            let avatarStamp = fileModificationTimestamp(at: avatarURL)
+            return "\(id)-\(manifestStamp)-\(avatarStamp)"
+        }
+        if manifestStamp > 0 {
+            return "\(id)-\(manifestStamp)"
+        }
+        return id
+    }
+
+    var avatarClipAspectRatio: CGFloat {
+        guard let manifest = avatarManifest else { return 1 }
+        let clip = manifest.effectiveClip
+        let rawRatio = clip.width / max(clip.height, 1)
+        return rawRatio.isFinite && rawRatio > 0 ? rawRatio : 1
+    }
+
+    nonisolated private func fileModificationTimestamp(at url: URL) -> TimeInterval {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?.timeIntervalSince1970 ?? 0
     }
 
     nonisolated var favoriteThemeColor: BrainThemeColor? {
@@ -71,7 +92,6 @@ struct BrainDescriptor: Identifiable, Equatable {
     nonisolated func validateForCoreConnection(fileManager: FileManager = .default) throws {
         try Self.requireDirectory(rootURL, relativePath: rootURL.lastPathComponent, fileManager: fileManager)
         try Self.requireFile(profileURL, relativePath: "brain_profile.json", fileManager: fileManager)
-        try Self.requireFile(eventsURL, relativePath: "events.jsonl", fileManager: fileManager)
         try Self.requireFile(scheduleURL, relativePath: "maintenance.md", fileManager: fileManager)
         try Self.requireFile(runtimeOptionsURL, relativePath: "runtime_options.json", fileManager: fileManager)
         try Self.requireDirectory(rootURL.appendingPathComponent("memory", isDirectory: true), relativePath: "memory/", fileManager: fileManager)
@@ -82,7 +102,6 @@ struct BrainDescriptor: Identifiable, Equatable {
             throw BrainValidationError.invalidJSON("brain_profile.json", detail: "expected a non-empty JSON object")
         }
         _ = try Self.loadJSONObject(at: runtimeOptionsURL, relativePath: "runtime_options.json", allowsEmptyFile: true)
-        try Self.validateJSONLines(at: eventsURL, relativePath: "events.jsonl")
     }
 
     nonisolated static func requireFile(_ url: URL, relativePath: String, fileManager: FileManager) throws {
@@ -206,7 +225,7 @@ nonisolated struct BrainThemeColor: Equatable {
 
     private static func color(from value: Any?) -> BrainThemeColor? {
         if let string = value as? String {
-            return color(fromString: string)
+            return parseColorString(string)
         }
         if let object = value as? [String: Any] {
             return color(fromObject: object)
@@ -217,7 +236,11 @@ nonisolated struct BrainThemeColor: Equatable {
         return nil
     }
 
-    private static func color(fromString rawString: String) -> BrainThemeColor? {
+    static func color(fromString rawString: String) -> BrainThemeColor? {
+        parseColorString(rawString)
+    }
+
+    private static func parseColorString(_ rawString: String) -> BrainThemeColor? {
         let string = rawString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !string.isEmpty else { return nil }
 
@@ -246,7 +269,7 @@ nonisolated struct BrainThemeColor: Equatable {
 
     private static func color(fromObject object: [String: Any]) -> BrainThemeColor? {
         if let string = object["hex"] as? String ?? object["value"] as? String ?? object["name"] as? String {
-            return color(fromString: string)
+            return parseColorString(string)
         }
 
         let red = numericValue(object["red"] ?? object["r"])
