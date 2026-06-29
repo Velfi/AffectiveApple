@@ -272,6 +272,7 @@ nonisolated enum BrainKnowledgeReader {
             throw BrainKnowledgeReaderError.sqlite("could not open memory database: \(databaseURL.path)")
         }
         defer { sqlite3_close(database) }
+        sqlite3_busy_timeout(database, 5_000)
 
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, "SELECT data_json FROM cognitive_memory WHERE id = 1", -1, &statement, nil) == SQLITE_OK else {

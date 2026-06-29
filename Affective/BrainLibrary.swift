@@ -7,14 +7,6 @@ import Foundation
 import Combine
 import SQLite3
 
-actor BrainArchiveOperationGate {
-    static let shared = BrainArchiveOperationGate()
-
-    func run<T>(_ operation: () async throws -> T) async rethrows -> T {
-        try await operation()
-    }
-}
-
 final class BrainLibrary: ObservableObject {
     static let avatarDidUpdateNotification = Notification.Name("Affective.avatarDidUpdate")
     static let avatarDidUpdateBrainIDKey = "brainID"
@@ -49,6 +41,7 @@ final class BrainLibrary: ObservableObject {
     static var profilesRootURL: URL { persistentRootURL.appendingPathComponent("profiles", isDirectory: true) }
 
     private static let recentBrainIDsKey = "Affective.recentBrainIDs"
+    private static let defaultRuntimeOptionsJSON = Data(#"{"seed_path":"seed.md"}"#.utf8)
 
     @Published private(set) var brains: [BrainDescriptor] = []
     @Published var statusText = ""
@@ -112,11 +105,13 @@ final class BrainLibrary: ObservableObject {
 
         try FileManager.default.createDirectory(at: Self.brainsRootURL, withIntermediateDirectories: true)
         let rootURL = Self.availableUUIDDestination()
+        let brainID = rootURL.lastPathComponent
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
         let memoryURL = rootURL.appendingPathComponent("memory", isDirectory: true)
         let faceEmbeddingsURL = memoryURL.appendingPathComponent("face_embeddings", isDirectory: true)
 
         try FileManager.default.createDirectory(at: faceEmbeddingsURL, withIntermediateDirectories: true)
-        try Data("{}".utf8).write(to: rootURL.appendingPathComponent("runtime_options.json"), options: .atomic)
+        try Self.defaultRuntimeOptionsJSON.write(to: rootURL.appendingPathComponent("runtime_options.json"), options: .atomic)
         try Self.maintenanceTemplate(for: name).write(
             to: rootURL.appendingPathComponent("maintenance.md"),
             atomically: true,
@@ -134,9 +129,13 @@ final class BrainLibrary: ObservableObject {
 
         refresh()
 
-        guard let created = brains.first(where: { $0.rootURL == rootURL }) else {
-            throw CocoaError(.fileReadUnknown)
-        }
+        let created = brains.first(where: { $0.id == brainID })
+            ?? Self.descriptor(
+                id: brainID,
+                displayName: name,
+                rootURL: rootURL,
+                recentIDs: Self.recentBrainIDs()
+            )
         markOpened(created)
         statusText = "Created \(created.displayName)."
         return created
@@ -157,9 +156,13 @@ final class BrainLibrary: ObservableObject {
         }
         try FileManager.default.moveItem(at: importedRoot, to: destination)
         refresh()
-        guard let imported = brains.first(where: { $0.rootURL == destination }) else {
-            throw CocoaError(.fileReadUnknown)
-        }
+        let imported = brains.first(where: { $0.id == importedID })
+            ?? Self.descriptor(
+                id: importedID,
+                displayName: Self.displayName(for: importedID, brainRoot: destination),
+                rootURL: destination,
+                recentIDs: Self.recentBrainIDs()
+            )
         markOpened(imported)
         statusText = "Imported \(imported.displayName)."
         return imported
@@ -301,9 +304,9 @@ final class BrainLibrary: ObservableObject {
             modifiedAt: nil,
             isRecent: false
         )
-        let core = BrainCore(brain: helper)
+        let core = BrainCore(brain: helper, tracksLiveFileSession: false)
         do {
-            let response = try await BrainArchiveOperationGate.shared.run {
+            let response = try await BrainFileAccessGate.runExclusive(brainID: helper.id) {
                 try await core.importBrain(
                     from: sourceURL,
                     brainID: expectedBrainID,
@@ -373,7 +376,7 @@ final class BrainLibrary: ObservableObject {
         let memoryURL = rootURL.appendingPathComponent("memory", isDirectory: true)
         let faceEmbeddingsURL = memoryURL.appendingPathComponent("face_embeddings", isDirectory: true)
         try FileManager.default.createDirectory(at: faceEmbeddingsURL, withIntermediateDirectories: true)
-        try Data("{}".utf8).write(to: rootURL.appendingPathComponent("runtime_options.json"), options: .atomic)
+        try Self.defaultRuntimeOptionsJSON.write(to: rootURL.appendingPathComponent("runtime_options.json"), options: .atomic)
         try "Import helper brain.".write(
             to: rootURL.appendingPathComponent("maintenance.md"),
             atomically: true,
@@ -426,17 +429,39 @@ final class BrainLibrary: ObservableObject {
         }
 
         return rootsByID.map { id, url in
-            let modifiedAt = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-            return BrainDescriptor(
+            let normalizedRoot = Self.normalizedBrainRootURL(url)
+            let modifiedAt = try? normalizedRoot.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            return Self.descriptor(
                 id: id,
-                displayName: Self.displayName(for: id, brainRoot: url),
-                rootURL: url,
-                avatarURL: Self.avatarURL(for: id, brainRoot: url),
-                avatarManifest: Self.avatarManifest(for: url),
-                modifiedAt: modifiedAt,
-                isRecent: recentIDs.contains(id)
+                displayName: Self.displayName(for: id, brainRoot: normalizedRoot),
+                rootURL: normalizedRoot,
+                recentIDs: recentIDs,
+                modifiedAt: modifiedAt
             )
         }
+    }
+
+    private static func descriptor(
+        id: String,
+        displayName: String,
+        rootURL: URL,
+        recentIDs: [String],
+        modifiedAt: Date? = nil
+    ) -> BrainDescriptor {
+        let normalizedRoot = normalizedBrainRootURL(rootURL)
+        return BrainDescriptor(
+            id: id,
+            displayName: displayName,
+            rootURL: normalizedRoot,
+            avatarURL: Self.avatarURL(for: id, brainRoot: normalizedRoot),
+            avatarManifest: Self.avatarManifest(for: normalizedRoot),
+            modifiedAt: modifiedAt,
+            isRecent: recentIDs.contains(id)
+        )
+    }
+
+    private static func normalizedBrainRootURL(_ url: URL) -> URL {
+        url.standardizedFileURL
     }
 
     private static func candidateRoots(in container: URL) throws -> [URL] {
@@ -607,7 +632,10 @@ final class BrainLibrary: ObservableObject {
 
     private static func availableUUIDDestination() -> URL {
         while true {
-            let candidate = brainsRootURL.appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
+            let brainID = UUID().uuidString.lowercased()
+            let candidate = normalizedBrainRootURL(
+                brainsRootURL.appendingPathComponent(brainID, isDirectory: true)
+            )
             if !FileManager.default.fileExists(atPath: candidate.path) {
                 return candidate
             }
@@ -664,7 +692,18 @@ final class BrainLibrary: ObservableObject {
 
     private static func seedMarkdown(for name: String, request: BrainCreationRequest) -> String {
         """
-        # \(name) Seed Orientation
+        # \(name)
+
+        ## Core Values
+
+        - Be honest about what is known and what is still uncertain.
+        - Prefer durable helpful connection over performative answers.
+        - Treat memory, consent, and repair as part of trust.
+
+        ## Operating Tendencies
+
+        - Ask before acting when intent is unclear.
+        - Keep responses plain and warm.
 
         ## Wants
         \(request.wants.seedMarkdownList)
@@ -672,10 +711,15 @@ final class BrainLibrary: ObservableObject {
         ## Goals
         \(request.goals.seedMarkdownList)
 
-        ## Initial Thoughts
-        \(request.initialThoughts.seedParagraph)
+        ## Voice
+
+        - Speak plainly and warmly; avoid corporate or assistant-like phrasing.
+        - Share inner life selectively; do not dump memory indexes unless asked.
+        - Match the user's energy without mirroring hostility.
 
         ## Notes
+        \(request.initialThoughts.seedParagraph)
+
         \(request.notes.seedParagraph)
         """
     }

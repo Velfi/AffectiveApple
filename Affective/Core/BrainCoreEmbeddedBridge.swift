@@ -102,6 +102,9 @@ import Foundation
     private static let hostVisionCompletionURL = "affective-host://vision/complete"
     private static let hostRecognizeIdentifyURL = "affective-host://recognize/identify"
     private static let hostRecognizeEnrollURL = "affective-host://recognize/enroll"
+    private static let hostEmbedComputeURL = "affective-host://embed/compute"
+    private static let hostSystemPowerURL = "affective-host://system/power"
+    private static let hostSystemStorageURL = "affective-host://system/storage"
 
     private let providerRouter: HostProviderRouter
     private let textProviderPreference: HostTextProviderPreference
@@ -205,9 +208,18 @@ import Foundation
       if urlString == Self.hostRecognizeEnrollURL {
         return try performHostRecognizeEnroll(body: body)
       }
+      if urlString == Self.hostEmbedComputeURL {
+        return try performHostEmbedCompute(body: body)
+      }
+      if urlString == Self.hostSystemPowerURL {
+        return try HostSystemSensesReading.encodedPowerSnapshot()
+      }
+      if urlString == Self.hostSystemStorageURL {
+        return try HostSystemSensesReading.encodedStorageSnapshot()
+      }
 
       let request = try requestForPostJSON(url: urlString, headersJSON: headersJSON, body: body)
-      let (data, response) = try Self.runBlockingAsync {
+      let (data, response) = try Self.runBlockingDetached {
         try await URLSession.shared.data(for: request)
       }
       guard let httpResponse = response as? HTTPURLResponse else {
@@ -228,13 +240,21 @@ import Foundation
         routePicker: textRoutePicker,
         jsonLoader: jsonLoader
       )
-      let completion = try Self.runBlockingAsync {
-        try await client.complete(HostLLMCompletionRequest(
-          prompt: prompt,
-          maxTokens: payload.maxTokens ?? 512,
-          responseFormat: HostResponseFormat(rawValue: payload.responseFormat) ?? .text,
-          jsonSchema: payload.jsonSchema ?? "{}"
-        ))
+      let request = HostLLMCompletionRequest(
+        prompt: prompt,
+        maxTokens: payload.maxTokens ?? 512,
+        responseFormat: HostResponseFormat(rawValue: payload.responseFormat) ?? .text,
+        jsonSchema: payload.jsonSchema ?? "{}"
+      )
+      let completion: HostLLMCompletionResponse
+      if try client.primaryRoute() == .appleFoundationModels {
+        completion = try Self.runBlockingOnMainActor {
+          try await client.complete(request)
+        }
+      } else {
+        completion = try Self.runBlockingDetached {
+          try await client.complete(request)
+        }
       }
       return Data(completion.text.utf8)
     }
@@ -251,10 +271,15 @@ import Foundation
       return try JSONEncoder().encode(result)
     }
 
+    private func performHostEmbedCompute(body: Data) throws -> Data {
+      let payload = try JSONDecoder().decode(HostEmbeddingRequest.self, from: body)
+      return try HostEmbeddingClient.encodedResponse(for: payload.texts)
+    }
+
     private func performHostImageGeneration(body: Data) throws -> Data {
       let payload = try JSONDecoder().decode(HostImageGenerationPayload.self, from: body)
       let client = HostImageGenerationClient(providerRouter: providerRouter, jsonLoader: jsonLoader)
-      let generated = try Self.runBlockingAsync {
+      let generated = try Self.runBlockingDetached {
         try await client.generate(HostImageGenerationRequest(
           prompt: payload.prompt,
           outputDirectory: URL(fileURLWithPath: payload.outputDirectory)
@@ -270,7 +295,7 @@ import Foundation
       let payload = try JSONDecoder().decode(HostVisionCompletionPayload.self, from: body)
       let responseFormat = HostResponseFormat(rawValue: payload.responseFormat) ?? .text
       let client = HostVisionCompletionClient(providerRouter: providerRouter, jsonLoader: jsonLoader)
-      let completion = try Self.runBlockingAsync {
+      let completion = try Self.runBlockingDetached {
         try await client.complete(HostVisionCompletionRequest(
           prompt: payload.prompt,
           imagePaths: payload.imagePaths,
@@ -333,26 +358,54 @@ import Foundation
       UnsafeMutablePointer(mutating: ptr).deallocate()
     }
 
-    private static func runBlockingAsync<T>(
+    /// Foundation Models must run on the main actor when invoked from the brain FFI worker thread.
+    private static func runBlockingOnMainActor<T>(
       timeoutSeconds: TimeInterval = 65,
-      _ work: @escaping @Sendable () async throws -> T
+      _ work: @escaping @Sendable @MainActor () async throws -> T
     ) throws -> T {
       let semaphore = DispatchSemaphore(value: 0)
-      var result: Result<T, Error>?
-      Task.detached(priority: .userInitiated) {
+      let resultBox = BlockingAsyncResultBox<T>()
+      Task { @MainActor in
         do {
-          result = .success(try await work())
+          resultBox.result = .success(try await work())
         } catch {
-          result = .failure(error)
+          resultBox.result = .failure(error)
         }
         semaphore.signal()
       }
       guard semaphore.wait(timeout: .now() + timeoutSeconds) == .success else {
         throw HostHTTPError.timeout
       }
-      return try result?.get() ?? {
+      return try resultBox.result?.get() ?? {
         throw HostHTTPError.missingResponse
       }()
+    }
+
+    /// Network and credential-provider completions stay off the main actor.
+    private static func runBlockingDetached<T>(
+      timeoutSeconds: TimeInterval = 65,
+      _ work: @escaping @Sendable () async throws -> T
+    ) throws -> T {
+      let semaphore = DispatchSemaphore(value: 0)
+      let resultBox = BlockingAsyncResultBox<T>()
+      Task.detached(priority: .userInitiated) {
+        do {
+          resultBox.result = .success(try await work())
+        } catch {
+          resultBox.result = .failure(error)
+        }
+        semaphore.signal()
+      }
+      guard semaphore.wait(timeout: .now() + timeoutSeconds) == .success else {
+        throw HostHTTPError.timeout
+      }
+      return try resultBox.result?.get() ?? {
+        throw HostHTTPError.missingResponse
+      }()
+    }
+
+    private final class BlockingAsyncResultBox<T>: @unchecked Sendable {
+      var result: Result<T, Error>?
     }
 
     private enum HostHTTPError: Error, CustomStringConvertible {
@@ -549,7 +602,7 @@ import Foundation
       else {
         return .random
       }
-      return HostTextProviderPreference(rawValue: rawValue) ?? .random
+      return HostTextProviderPreference(rawValue: rawValue)?.resolvedForHostRouting() ?? .random
     }
 
     static func hostManifestJSON(
@@ -621,6 +674,10 @@ import Foundation
       #else
         return "unavailable"
       #endif
+    }
+
+    static func currentDateTimeCapabilityStatus() -> String {
+      "available"
     }
 
     static func motionGestureEnabled(brain: BrainDescriptor?) -> Bool {
@@ -771,6 +828,13 @@ import Foundation
           permissionState: motionGestureStatus,
           statusReason: "Host accelerometer gesture monitor status."
         ),
+        PullSenseDescriptor(
+          senseID: "time",
+          direction: .pull,
+          availability: CoreConfigStorage.currentDateTimeCapabilityStatus(),
+          permissionState: CoreConfigStorage.currentDateTimeCapabilityStatus(),
+          statusReason: "Host system clock and local timezone."
+        ),
       ]
     }
 
@@ -790,6 +854,7 @@ import Foundation
           "camera": .string(cameraStatus),
           "orientation": .string(orientationStatus),
           "motion_gesture": .string(motionGestureStatus),
+          "time": .string(CoreConfigStorage.currentDateTimeCapabilityStatus()),
           "face_identification": .string(identityRecognitionStatus),
           "face_enrollment": .string(facePictureUpdateStatus),
           "provider_routing": .string(hasTextRouting ? "available" : "unavailable"),
@@ -858,6 +923,7 @@ import Foundation
       "power_status",
       "storage_fullness",
       "database_stats",
+      "introspection",
       "local_process_io",
       "file_import",
       "file_export",

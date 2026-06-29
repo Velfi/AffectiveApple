@@ -173,7 +173,7 @@ struct AvatarLayerView: View {
         }
         #elseif canImport(UIKit)
         if let imagePath = layer.image,
-           let image = UIImage(contentsOfFile: assetURL(imagePath).path) {
+           let image = AvatarAssetImageLoader.loadImage(from: assetURL(imagePath), layerID: layer.id) {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFill()
@@ -184,37 +184,27 @@ struct AvatarLayerView: View {
 
     @ViewBuilder
     func atlasFrame(index: Int) -> some View {
-        #if os(macOS)
-        if let atlasPath = layer.atlas,
-           let image = AvatarAssetImageLoader.loadImage(from: assetURL(atlasPath), layerID: layer.id),
-           let frameImage = image.croppedAvatarFrame(
-                index: index,
-                frameX: safeInt(layer.frameX),
-                frameY: safeInt(layer.frameY),
-                frameWidth: safeInt(layer.frameWidth ?? layer.width),
-                frameHeight: safeInt(layer.frameHeight ?? layer.height)
-           ) {
+        if let frameImage = AvatarAtlasFrameCache.frameImage(
+            atlasURL: assetURL(layer.atlas ?? ""),
+            layerID: layer.id,
+            frameIndex: index,
+            frameX: safeInt(layer.frameX),
+            frameY: safeInt(layer.frameY),
+            frameWidth: safeInt(layer.frameWidth ?? layer.width),
+            frameHeight: safeInt(layer.frameHeight ?? layer.height)
+        ) {
+            #if os(macOS)
             Image(nsImage: frameImage)
                 .resizable()
                 .scaledToFill()
                 .clipped()
-        }
-        #elseif canImport(UIKit)
-        if let atlasPath = layer.atlas,
-           let image = UIImage(contentsOfFile: assetURL(atlasPath).path),
-           let frameImage = image.croppedAvatarFrame(
-                index: index,
-                frameX: safeInt(layer.frameX),
-                frameY: safeInt(layer.frameY),
-                frameWidth: safeInt(layer.frameWidth ?? layer.width),
-                frameHeight: safeInt(layer.frameHeight ?? layer.height)
-           ) {
+            #elseif canImport(UIKit)
             Image(uiImage: frameImage)
                 .resizable()
                 .scaledToFill()
                 .clipped()
+            #endif
         }
-        #endif
     }
 
 }
@@ -228,68 +218,148 @@ struct RandomBlinkAvatarLayerView: View {
 
     var body: some View {
         TimelineView(.animation) { timeline in
-            atlasFrame(index: frameIndex(at: timeline.date))
+            atlasFrame(index: displayedFrameIndex(at: timeline.date))
+                .onChange(of: timeline.date) { _, date in
+                    advanceBlinkSchedule(at: date)
+                }
         }
     }
 
-    func frameIndex(at date: Date) -> Int {
+    func displayedFrameIndex(at date: Date) -> Int {
         let frames = playback.frames?.isEmpty == false ? playback.frames! : [0]
         let fps = max(playback.fps ?? 12, 1)
 
         if let blinkStartDate {
-            let frameOffset = Int(date.timeIntervalSince(blinkStartDate) * fps)
+            let frameOffset = Int(date.timeIntervalSince(blinkStartDate) * Double(fps))
             if frameOffset < frames.count {
                 return max(frames[frameOffset], 0)
-            }
-
-            DispatchQueue.main.async {
-                self.blinkStartDate = nil
-                self.nextBlinkDate = Date(timeIntervalSinceNow: Double.random(in: 2.4...7.0))
             }
             return max(frames.first ?? 0, 0)
         }
 
-        if date >= nextBlinkDate {
-            DispatchQueue.main.async {
-                self.blinkStartDate = date
-            }
-        }
         return max(frames.first ?? 0, 0)
+    }
+
+    func advanceBlinkSchedule(at date: Date) {
+        let frames = playback.frames?.isEmpty == false ? playback.frames! : [0]
+        let fps = max(playback.fps ?? 12, 1)
+
+        if let blinkStartDate {
+            let frameOffset = Int(date.timeIntervalSince(blinkStartDate) * Double(fps))
+            if frameOffset >= frames.count {
+                self.blinkStartDate = nil
+                self.nextBlinkDate = Date(timeIntervalSinceNow: Double.random(in: 2.4...7.0))
+            }
+            return
+        }
+
+        if date >= nextBlinkDate {
+            blinkStartDate = date
+        }
     }
 
     @ViewBuilder
     func atlasFrame(index: Int) -> some View {
-        #if os(macOS)
-        if let atlasPath = layer.atlas,
-           let image = AvatarAssetImageLoader.loadImage(from: assetURL(atlasPath), layerID: layer.id),
-           let frameImage = image.croppedAvatarFrame(
-                index: index,
-                frameX: safeInt(layer.frameX),
-                frameY: safeInt(layer.frameY),
-                frameWidth: safeInt(layer.frameWidth ?? layer.width),
-                frameHeight: safeInt(layer.frameHeight ?? layer.height)
-           ) {
+        if let frameImage = AvatarAtlasFrameCache.frameImage(
+            atlasURL: assetURL(layer.atlas ?? ""),
+            layerID: layer.id,
+            frameIndex: index,
+            frameX: safeInt(layer.frameX),
+            frameY: safeInt(layer.frameY),
+            frameWidth: safeInt(layer.frameWidth ?? layer.width),
+            frameHeight: safeInt(layer.frameHeight ?? layer.height)
+        ) {
+            #if os(macOS)
             Image(nsImage: frameImage)
                 .resizable()
                 .scaledToFill()
                 .clipped()
-        }
-        #elseif canImport(UIKit)
-        if let atlasPath = layer.atlas,
-           let image = UIImage(contentsOfFile: assetURL(atlasPath).path),
-           let frameImage = image.croppedAvatarFrame(
-                index: index,
-                frameX: safeInt(layer.frameX),
-                frameY: safeInt(layer.frameY),
-                frameWidth: safeInt(layer.frameWidth ?? layer.width),
-                frameHeight: safeInt(layer.frameHeight ?? layer.height)
-           ) {
+            #elseif canImport(UIKit)
             Image(uiImage: frameImage)
                 .resizable()
                 .scaledToFill()
                 .clipped()
+            #endif
         }
-        #endif
+    }
+}
+
+@MainActor
+enum AvatarAtlasFrameCache {
+    #if canImport(UIKit)
+    typealias PlatformImage = UIImage
+    #elseif canImport(AppKit)
+    typealias PlatformImage = NSImage
+    #endif
+
+    private struct AtlasKey: Hashable {
+        let url: URL
+        let layerID: String
+    }
+
+    private struct FrameKey: Hashable {
+        let atlas: AtlasKey
+        let frameIndex: Int
+        let frameX: Int
+        let frameY: Int
+        let frameWidth: Int
+        let frameHeight: Int
+    }
+
+    private static var atlasImages: [AtlasKey: PlatformImage] = [:]
+    private static var frameImages: [FrameKey: PlatformImage] = [:]
+
+    static func frameImage(
+        atlasURL: URL,
+        layerID: String,
+        frameIndex: Int,
+        frameX: Int,
+        frameY: Int,
+        frameWidth: Int,
+        frameHeight: Int
+    ) -> PlatformImage? {
+        let atlasKey = AtlasKey(url: atlasURL, layerID: layerID)
+        let frameKey = FrameKey(
+            atlas: atlasKey,
+            frameIndex: frameIndex,
+            frameX: frameX,
+            frameY: frameY,
+            frameWidth: frameWidth,
+            frameHeight: frameHeight
+        )
+
+        if let cached = frameImages[frameKey] {
+            return cached
+        }
+
+        guard let atlas = loadAtlasImage(atlasURL: atlasURL, layerID: layerID) else {
+            return nil
+        }
+
+        guard let cropped = atlas.croppedAvatarFrame(
+            index: frameIndex,
+            frameX: frameX,
+            frameY: frameY,
+            frameWidth: frameWidth,
+            frameHeight: frameHeight
+        ) else {
+            return nil
+        }
+
+        frameImages[frameKey] = cropped
+        return cropped
+    }
+
+    static func loadAtlasImage(atlasURL: URL, layerID: String) -> PlatformImage? {
+        let key = AtlasKey(url: atlasURL, layerID: layerID)
+        if let cached = atlasImages[key] {
+            return cached
+        }
+        guard let image = AvatarAssetImageLoader.loadImage(from: atlasURL, layerID: layerID) else {
+            return nil
+        }
+        atlasImages[key] = image
+        return image
     }
 }
 
@@ -318,6 +388,26 @@ enum AvatarAssetImageLoader {
             avatarRenderLogger.error("Could not decode avatar asset layer=\(layerID, privacy: .public) path=\(url.path, privacy: .public) error=\(String(describing: error), privacy: .public)")
             return nil
         }
+    }
+    #elseif canImport(UIKit)
+    static func loadImage(from url: URL, layerID: String) -> UIImage? {
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if didAccess {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            avatarRenderLogger.error("Missing avatar asset layer=\(layerID, privacy: .public) path=\(url.path, privacy: .public)")
+            return nil
+        }
+
+        guard let image = UIImage(contentsOfFile: url.path) else {
+            avatarRenderLogger.error("Could not decode avatar asset layer=\(layerID, privacy: .public) path=\(url.path, privacy: .public)")
+            return nil
+        }
+        return image
     }
     #endif
 }

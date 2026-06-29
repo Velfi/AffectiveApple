@@ -69,6 +69,8 @@ public struct LlmTesterScenarioResult {
     public let rawText: String?
     public let prettyJSON: String?
     public let jsonValid: Bool
+    public let semanticPassed: Bool?
+    public let semanticMessage: String?
     public let errorMessage: String?
 
     public init(
@@ -80,7 +82,9 @@ public struct LlmTesterScenarioResult {
         rawText: String?,
         prettyJSON: String?,
         jsonValid: Bool,
-        errorMessage: String?
+        semanticPassed: Bool? = nil,
+        semanticMessage: String? = nil,
+        errorMessage: String? = nil
     ) {
         self.scenario = scenario
         self.combinedPrompt = combinedPrompt
@@ -90,6 +94,8 @@ public struct LlmTesterScenarioResult {
         self.rawText = rawText
         self.prettyJSON = prettyJSON
         self.jsonValid = jsonValid
+        self.semanticPassed = semanticPassed
+        self.semanticMessage = semanticMessage
         self.errorMessage = errorMessage
     }
 }

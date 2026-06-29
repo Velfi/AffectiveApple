@@ -130,9 +130,9 @@ extension MailboxItem {
         )
     }
 
-    nonisolated func resolvingArtifact(in memoryDatabaseURL: URL) -> MailboxItem {
+    nonisolated func resolvingArtifact(in memoryDatabaseURL: URL, brainID: String) -> MailboxItem {
         guard imagePath == nil, let artifactID else { return self }
-        guard let artifact = CognitiveArtifactResolver.artifact(id: artifactID, in: memoryDatabaseURL) else { return self }
+        guard let artifact = CognitiveArtifactResolver.artifact(id: artifactID, in: memoryDatabaseURL, brainID: brainID) else { return self }
         var resolved = self
         resolved.imagePath = artifact.path
         resolved.imageMimeType = artifact.mimeType
@@ -153,8 +153,9 @@ nonisolated struct CognitiveArtifact: Decodable, Equatable {
 }
 
 nonisolated enum CognitiveArtifactResolver {
-    static func artifact(id: String, in memoryDatabaseURL: URL?) -> CognitiveArtifact? {
+    static func artifact(id: String, in memoryDatabaseURL: URL?, brainID: String) -> CognitiveArtifact? {
         guard let memoryDatabaseURL else { return nil }
+        guard !BrainFileAccessGate.hasLiveSession(brainID: brainID) else { return nil }
         guard let data = cognitiveData(at: memoryDatabaseURL) else { return nil }
         guard let file = try? JSONDecoder().decode(CognitiveArtifactFile.self, from: data) else { return nil }
         return file.artifacts.first { $0.artifactID == id }

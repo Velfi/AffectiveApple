@@ -49,7 +49,8 @@ struct EventFilterBar: View {
     var kindPicker: some View {
         Picker("Kind", selection: $model.selectedEventKind) {
             Text("All").tag(LogKind?.none)
-            ForEach(LogKind.allCases) { kind in
+            Text("Process / reasoning").tag(LogKind?.some(.process))
+            ForEach(LogKind.allCases.filter { $0 != .process }) { kind in
                 Text(kind.rawValue.optionDisplayName).tag(LogKind?.some(kind))
             }
         }
@@ -137,20 +138,39 @@ struct KnowledgeFilterBar: View {
 
 struct LogHeader: View {
     let model: AffectiveViewModel
+    var closeBrain: (() -> Void)? = nil
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text("Affective")
-                    .font(.system(size: 30, weight: .semibold, design: .rounded))
-                Text("Affective Memory-Based Intelligence")
-                    .font(.callout)
+                    .font(.system(size: 28, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                Text("Memory-Based Intelligence")
+                    .font(.caption)
                     .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Spacer(minLength: 16)
+            HStack(spacing: 8) {
+                if let closeBrain {
+                    Button(action: closeBrain) {
+                        Label("Projects", systemImage: "square.grid.2x2")
+                            .font(.caption.weight(.semibold))
+                            .lineLimit(1)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityLabel("Return to Projects")
+                }
 
-            CompactStatusPill(text: countText)
+                Spacer(minLength: 0)
+
+                CompactStatusPill(text: countText)
+            }
         }
     }
 
@@ -202,6 +222,11 @@ struct EntriesList: View {
                     }
                 }
             }
+            .onAppear {
+                if let last = entries.last {
+                    reader.scrollTo(last.id, anchor: .bottom)
+                }
+            }
         }
     }
 }
@@ -245,6 +270,11 @@ struct CompactActivityList: View {
             .onChange(of: entries.count) { _, _ in
                 guard let last = entries.last else { return }
                 withAnimation(.smooth(duration: 0.22)) {
+                    reader.scrollTo(last.id, anchor: .bottom)
+                }
+            }
+            .onAppear {
+                if let last = entries.last {
                     reader.scrollTo(last.id, anchor: .bottom)
                 }
             }
@@ -345,6 +375,7 @@ struct ChatTranscriptView: View {
     let entries: [LogEntry]
     let brainRootURL: URL
     var isResponding = false
+    var onReactToBrainUtterance: ((UUID, String) -> Void)? = nil
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     private let typingIndicatorID = "chat-typing-indicator"
 
@@ -358,7 +389,11 @@ struct ChatTranscriptView: View {
                             .frame(maxWidth: .infinity)
                     } else {
                         ForEach(entries) { entry in
-                            ChatBubbleView(entry: entry, brainRootURL: brainRootURL)
+                            ChatBubbleView(
+                                entry: entry,
+                                brainRootURL: brainRootURL,
+                                onReact: onReactToBrainUtterance
+                            )
                                 .id(entry.id)
                         }
                     }
@@ -374,9 +409,10 @@ struct ChatTranscriptView: View {
             }
             .chatKeyboardDismissMode()
             .onChange(of: entries.count) { _, _ in
-                guard let last = entries.last else { return }
-                withAnimation(.smooth(duration: 0.25)) {
-                    reader.scrollTo(last.id, anchor: .bottom)
+                if let last = entries.last {
+                    withAnimation(.smooth(duration: 0.25)) {
+                        reader.scrollTo(last.id, anchor: .bottom)
+                    }
                 }
             }
             .onChange(of: isResponding) { _, isResponding in
@@ -385,6 +421,19 @@ struct ChatTranscriptView: View {
                     reader.scrollTo(typingIndicatorID, anchor: .bottom)
                 }
             }
+            .onAppear {
+                scrollToBottom(reader: reader)
+            }
+        }
+    }
+
+    func scrollToBottom(reader: ScrollViewProxy) {
+        if isResponding {
+            withAnimation(.smooth(duration: 0.25)) {
+                reader.scrollTo(typingIndicatorID, anchor: .bottom)
+            }
+        } else if let last = entries.last {
+            reader.scrollTo(last.id, anchor: .bottom)
         }
     }
 }
@@ -449,7 +498,12 @@ struct TypingIndicatorBubble: View {
 struct ChatBubbleView: View {
     let entry: LogEntry
     let brainRootURL: URL
+    var onReact: ((UUID, String) -> Void)? = nil
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @State private var showingReactionPicker = false
+    #if os(macOS)
+    @State private var isHovered = false
+    #endif
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
@@ -467,19 +521,50 @@ struct ChatBubbleView: View {
                         .padding(.horizontal, 4)
                 }
 
-                Text(entry.body)
-                    .font(.body)
-                    .foregroundStyle(textColor)
-                    .textSelection(.enabled)
-                    .lineSpacing(2)
-                    .padding(.horizontal, isSystem ? 10 : 13)
-                    .padding(.vertical, isSystem ? 7 : 10)
-                    .background(bubbleBackground, in: bubbleShape)
-                    .overlay {
-                        bubbleShape.stroke(borderColor, lineWidth: isSystem ? 1 : 0)
+                ZStack(alignment: .topTrailing) {
+                    Text(messageText)
+                        .font(entry.kind == .emote ? .body.italic() : .body)
+                        .foregroundStyle(textColor)
+                        .textSelection(.enabled)
+                        .lineSpacing(2)
+                        .padding(.horizontal, isSystem ? 10 : 13)
+                        .padding(.vertical, isSystem ? 7 : 10)
+                        .background(bubbleBackground, in: bubbleShape)
+                        .overlay {
+                            bubbleShape.stroke(borderColor, lineWidth: isSystem ? 1 : 0)
+                        }
+                        .opacity(entry.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !attachments.isEmpty ? 0 : 1)
+                        .frame(height: entry.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !attachments.isEmpty ? 0 : nil)
+                        .contextMenu {
+                            if canReact {
+                                Button("Add reaction…") {
+                                    showingReactionPicker = true
+                                }
+                            }
+                        }
+
+                    if canReact, showsReactionAffordance {
+                        AddReactionButton {
+                            showingReactionPicker = true
+                        }
+                        .offset(x: 6, y: -6)
                     }
-                    .opacity(entry.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !attachments.isEmpty ? 0 : 1)
-                    .frame(height: entry.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !attachments.isEmpty ? 0 : nil)
+                }
+
+                if let reaction = entry.userReaction {
+                    Button {
+                        showingReactionPicker = true
+                    } label: {
+                        Text(reaction)
+                            .font(.title3)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 2)
+                            .background(AppTheme.panelBackground.opacity(0.85), in: Capsule())
+                            .overlay(Capsule().stroke(AppTheme.separator))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Change reaction")
+                }
 
                 ForEach(attachments) { attachment in
                     ChatAttachmentView(attachment: attachment, isOutgoing: isOutgoing)
@@ -497,6 +582,23 @@ struct ChatBubbleView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: isSystem ? .center : (isOutgoing ? .trailing : .leading))
+        #if os(macOS)
+        .onHover { isHovered = $0 }
+        #endif
+        .sheet(isPresented: $showingReactionPicker) {
+            EmojiReactionPickerSheet { emoji in
+                guard !emoji.isEmpty, let onReact else { return }
+                onReact(entry.id, emoji)
+            }
+        }
+    }
+
+    var showsReactionAffordance: Bool {
+        #if os(macOS)
+        isHovered
+        #else
+        false
+        #endif
     }
 
     var isOutgoing: Bool {
@@ -505,6 +607,17 @@ struct ChatBubbleView: View {
 
     var isSystem: Bool {
         entry.kind == .state || entry.kind == .error
+    }
+
+    var canReact: Bool {
+        !isOutgoing && !isSystem && (entry.kind == .brain || entry.kind == .emote)
+    }
+
+    var messageText: String {
+        if entry.kind == .emote {
+            return "*\(entry.body)*"
+        }
+        return entry.body
     }
 
     var labelText: String {
@@ -537,6 +650,8 @@ struct ChatBubbleView: View {
             return AppTheme.messageOutgoing
         case .brain, .result:
             return AppTheme.messageIncoming
+        case .emote, .process:
+            return AppTheme.messageIncoming.opacity(0.82)
         case .state:
             return AppTheme.panelBackground.opacity(0.72)
         case .error:
@@ -590,7 +705,7 @@ struct ChatImageAttachmentView: View {
         Group {
             if let url = attachment.url {
                 if url.isFileURL {
-                    localImage(url: url)
+                    LocalCachedFileImageView(url: url, missingContent: AnyView(missingImage))
                 } else {
                     AsyncImage(url: url) { phase in
                         switch phase {
@@ -618,29 +733,6 @@ struct ChatImageAttachmentView: View {
         .accessibilityLabel(attachment.caption ?? "Image attachment")
     }
 
-    @ViewBuilder
-    func localImage(url: URL) -> some View {
-        #if canImport(UIKit)
-        if let image = UIImage(contentsOfFile: url.path) {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFill()
-        } else {
-            missingImage
-        }
-        #elseif canImport(AppKit)
-        if let image = NSImage(contentsOf: url) {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFill()
-        } else {
-            missingImage
-        }
-        #else
-        missingImage
-        #endif
-    }
-
     var missingImage: some View {
         VStack(spacing: 7) {
             Image(systemName: "photo")
@@ -659,6 +751,9 @@ struct ChatAudioAttachmentView: View {
     let isOutgoing: Bool
     @State private var player: PlatformAudioPlayer?
     @State private var isPlaying = false
+    #if canImport(AVFoundation)
+    @State private var playerDelegate = ChatAudioPlayerDelegate()
+    #endif
 
     var body: some View {
         Button {
@@ -703,16 +798,34 @@ struct ChatAudioAttachmentView: View {
                 isPlaying = false
             } else {
                 let nextPlayer = try PlatformAudioPlayer(contentsOf: url)
+                playerDelegate.onFinished = {
+                    Task { @MainActor in
+                        isPlaying = false
+                        player = nil
+                    }
+                }
+                nextPlayer.delegate = playerDelegate
                 player = nextPlayer
                 nextPlayer.play()
                 isPlaying = true
             }
         } catch {
             isPlaying = false
+            player = nil
         }
         #endif
     }
 }
+
+#if canImport(AVFoundation)
+private final class ChatAudioPlayerDelegate: NSObject, AVAudioPlayerDelegate {
+    var onFinished: (() -> Void)?
+
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        onFinished?()
+    }
+}
+#endif
 
 #if canImport(AVFoundation)
 typealias PlatformAudioPlayer = AVAudioPlayer
@@ -837,7 +950,7 @@ struct LogEntryView: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(AppTheme.separator)
         )
-        .shadow(color: .black.opacity(0.14), radius: 18, y: 10)
+        .shadow(color: .black.opacity(0.08), radius: 6, y: 3)
         .padding(entry.kind == .user || entry.kind == .sent ? .trailing : .leading, horizontalSizeClass == .compact ? 0 : 34)
     }
 

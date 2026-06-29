@@ -105,17 +105,29 @@ extension AffectiveViewModel {
             statusText = "Ready"
             return
         }
+        if speechSpeaker.shouldSkipDuplicateSpeech(text) {
+            appendEventLog(
+                kind: .state,
+                title: "speech output",
+                body: "duplicate speech skipped",
+                metadata: ["reason": "already_spoken"]
+            )
+            canSend = true
+            statusText = "Ready"
+            return
+        }
+        notificationSounds.playSpeechNotification()
         guard brainVoiceEnabled else {
             canSend = true
             statusText = "Ready"
             appendEventLog(kind: .state, title: "speech output", body: "apple_speech=false", metadata: ["reason": "brain_voice_disabled"])
+            markAwaitingSocialResponse()
             return
         }
         canSend = false
         statusText = "Affective is speaking"
         let preferredVoice = runtimeOptionStringValue(for: Self.speechVoiceOptionKey)
         appendEventLog(kind: .state, title: "speech output", body: "apple_speech=true", metadata: ["voice": preferredVoice ?? "system"])
-        notificationSounds.playSpeechNotification()
         speechSpeaker.speak(text, preferredVoiceName: preferredVoice) { [weak self] in
             guard let self else { return }
             self.markAwaitingSocialResponse()
@@ -147,17 +159,30 @@ extension AffectiveViewModel {
             statusText = "Ready"
             return
         }
-        guard brainVoiceEnabled else {
-            canSend = true
+        if speechSpeaker.shouldSkipDuplicateSpeech(text) {
+            appendEventLog(
+                kind: .state,
+                title: "speech output",
+                body: "duplicate speech skipped",
+                metadata: ["reason": "already_spoken"]
+            )
+            refreshUserSendAvailability()
             statusText = "Ready"
+            return
+        }
+        notificationSounds.playSpeechNotification()
+        guard brainVoiceEnabled else {
             appendEventLog(kind: .state, title: "speech output", body: "apple_speech=false", metadata: ["reason": "brain_voice_disabled"])
+            markAwaitingSocialResponse()
+            refreshUserSendAvailability()
+            statusText = "Ready"
             return
         }
         setHostPipelineHold(.speechOutput)
         canSend = false
+        statusText = "Affective is speaking"
         let preferredVoice = runtimeOptionStringValue(for: Self.speechVoiceOptionKey)
         appendEventLog(kind: .state, title: "speech output", body: "apple_speech=true", metadata: ["voice": preferredVoice ?? "system"])
-        notificationSounds.playSpeechNotification()
         await withCheckedContinuation { continuation in
             speechSpeaker.speak(text, preferredVoiceName: preferredVoice) { [weak self] in
                 guard let self else {
@@ -166,7 +191,8 @@ extension AffectiveViewModel {
                 }
                 self.setHostPipelineHold(.none)
                 self.markAwaitingSocialResponse()
-                self.canSend = self.hostPipelineQueue.isEmpty
+                self.refreshUserSendAvailability()
+                self.statusText = "Ready"
                 continuation.resume()
             }
         }
@@ -573,6 +599,13 @@ extension AffectiveViewModel {
                 permissionState: currentMotionGestureCapabilityStatus(),
                 statusReason: "Host accelerometer gesture monitor status."
             ),
+            PullSenseDescriptor(
+                senseID: "time",
+                direction: .pull,
+                availability: CoreConfigStorage.currentDateTimeCapabilityStatus(),
+                permissionState: CoreConfigStorage.currentDateTimeCapabilityStatus(),
+                statusReason: "Host system clock and local timezone."
+            ),
         ]
     }
 
@@ -714,6 +747,29 @@ extension AffectiveViewModel {
             orientationPermissionPrompt = nil
             orientationPermissionContinuation?.resume(returning: .unavailable)
             orientationPermissionContinuation = nil
+        }
+        setHostPipelineHold(.none)
+    }
+
+    func abortSupersededPullSenseFulfillment() {
+        if let requestID = pendingCameraRequestID {
+            closedPullSenseRequestIDs.insert(requestID)
+            pendingCameraRequestID = nil
+        }
+        if let requestID = pendingOrientationRequestID {
+            closedPullSenseRequestIDs.insert(requestID)
+            pendingOrientationRequestID = nil
+        }
+        if orientationPermissionContinuation != nil {
+            orientationPermissionPrompt = nil
+            orientationPermissionContinuation?.resume(returning: .unavailable)
+            orientationPermissionContinuation = nil
+        }
+        hostPipelineQueue.removeAll { action in
+            if case .pullSenseRequest = action {
+                return true
+            }
+            return false
         }
         setHostPipelineHold(.none)
     }

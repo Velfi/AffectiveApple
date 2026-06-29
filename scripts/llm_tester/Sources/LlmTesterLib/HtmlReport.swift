@@ -11,7 +11,7 @@ public enum HtmlReport {
         let hoistedPrompts = buildHoistedSystemPrompts(from: sortedResults)
         let counts = statusCounts(from: sortedResults)
         let subsystems = Array(Set(sortedResults.map(\.scenario.subsystem))).sorted()
-        let statuses = ["error", "invalid_json", "ok"]
+        let statuses = ["error", "invalid_json", "semantic_fail", "ok"]
 
         var html: [String] = []
         html.append("<!DOCTYPE html>")
@@ -57,6 +57,7 @@ public enum HtmlReport {
             .metric .value { font-size: 24px; font-weight: 600; margin-top: 4px; }
             .metric.ok .value { color: var(--ok); }
             .metric.invalid_json .value { color: var(--warn); }
+            .metric.semantic_fail .value { color: var(--warn); }
             .metric.error .value { color: var(--bad); }
             .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 16px; overflow: hidden; scroll-margin-top: 24px; }
             .card-header { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; padding: 16px 18px; border-bottom: 1px solid var(--border); }
@@ -67,6 +68,7 @@ public enum HtmlReport {
             .badge { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600; text-transform: uppercase; }
             .badge.ok { background: rgba(63, 185, 80, 0.15); color: var(--ok); }
             .badge.invalid_json { background: rgba(210, 153, 34, 0.15); color: var(--warn); }
+            .badge.semantic_fail { background: rgba(210, 153, 34, 0.15); color: var(--warn); }
             .badge.error { background: rgba(248, 81, 73, 0.15); color: var(--bad); }
             .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 20px; }
             .filters .group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
@@ -75,6 +77,7 @@ public enum HtmlReport {
             .filter-chip.active { border-color: #58a6ff; background: rgba(88, 166, 255, 0.15); color: #79c0ff; }
             .filter-chip.status-ok.active { border-color: var(--ok); background: rgba(63, 185, 80, 0.15); color: var(--ok); }
             .filter-chip.status-invalid_json.active { border-color: var(--warn); background: rgba(210, 153, 34, 0.15); color: var(--warn); }
+            .filter-chip.status-semantic_fail.active { border-color: var(--warn); background: rgba(210, 153, 34, 0.15); color: var(--warn); }
             .filter-chip.status-error.active { border-color: var(--bad); background: rgba(248, 81, 73, 0.15); color: var(--bad); }
             .shared-prompts { margin-bottom: 24px; }
             .shared-prompts h2 { font-size: 20px; margin: 0 0 12px; }
@@ -116,6 +119,7 @@ public enum HtmlReport {
         html.append(metric(label: "Failed", value: "\(summary.failed)"))
         html.append(metric(label: "OK", value: "\(counts.ok)", cssClass: "ok"))
         html.append(metric(label: "Invalid JSON", value: "\(counts.invalidJSON)", cssClass: "invalid_json"))
+        html.append(metric(label: "Semantic Fail", value: "\(counts.semanticFail)", cssClass: "semantic_fail"))
         html.append(metric(label: "Error", value: "\(counts.error)", cssClass: "error"))
         html.append("</section>")
 
@@ -151,8 +155,9 @@ public enum HtmlReport {
         switch status {
         case "error": return 0
         case "invalid_json": return 1
-        case "ok": return 2
-        default: return 3
+        case "semantic_fail": return 2
+        case "ok": return 3
+        default: return 4
         }
     }
 
@@ -160,19 +165,21 @@ public enum HtmlReport {
         results.sorted { statusSortOrder($0.status) < statusSortOrder($1.status) }
     }
 
-    public static func statusCounts(from results: [LlmTesterScenarioResult]) -> (ok: Int, invalidJSON: Int, error: Int) {
+    public static func statusCounts(from results: [LlmTesterScenarioResult]) -> (ok: Int, invalidJSON: Int, semanticFail: Int, error: Int) {
         var ok = 0
         var invalidJSON = 0
+        var semanticFail = 0
         var error = 0
         for result in results {
             switch result.status {
             case "ok": ok += 1
             case "invalid_json": invalidJSON += 1
+            case "semantic_fail": semanticFail += 1
             case "error": error += 1
             default: break
             }
         }
-        return (ok, invalidJSON, error)
+        return (ok, invalidJSON, semanticFail, error)
     }
 
     // MARK: - Stimulus extraction
@@ -540,6 +547,9 @@ public enum HtmlReport {
 
         if let errorMessage = result.errorMessage, result.status == "error" || result.status == "invalid_json" {
             parts.append("<div class=\"error-box\">\(escapeHTML(errorMessage))</div>")
+        }
+        if let semanticMessage = result.semanticMessage, result.status == "semantic_fail" {
+            parts.append("<div class=\"error-box\">Semantic: \(escapeHTML(semanticMessage))</div>")
         }
 
         if let hoistedId = hoistedPromptId(for: result.scenario.systemPrompt, hoistedPrompts: hoistedPrompts) {

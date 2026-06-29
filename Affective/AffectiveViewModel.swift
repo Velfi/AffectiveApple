@@ -16,6 +16,7 @@ final class AffectiveViewModel: ObservableObject {
     static let boredomIntervalOptionKey = "boredom_interval_seconds"
     static let boredomIntervalMinSeconds = 60
     static let makeUpLostDreamTimeOptionKey = "make_up_lost_dream_time"
+    static let llmQualityOptionKey = "llm_quality"
     static let speechVoiceOptionKey = "speech_voice"
     static let cameraDeviceIDOptionKey = "camera_device_id"
     nonisolated static let textProviderPreferenceOptionKey = "text_provider_preference"
@@ -51,19 +52,24 @@ final class AffectiveViewModel: ObservableObject {
     var pokeFlushTask: Task<Void, Never>?
     var boredomSenseTask: Task<Void, Never>?
     var boredomSenseGeneration = 0
+    var autonomySenseTask: Task<Void, Never>?
+    var autonomySenseGeneration = 0
     var lastHostStimulusAt = Date()
     var awaitingSocialResponseUntil: Date?
     var counterpartActiveUntil: Date?
     @Published private(set) var brain: BrainDescriptor
     @Published var brainPresentationName: String?
     @Published var isBrainConnected = false
+    @Published private(set) var hasAttemptedInitialCoreLoad = false
     @Published var isToolRunning = false
-    var isBrainConnectionInFlight = false
+    @Published var isBrainConnectionInFlight = false
     var hostPipelineQueue: [HostPipelineAction] = []
     var isHostPipelineRunning = false
     var currentHostPipelineAction: HostPipelineAction?
     var currentHostPipelineActionIsAwaitingChatResponse = false
     var pendingChatResponseCount = 0
+    var immediateUserMessageInFlight = false
+    var conversationDispatchGeneration = 0
     @Published var hostPipelineHold: HostPipelineHold = .none
 
     @Published var selectedSection: WorkspaceSection = .chat
@@ -73,9 +79,13 @@ final class AffectiveViewModel: ObservableObject {
     @Published var selectedSettingsScope: SettingsScope = .brain
     @Published var messageText = ""
     @Published var statusText = "Ready"
+    @Published var coreLoadProgressLabel = ""
+    @Published var coreLoadProgressDetail = ""
+    @Published private(set) var lastCoreLoadMetrics: CoreLoadMetricsReport?
     @Published var isPoking = false
     @Published var canSend = true
     @Published var brainMode = "waking"
+    @Published var innerStateSummary = ""
     @Published var brainVoiceEnabled = true
     @Published var isAwaitingChatResponse = false
     @Published var droppedImageName: String?
@@ -122,10 +132,12 @@ final class AffectiveViewModel: ObservableObject {
     var applyingQueuedFacialExpression = false
     @Published var autonomyControlCapacity: Double = 1.0
     @Published var autonomyMaxCapacity: Double = 1.0
+    @Published var autonomyReplenishPointsPerMinute: Double = 0
+    @Published var autonomyLastCapacityReplenishAt: Date?
     @Published var appIsForeground = true
     var scenePhaseIsActive = true
     #if os(macOS)
-    var macForegroundObservers: [NSObject] = []
+    var macForegroundObservers: [any NSObjectProtocol] = []
     #endif
 
     init(
@@ -153,6 +165,23 @@ final class AffectiveViewModel: ObservableObject {
         recordBrainSizeSnapshotIfNeeded()
         refreshKnowledgeEntries()
         resetAvatarFacialExpression()
+        #if os(macOS)
+        macForegroundObservers.append(
+            NotificationCenter.default.addObserver(
+                forName: BrainLibrary.avatarDidUpdateNotification,
+                object: nil,
+                queue: .main
+            ) { [weak viewModel = self] notification in
+                guard let viewModel,
+                      let brainID = notification.userInfo?[BrainLibrary.avatarDidUpdateBrainIDKey] as? String else {
+                    return
+                }
+                MainActor.assumeIsolated {
+                    viewModel.handleAvatarDidUpdate(for: brainID)
+                }
+            }
+        )
+        #endif
     }
 
     func reloadBrain(_ updated: BrainDescriptor) {
@@ -164,6 +193,7 @@ final class AffectiveViewModel: ObservableObject {
 
     deinit {
         boredomSenseTask?.cancel()
+        autonomySenseTask?.cancel()
         motionGestureMonitor?.stop()
         #if os(macOS)
         for observer in macForegroundObservers {
@@ -190,8 +220,21 @@ final class AffectiveViewModel: ObservableObject {
     }
     #endif
 
+    func recordCoreLoadMetrics(_ report: CoreLoadMetricsReport) {
+        lastCoreLoadMetrics = report
+    }
+
+    func markInitialCoreLoadAttempted() {
+        hasAttemptedInitialCoreLoad = true
+    }
+
     var workspaceBrainTitle: String {
         brainPresentationName ?? brain.displayName
+    }
+
+    var showsCoreConnectingScreen: Bool {
+        guard !isBrainConnected else { return false }
+        return isBrainConnectionInFlight || !hasAttemptedInitialCoreLoad
     }
 
     var coreStatusText: String {
@@ -331,12 +374,52 @@ final class AffectiveViewModel: ObservableObject {
     }
 
     var autonomyCapacityFraction: Double {
+        autonomyCapacityFraction(at: Date())
+    }
+
+    func autonomyCapacityFraction(at date: Date) -> Double {
         guard autonomyMaxCapacity > 0 else { return 0 }
-        return min(max(autonomyControlCapacity / autonomyMaxCapacity, 0), 1)
+        let capacity = interpolatedAutonomyControlCapacity(at: date)
+        return min(max(capacity / autonomyMaxCapacity, 0), 1)
     }
 
     var autonomyCapacityPercentText: String {
-        "\(Int((autonomyCapacityFraction * 100).rounded()))%"
+        autonomyCapacityPercentText(at: Date())
+    }
+
+    func autonomyCapacityPercentText(at date: Date) -> String {
+        "\(Int((autonomyCapacityFraction(at: date) * 100).rounded()))%"
+    }
+
+    func interpolatedAutonomyControlCapacity(at date: Date = Date()) -> Double {
+        guard autonomyIsEnabled else { return autonomyControlCapacity }
+        let replenishRate = effectiveAutonomyReplenishPointsPerMinute
+        guard replenishRate > 0 else { return autonomyControlCapacity }
+
+        let elapsed: TimeInterval
+        if let anchor = autonomyLastCapacityReplenishAt {
+            elapsed = max(0, date.timeIntervalSince(anchor))
+        } else {
+            return autonomyControlCapacity
+        }
+
+        let ratePerSecond = replenishRate / 60
+        let projected = autonomyControlCapacity + ratePerSecond * elapsed
+        return min(projected, autonomyMaxCapacity)
+    }
+
+    var effectiveAutonomyReplenishPointsPerMinute: Double {
+        if autonomyReplenishPointsPerMinute > 0 {
+            return autonomyReplenishPointsPerMinute
+        }
+        let key = normalizedAutonomyMode == "limited"
+            ? "autonomy_limited_replenish_actions_per_minute"
+            : "autonomy_full_replenish_actions_per_minute"
+        guard let rawValue = runtimeOptionStringValue(for: key),
+              let value = Double(rawValue) else {
+            return 0
+        }
+        return max(0, value)
     }
 
     static func normalizeAutonomyMode(_ rawMode: String) -> String {
@@ -425,9 +508,7 @@ final class AffectiveViewModel: ObservableObject {
 
     func refreshMailboxItems() {
         guard isBrainConnected, !isBrainConnectionInFlight else { return }
-        Task {
-            await collectMailboxItems()
-        }
+        enqueueHostPipelineAction(.collectMailbox)
     }
 
     func enterDreamOnLoadIfNeeded(now: Date = Date()) async {
@@ -460,7 +541,7 @@ final class AffectiveViewModel: ObservableObject {
             let stateByID = mailboxUIState.stateByMailboxID
             mailboxItems = response.items.map {
                 MailboxItem(mailbox: $0, state: stateByID[$0.mailboxID])
-                    .resolvingArtifact(in: brain.memoryDatabaseURL)
+                    .resolvingArtifact(in: brain.memoryDatabaseURL, brainID: brain.id)
             }
         } catch {
             statusText = "Mailbox update failed: \(error.localizedDescription)"
@@ -482,7 +563,7 @@ final class AffectiveViewModel: ObservableObject {
             item.isRead = isRead
         }
         if isRead {
-            Task { try? await brainCore.mailboxMarkRead(mailboxID: itemID) }
+            enqueueHostPipelineAction(.mailboxMarkRead(itemID))
         }
     }
 
@@ -574,11 +655,14 @@ enum HostPipelineAction {
     case interrupt(userText: String, reason: String, interruptedAction: String?, canceledQueuedActionCount: Int)
     case typedText(text: String, stimulusContext: StimulusContext)
     case imageText(prompt: String, attachment: [String: JSONValue], mediaPayload: String, stimulusContext: StimulusContext)
+    case pullSenseRequest(BrainEvent, BrainEventPresentation)
     case coreTouch(name: String, title: String)
     case pokeSequence([PokePulse])
     case pushedMotionGesture(MotionGestureObservation)
     case boredomStimulus(text: String, stimulusContext: StimulusContext)
     case refreshBrainState
+    case collectMailbox
+    case mailboxMarkRead(String)
 }
 
 nonisolated struct RecentStimulus: Equatable {

@@ -30,6 +30,8 @@ nonisolated struct AppleFoundationModelsTextRequest: Equatable {
 }
 
 nonisolated struct AppleFoundationModelsTextClient {
+    nonisolated static let isFeatureEnabled = false
+
     typealias AvailabilityProvider = () -> AppleFoundationModelsAvailability
     typealias CompletionProvider = (AppleFoundationModelsTextRequest) async throws -> String
 
@@ -62,6 +64,9 @@ nonisolated struct AppleFoundationModelsTextClient {
     }
 
     static func currentAvailability() -> AppleFoundationModelsAvailability {
+        guard isFeatureEnabled else {
+            return .unsupportedPlatform
+        }
         #if canImport(FoundationModels) && (os(iOS) || os(macOS) || os(visionOS))
         guard #available(iOS 26.0, macOS 26.0, visionOS 26.0, *) else {
             return .unsupportedPlatform

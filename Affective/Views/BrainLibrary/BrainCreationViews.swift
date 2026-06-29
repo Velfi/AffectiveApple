@@ -164,6 +164,7 @@ struct BrainCreationSheet: View {
                     initialThoughts: initialThoughts.seedText,
                     notes: notes.seedText
                 ))
+                dismiss()
             } catch {
                 errorText = error.localizedDescription
             }

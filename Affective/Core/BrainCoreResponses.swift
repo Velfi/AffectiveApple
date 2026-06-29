@@ -10,6 +10,21 @@ nonisolated struct BrainTextResponse: Equatable {
   let text: String
   let metadata: [String: String]
   let events: [BrainEvent]
+  let shouldSpeak: Bool
+
+  init(
+    toolName: String,
+    text: String,
+    metadata: [String: String],
+    events: [BrainEvent],
+    shouldSpeak: Bool = false
+  ) {
+    self.toolName = toolName
+    self.text = text
+    self.metadata = metadata
+    self.events = events
+    self.shouldSpeak = shouldSpeak
+  }
 }
 
 nonisolated struct BrainModeResponse: Equatable {
@@ -51,6 +66,9 @@ nonisolated struct BrainReadModelsSnapshotResponse: Equatable {
     self.toolName = toolName
     let payload = try envelope.structuredResultValueRequired()
     guard let readModels = payload.objectValue?["read_models"] else {
+      if let detail = payload.objectValue?["detail"]?.stringValue, !detail.isEmpty {
+        throw BrainCoreError.unavailable(detail)
+      }
       throw BrainCoreError.malformedResponse
     }
     self.readModels = readModels
@@ -58,7 +76,43 @@ nonisolated struct BrainReadModelsSnapshotResponse: Equatable {
     if let brainMode = readModels.objectValue?["brain_mode"]?.stringValue {
       mergedMetadata["brain_mode"] = brainMode
     }
+    if let activeProcess = readModels.objectValue?["active_process_model"]?.objectValue {
+      if let goal = activeProcess["goal"]?.stringValue {
+        mergedMetadata["active_process_goal"] = goal
+      }
+      if let state = activeProcess["state"]?.stringValue {
+        mergedMetadata["active_process_state"] = state
+      }
+    }
     self.metadata = mergedMetadata
+  }
+}
+
+nonisolated struct BrainChatDryRunPromptResponse: Equatable {
+  let toolName: String
+  let systemPrompt: String
+  let userPrompt: String
+  let metadata: [String: String]
+
+  init(toolName: String, systemPrompt: String, userPrompt: String, metadata: [String: String]) {
+    self.toolName = toolName
+    self.systemPrompt = systemPrompt
+    self.userPrompt = userPrompt
+    self.metadata = metadata
+  }
+
+  init(toolName: String, envelope: BrainDispatchEnvelope) throws {
+    self.toolName = toolName
+    let payload = try envelope.structuredResultValueRequired()
+    guard
+      let systemPrompt = payload.objectValue?["system_prompt"]?.stringValue,
+      let userPrompt = payload.objectValue?["user_prompt"]?.stringValue
+    else {
+      throw BrainCoreError.malformedResponse
+    }
+    self.systemPrompt = systemPrompt
+    self.userPrompt = userPrompt
+    self.metadata = envelope.metadata()
   }
 }
 
@@ -273,6 +327,7 @@ nonisolated enum BrainEventModality: String, Codable, Equatable, Sendable {
   case media
   case face
   case facialExpression = "facial_expression"
+  case emote
 }
 
 nonisolated enum BrainParticipantRole: String, Codable, Equatable, Sendable {
@@ -613,6 +668,12 @@ nonisolated struct BrainControlPayload: Codable, Equatable, Sendable {
   }
 }
 
+nonisolated struct BrainDeveloperLogPayload: Codable, Equatable, Sendable {
+  let kind: String
+  let title: String
+  let body: String
+}
+
 nonisolated struct BrainMiseEnScenePayload: Codable, Equatable, Sendable {
   let name: String
   let themeColor: String?
@@ -646,6 +707,7 @@ nonisolated enum BrainEventPayload: Codable, Equatable, Sendable {
   case memoryResult(BrainMemoryResultPayload)
   case memoryMutation(BrainMemoryMutationPayload)
   case control(BrainControlPayload)
+  case developerLog(BrainDeveloperLogPayload)
   case miseEnScene(BrainMiseEnScenePayload)
   case error(BrainEventErrorPayload)
 
@@ -666,6 +728,7 @@ nonisolated enum BrainEventPayload: Codable, Equatable, Sendable {
     case memoryResult = "memory_result"
     case memoryMutation = "memory_mutation"
     case control
+    case developerLog = "developer_log"
     case miseEnScene = "mise_en_scene"
     case error
   }
@@ -704,6 +767,8 @@ nonisolated enum BrainEventPayload: Codable, Equatable, Sendable {
       self = .memoryMutation(value)
     } else if let value = try container.decodeIfPresent(BrainControlPayload.self, forKey: .control) {
       self = .control(value)
+    } else if let value = try container.decodeIfPresent(BrainDeveloperLogPayload.self, forKey: .developerLog) {
+      self = .developerLog(value)
     } else if let value = try container.decodeIfPresent(BrainMiseEnScenePayload.self, forKey: .miseEnScene) {
       self = .miseEnScene(value)
     } else if let value = try container.decodeIfPresent(BrainEventErrorPayload.self, forKey: .error) {
@@ -732,6 +797,7 @@ nonisolated enum BrainEventPayload: Codable, Equatable, Sendable {
     case .memoryResult(let value): try container.encode(value, forKey: .memoryResult)
     case .memoryMutation(let value): try container.encode(value, forKey: .memoryMutation)
     case .control(let value): try container.encode(value, forKey: .control)
+    case .developerLog(let value): try container.encode(value, forKey: .developerLog)
     case .miseEnScene(let value): try container.encode(value, forKey: .miseEnScene)
     case .error(let value): try container.encode(value, forKey: .error)
     }
@@ -755,6 +821,7 @@ nonisolated enum BrainEventPayload: Codable, Equatable, Sendable {
     case .memoryResult: "memory_result"
     case .memoryMutation: "memory_mutation"
     case .control: "control"
+    case .developerLog: "developer_log"
     case .miseEnScene: "mise_en_scene"
     case .error: "error"
     }
@@ -929,6 +996,7 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
   let result: JSONValue?
   let error: BrainDispatchError?
   let budget: BrainDispatchBudget?
+  let timings: JSONValue?
   let rawText: String
 
   private enum CodingKeys: String, CodingKey {
@@ -938,16 +1006,18 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
     case result
     case error
     case budget
+    case timings
   }
 
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     requestID = try container.decode(String.self, forKey: .requestID)
     ok = try container.decode(Bool.self, forKey: .ok)
-    events = try container.decodeIfPresent([BrainEvent].self, forKey: .events) ?? []
+    events = Self.decodeEventsLeniently(from: container)
     result = try container.decodeIfPresent(JSONValue.self, forKey: .result)
     error = try container.decodeIfPresent(BrainDispatchError.self, forKey: .error)
     budget = try container.decodeIfPresent(BrainDispatchBudget.self, forKey: .budget)
+    timings = try container.decodeIfPresent(JSONValue.self, forKey: .timings)
     rawText = ""
   }
 
@@ -958,6 +1028,7 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
     result: JSONValue?,
     error: BrainDispatchError?,
     budget: BrainDispatchBudget? = nil,
+    timings: JSONValue? = nil,
     rawText: String = ""
   ) {
     self.requestID = requestID
@@ -966,6 +1037,7 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
     self.result = result
     self.error = error
     self.budget = budget
+    self.timings = timings
     self.rawText = rawText
   }
 
@@ -977,23 +1049,154 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
     try container.encodeIfPresent(result, forKey: .result)
     try container.encodeIfPresent(error, forKey: .error)
     try container.encodeIfPresent(budget, forKey: .budget)
+    try container.encodeIfPresent(timings, forKey: .timings)
   }
 
   static func decode(from text: String) throws -> BrainDispatchEnvelope {
     guard let data = text.data(using: .utf8) else {
       throw BrainCoreError.malformedResponse
     }
-    var decoded = try JSONDecoder().decode(BrainDispatchEnvelope.self, from: data)
-    decoded = BrainDispatchEnvelope(
-      requestID: decoded.requestID,
-      ok: decoded.ok,
-      events: decoded.events,
-      result: decoded.result,
-      error: decoded.error,
-      budget: decoded.budget,
+    let decoder = JSONDecoder()
+    let shell: EnvelopeShell
+    do {
+      shell = try decoder.decode(EnvelopeShell.self, from: data)
+    } catch {
+      throw BrainCoreError.malformedResponse
+    }
+    let events = try decodeEventsLeniently(from: data, decoder: decoder, fallback: shell.events)
+    return BrainDispatchEnvelope(
+      requestID: shell.requestID,
+      ok: shell.ok,
+      events: events,
+      result: shell.result,
+      error: shell.error,
+      budget: shell.budget,
+      timings: shell.timings,
       rawText: text
     )
-    return decoded
+  }
+
+  /// Host-visible events from the envelope, or a chat/speech batch synthesized from `spoken_text` in the result.
+  func resolvedEvents() -> [BrainEvent] {
+    if !events.isEmpty {
+      return events
+    }
+    let spoken = displayText.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !spoken.isEmpty else { return [] }
+    return Self.syntheticUserTextEvents(text: spoken, requestID: requestID)
+  }
+
+  private struct EnvelopeShell: Decodable {
+    let requestID: String
+    let ok: Bool
+    let events: [BrainEvent]
+    let result: JSONValue?
+    let error: BrainDispatchError?
+    let budget: BrainDispatchBudget?
+    let timings: JSONValue?
+
+    init(from decoder: Decoder) throws {
+      let container = try decoder.container(keyedBy: CodingKeys.self)
+      requestID = try container.decode(String.self, forKey: .requestID)
+      ok = try container.decode(Bool.self, forKey: .ok)
+      result = try container.decodeIfPresent(JSONValue.self, forKey: .result)
+      error = try container.decodeIfPresent(BrainDispatchError.self, forKey: .error)
+      budget = try container.decodeIfPresent(BrainDispatchBudget.self, forKey: .budget)
+      timings = try container.decodeIfPresent(JSONValue.self, forKey: .timings)
+      events = BrainDispatchEnvelope.decodeEventsLeniently(from: container)
+    }
+  }
+
+  private static func decodeEventsLeniently(
+    from container: KeyedDecodingContainer<CodingKeys>
+  ) -> [BrainEvent] {
+    guard var eventsContainer = try? container.nestedUnkeyedContainer(forKey: .events) else {
+      return []
+    }
+    var events: [BrainEvent] = []
+    while !eventsContainer.isAtEnd {
+      if let event = try? eventsContainer.decode(BrainEvent.self) {
+        events.append(event)
+      } else {
+        _ = try? eventsContainer.decode(IgnoredEvent.self)
+      }
+    }
+    return events
+  }
+
+  private struct IgnoredEvent: Decodable {}
+
+  private static func decodeEventsLeniently(
+    from data: Data,
+    decoder: JSONDecoder,
+    fallback: [BrainEvent]
+  ) throws -> [BrainEvent] {
+    if !fallback.isEmpty {
+      return fallback
+    }
+    guard
+      let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let rawEvents = root["events"] as? [Any]
+    else {
+      return fallback
+    }
+    return rawEvents.compactMap { raw in
+      guard JSONSerialization.isValidJSONObject(raw),
+            let eventData = try? JSONSerialization.data(withJSONObject: raw),
+            let event = try? decoder.decode(BrainEvent.self, from: eventData) else {
+        return nil
+      }
+      return event
+    }
+  }
+
+  static func syntheticUserTextEvents(text: String, requestID: String) -> [BrainEvent] {
+    let expressionID = requestID.isEmpty ? "user-text-expression" : "\(requestID)-expression"
+    let actionID = requestID.isEmpty ? "user-text-speech" : "\(requestID)-speech"
+    return [
+      BrainEvent(
+        id: expressionID,
+        traceID: expressionID,
+        parentID: nil,
+        turnID: requestID.isEmpty ? nil : requestID,
+        loopID: nil,
+        occurredAt: BrainEvent.iso8601Now(),
+        source: .brain,
+        target: .host,
+        visibility: .public,
+        presentation: .chat,
+        payload: .expression(BrainExpressionPayload(
+          modality: .text,
+          role: .selfRole,
+          title: "Brain",
+          text: text,
+          media: [],
+          expressionID: expressionID,
+          eyes: nil,
+          mouth: nil,
+          durationMS: nil
+        ))
+      ),
+      BrainEvent(
+        id: actionID,
+        traceID: actionID,
+        parentID: nil,
+        turnID: requestID.isEmpty ? nil : requestID,
+        loopID: nil,
+        occurredAt: BrainEvent.iso8601Now(),
+        source: .brain,
+        target: .host,
+        visibility: .public,
+        presentation: .chat,
+        payload: .capabilityRequest(BrainActionRequestPayload(
+          actionID: actionID,
+          action: "speak",
+          arguments: .object(["text": .string(text)]),
+          requires: ["speech_output"],
+          awaitResponse: false
+        ))
+      ),
+    ]
   }
 
   var speechTexts: [String] {
@@ -1267,6 +1470,8 @@ extension BrainEvent {
       return value.summary
     case .control(let value):
       return value.status
+    case .developerLog(let value):
+      return value.body
     case .error(let value):
       return value.message
     default:
@@ -1290,6 +1495,7 @@ extension BrainEvent {
     case .attentionState: "attention_state"
     case .intention: "intention"
     case .memoryMutation: "memory"
+    case .developerLog(let value): value.kind
     default: nil
     }
   }
@@ -1303,6 +1509,7 @@ extension BrainEvent {
     case .senseRequest(let value): "\(value.senseID) sense"
     case .capabilityRequest(let value): value.action
     case .actionResult(let value): value.actionID
+    case .developerLog(let value): value.title
     default: nil
     }
   }

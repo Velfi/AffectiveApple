@@ -14,10 +14,10 @@ enum BrainSpeechNotificationAuthorizationStatus: String, Sendable {
     case ephemeral
 }
 
-private enum BrainSpeechNotificationKeys {
-    static let brainSpeechKind = "brain_speech"
-    static let brainID = "brain_id"
-    static let kind = "kind"
+private nonisolated enum BrainSpeechNotificationKeys {
+    nonisolated static let brainSpeechKind = "brain_speech"
+    nonisolated static let brainID = "brain_id"
+    nonisolated static let kind = "kind"
 }
 
 enum BrainSpeechNotificationPolicy {

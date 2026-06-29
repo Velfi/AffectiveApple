@@ -29,26 +29,8 @@ struct ContentView: View {
     @AppStorage("Affective.didBypassCredentialWelcome") private var didBypassCredentialWelcome = false
 
     var body: some View {
-        Group {
-            if !didCompleteCredentialWelcome && !didBypassCredentialWelcome {
-                APIKeyWelcomeView(
-                    continueToApp: {
-                        finishCredentialWelcome()
-                    },
-                    bypass: {
-                        finishCredentialWelcome(bypassed: true)
-                    }
-                )
-            } else if let selectedBrain {
-                AffectiveShellView(brain: selectedBrain)
-            } else {
-                WelcomeView(library: library, syncManager: syncManager) { brain in
-                    guard syncManager.canOpen(brain) else { return }
-                    library.markOpened(brain)
-                    selectedBrain = brain
-                }
-            }
-        }
+        rootContent
+        .animation(.smooth(duration: 0.25), value: selectedBrain?.id)
         .background(AppTheme.background)
         .foregroundStyle(AppTheme.primaryText)
         #if os(macOS)
@@ -88,6 +70,32 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: BrainLibrary.avatarDidUpdateNotification)) { notification in
             reloadAvatarIfNeeded(from: notification)
+        }
+    }
+
+    @ViewBuilder
+    private var rootContent: some View {
+        if !didCompleteCredentialWelcome && !didBypassCredentialWelcome {
+            APIKeyWelcomeView(
+                continueToApp: {
+                    finishCredentialWelcome()
+                },
+                bypass: {
+                    finishCredentialWelcome(bypassed: true)
+                }
+            )
+        } else if let brain = selectedBrain {
+            AffectiveShellView(brain: brain) {
+                selectedBrain = nil
+            }
+            .transition(.opacity)
+        } else {
+            WelcomeView(library: library, syncManager: syncManager) { brain in
+                guard syncManager.canOpen(brain) else { return }
+                library.markOpened(brain)
+                selectedBrain = brain
+            }
+            .transition(.opacity)
         }
     }
 
@@ -146,14 +154,16 @@ struct ContentView: View {
 
 private struct AffectiveShellView: View {
     let brain: BrainDescriptor
+    let onCloseBrain: () -> Void
     @StateObject private var model: AffectiveViewModel
     @FocusState private var composerFocused: Bool
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Environment(\.scenePhase) private var scenePhase
 
-    init(brain: BrainDescriptor) {
+    init(brain: BrainDescriptor, onCloseBrain: @escaping () -> Void) {
         self.brain = brain
+        self.onCloseBrain = onCloseBrain
         AppTheme.applyTheme(for: brain)
         #if DEBUG
         let viewModel = AffectiveViewModel(
@@ -168,43 +178,56 @@ private struct AffectiveShellView: View {
     }
 
     var body: some View {
-        shell
-            .background(AppTheme.background)
-            .foregroundStyle(AppTheme.primaryText)
-            .onChange(of: brain) { _, updated in
-                AppTheme.applyTheme(for: updated)
-                model.reloadBrain(updated)
+        ZStack {
+            shell
+
+            if model.showsCoreConnectingScreen {
+                CoreConnectingScreen(model: model)
+                    .transition(.opacity)
             }
-            .alert(item: $model.orientationPermissionPrompt) { prompt in
-                Alert(
-                    title: Text("Allow Orientation Sense?"),
-                    message: Text(prompt.reason),
-                    primaryButton: .default(Text("Allow")) {
-                        model.resolveOrientationPermission(true)
-                    },
-                    secondaryButton: .cancel(Text("Not Now")) {
-                        model.resolveOrientationPermission(false)
-                    }
-                )
-            }
-            .task {
-                await model.connectToBrain()
-            }
-            .onAppear {
-                model.refreshAppIsForeground()
-                #if os(macOS)
-                model.installMacForegroundObserversIfNeeded()
-                #endif
-            }
-            .onChange(of: scenePhase) { _, phase in
-                model.setScenePhaseActive(phase == .active)
-            }
+        }
+        .background(AppTheme.background)
+        .foregroundStyle(AppTheme.primaryText)
+        .animation(.smooth(duration: 0.2), value: model.showsCoreConnectingScreen)
+        .onChange(of: brain) { _, updated in
+            AppTheme.applyTheme(for: updated)
+            model.reloadBrain(updated)
+        }
+        .alert(item: $model.orientationPermissionPrompt) { prompt in
+            Alert(
+                title: Text("Allow Orientation Sense?"),
+                message: Text(prompt.reason),
+                primaryButton: .default(Text("Allow")) {
+                    model.resolveOrientationPermission(true)
+                },
+                secondaryButton: .cancel(Text("Not Now")) {
+                    model.resolveOrientationPermission(false)
+                }
+            )
+        }
+        .task {
+            await model.connectToBrain()
+        }
+        .onAppear {
+            model.refreshAppIsForeground()
+            #if os(macOS)
+            model.installMacForegroundObserversIfNeeded()
+            #endif
+        }
+        .onChange(of: scenePhase) { _, phase in
+            model.setScenePhaseActive(phase == .active)
+        }
     }
 
     @ViewBuilder
     private var shell: some View {
         if horizontalSizeClass == .compact {
             VStack(spacing: 0) {
+                CompactShellHeader(closeBrain: closeBrain)
+
+                Divider()
+                    .overlay(AppTheme.softSeparator)
+
                 WorkspaceDetail(model: model, composerFocused: $composerFocused)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -232,9 +255,16 @@ private struct AffectiveShellView: View {
         }
     }
 
+    func closeBrain() {
+        Task {
+            await model.disconnectFromBrain()
+            onCloseBrain()
+        }
+    }
+
     private var desktopShell: some View {
         HStack(spacing: 0) {
-            WorkspaceSidebar(model: model)
+            WorkspaceSidebar(model: model, closeBrain: closeBrain)
                 .frame(width: 260)
 
             Divider()
@@ -282,6 +312,28 @@ private struct CompactWorkspaceRail: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 10)
         .background(AppTheme.sidebarBackground)
+    }
+}
+
+private struct CompactShellHeader: View {
+    let closeBrain: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: closeBrain) {
+                Label("Projects", systemImage: "chevron.left")
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityLabel("Return to Projects")
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(AppTheme.sidebarBackground.opacity(0.72))
     }
 }
 

@@ -10,7 +10,6 @@ extension AffectiveViewModel {
     func enqueueHostPipelineAction(_ action: HostPipelineAction) {
         recordHostStimulus()
         hostPipelineQueue.append(action)
-        canSend = false
         noteQueuedChatResponses(action.presentsChatResponse ? 1 : 0)
         if !isHostPipelineRunning {
             Task {
@@ -27,7 +26,6 @@ extension AffectiveViewModel {
         guard !actions.isEmpty else { return }
         recordHostStimulus()
         hostPipelineQueue.insert(contentsOf: actions, at: 0)
-        canSend = false
         noteQueuedChatResponses(actions.filter(\.presentsChatResponse).count)
         if !isHostPipelineRunning {
             Task {
@@ -46,7 +44,7 @@ extension AffectiveViewModel {
         defer {
             isHostPipelineRunning = false
             if hostPipelineQueue.isEmpty, hostPipelineHold == .none {
-                canSend = !isBrainUnavailableForConversation
+                refreshUserSendAvailability()
                 if statusText == "Queued" || statusText.hasPrefix("Waiting for") {
                     statusText = isBrainUnavailableForConversation ? brainModeStatusText : "Ready"
                 }
@@ -78,10 +76,12 @@ extension AffectiveViewModel {
                 canceledQueuedActionCount: canceledQueuedActionCount
             )
         case .typedText(let text, let stimulusContext):
-            await sendTextToBrain(text, source: .typedText, stimulusContext: stimulusContext, speakResponse: brainVoiceEnabled)
+            await sendTextToBrain(text, source: .typedText, stimulusContext: stimulusContext)
         case .imageText(let prompt, let attachment, let mediaPayload, let stimulusContext):
             await sendMediaUploadedEvent(payload: mediaPayload)
-            await sendTextToBrain(prompt, source: .typedText, attachments: [attachment], stimulusContext: stimulusContext, speakResponse: brainVoiceEnabled)
+            await sendTextToBrain(prompt, source: .typedText, attachments: [attachment], stimulusContext: stimulusContext)
+        case .pullSenseRequest(let event, let observationResponsePresentation):
+            await fulfillSenseRequest(event, observationResponsePresentation: observationResponsePresentation)
         case .coreTouch(let name, let title):
             await callCoreTouch(name: name, title: title)
         case .pokeSequence(let pulses):
@@ -98,6 +98,10 @@ extension AffectiveViewModel {
             )
         case .refreshBrainState:
             await performRefreshBrainState()
+        case .collectMailbox:
+            await collectMailboxItems()
+        case .mailboxMarkRead(let mailboxID):
+            _ = try? await brainCore.mailboxMarkRead(mailboxID: mailboxID)
         }
     }
 
@@ -106,46 +110,113 @@ extension AffectiveViewModel {
         statusText = hold.statusText
     }
 
+    func disconnectFromBrain() async {
+        speechSpeaker.stop()
+        stopBoredomSense()
+        stopAutonomySense()
+        stopMotionGestureMonitoring()
+        pokeFlushTask?.cancel()
+        pokeFlushTask = nil
+        if isPoking {
+            isPoking = false
+        }
+        await brainCore.disconnect()
+        isBrainConnected = false
+        isBrainConnectionInFlight = false
+        statusText = "Disconnected"
+    }
+
     func connectToBrain() async {
         guard !isBrainConnected, !isBrainConnectionInFlight else { return }
+        markInitialCoreLoadAttempted()
         isBrainConnectionInFlight = true
         defer {
             isBrainConnectionInFlight = false
+            coreLoadProgressLabel = ""
+            coreLoadProgressDetail = ""
+        }
+
+        let loadSession = CoreLoadPerformanceSession { [weak self] label, detail in
+            self?.coreLoadProgressLabel = label
+            self?.coreLoadProgressDetail = detail ?? ""
+            self?.statusText = label
         }
 
         statusText = "Opening Zig core"
+        coreLoadProgressLabel = "Opening Zig core"
+        coreLoadProgressDetail = ""
+        CoreLoadPerformanceSession.writeStartupToConsole(brainID: brain.id)
         appendEventLog(kind: .sent, title: "initialize", body: "brain-core")
 
         do {
-            let envelope = try await brainCore.connect()
+            let envelope = try await brainCore.connect(progress: loadSession)
             isBrainConnected = true
             statusText = "Zig core ready"
+            coreLoadProgressLabel = "Zig core ready"
             appendEventLog(kind: .state, title: "core", body: "Brain core is ready.")
             if !SystemBrainSpeechNotificationService.didRequestAuthorizationThisLaunch {
                 SystemBrainSpeechNotificationService.didRequestAuthorizationThisLaunch = true
                 brainSpeechNotifications.registerDelegateIfNeeded()
-                let notificationStatus = await brainSpeechNotifications.requestAuthorizationIfNeeded()
+                let notificationStatus = await loadSession.measure(id: "notification_permission", label: "Requesting notification permission") {
+                    await brainSpeechNotifications.requestAuthorizationIfNeeded()
+                }
                 appendEventLog(
                     kind: .state,
                     title: "notification permission",
                     body: notificationStatus.rawValue
                 )
             }
-            _ = await applyCoreEvents(envelope.events, mirrorChatMessages: false, speak: false, handleHostRequests: false)
-            refreshBoredomSense()
+            _ = await loadSession.measure(id: "apply_core_events", label: "Applying core events") {
+                await applyCoreEvents(envelope.events, mirrorChatMessages: false, speak: false, handleHostRequests: false)
+            }
+            await loadSession.measure(id: "refresh_senses", label: "Starting background senses") {
+                refreshBoredomSense()
+                refreshAutonomySense()
+            }
 
-            await refreshBrainMode()
-            await refreshReadModelsSnapshot()
-            refreshKnowledgeEntries()
-            await collectMailboxItems()
+            await loadSession.measure(id: "refresh_brain_mode", label: "Refreshing brain mode") {
+                await refreshBrainMode()
+            }
+            await loadSession.measure(id: "read_models_snapshot", label: "Loading read models") {
+                await refreshReadModelsSnapshot()
+            }
+            await loadSession.measure(id: "refresh_knowledge", label: "Loading knowledge") {
+                refreshKnowledgeEntries()
+            }
+            await loadSession.measure(id: "collect_mailbox", label: "Loading mailbox") {
+                await collectMailboxItems()
+            }
+            if supportsAvatarFacialExpressions {
+                _ = try await loadSession.measure(id: "facial_expression_catalog", label: "Loading avatar expressions") {
+                    try await brainCore.refreshFacialExpressionCatalog()
+                }
+            }
 
-            await enterDreamOnLoadIfNeeded()
+            await loadSession.measure(id: "dream_on_load", label: "Checking dream schedule") {
+                await enterDreamOnLoadIfNeeded()
+            }
             if motionGestureOptionEnabled {
-                startMotionGestureMonitoringIfAvailable()
+                await loadSession.measure(id: "motion_gesture_monitor", label: "Starting motion gestures") {
+                    startMotionGestureMonitoringIfAvailable()
+                }
+            }
+
+            let metrics = loadSession.report()
+            recordCoreLoadMetrics(metrics)
+            loadSession.logReportToConsole(outcome: "complete", brainID: brain.id)
+            appendEventLog(kind: .state, title: "core load metrics", body: metrics.eventLogBody)
+            refreshUserSendAvailability()
+            if !isBrainUnavailableForConversation {
+                statusText = "Ready"
             }
         } catch {
+            let metrics = loadSession.report()
+            recordCoreLoadMetrics(metrics)
+            loadSession.logReportToConsole(outcome: "failed", brainID: brain.id, error: error.localizedDescription)
+            appendEventLog(kind: .error, title: "core load metrics", body: metrics.eventLogBody)
             isBrainConnected = false
             stopBoredomSense()
+            stopAutonomySense()
             stopMotionGestureMonitoring()
             statusText = "Core unavailable"
             appendEventLog(kind: .error, title: "core connect failed", body: error.localizedDescription)
@@ -414,16 +485,18 @@ extension AffectiveViewModel {
             return
         }
         let context = currentStimulusContext(kind: interrupt ? "user_interrupt_message" : "user_message")
+        let interruptedAction = interrupt ? currentHostPipelineAction?.stimulusDescription : nil
         clearSocialTurnResponseWindow()
         chatEntries.append(.init(kind: .user, title: "Other", body: trimmed, metadata: ["source": "typed text"]))
         recordConversationTurn(role: "other", text: trimmed, source: "experience", metadata: ["source": "typed text"])
         appendEventLog(kind: .sent, title: "text", body: trimmed)
         messageText = ""
-        if interrupt, canInterruptUserMessage {
-            interruptWithUserMessage(trimmed, stimulusContext: context)
-        } else {
-            enqueueHostPipelineAction(.typedText(text: trimmed, stimulusContext: context))
-        }
+        dispatchUserMessageImmediately(
+            text: trimmed,
+            stimulusContext: context,
+            sendInterruptFirst: interrupt,
+            interruptedAction: interruptedAction
+        )
     }
 
     func markInputActivity() {
@@ -469,14 +542,129 @@ extension AffectiveViewModel {
                 "caption": .string(caption),
                 "source": .string("user_upload"),
             ]
-            enqueueHostPipelineAction(.imageText(
-                prompt: prompt,
-                attachment: attachment,
+            dispatchUserMessageImmediately(
+                text: prompt,
+                attachments: [attachment],
                 mediaPayload: mediaPayload,
                 stimulusContext: context
-            ))
+            )
         } catch {
             reportImageSendFailure(error.localizedDescription)
+        }
+    }
+
+    func dispatchUserMessageImmediately(
+        text: String,
+        source: LanguageInputSource = .typedText,
+        attachments: [[String: JSONValue]] = [],
+        mediaPayload: String? = nil,
+        stimulusContext: StimulusContext,
+        speakResponse: Bool = true,
+        sendInterruptFirst: Bool = false,
+        interruptedAction: String? = nil
+    ) {
+        prepareForImmediateUserMessage()
+        let generation = conversationDispatchGeneration
+        immediateUserMessageInFlight = true
+        reserveChatResponseSlot()
+        statusText = attachments.isEmpty ? "Sending to core" : "Sending picture to core"
+        Task {
+            await performImmediateUserMessageDispatch(
+                generation: generation,
+                text: text,
+                source: source,
+                attachments: attachments,
+                mediaPayload: mediaPayload,
+                stimulusContext: stimulusContext,
+                speakResponse: speakResponse,
+                sendInterruptFirst: sendInterruptFirst,
+                interruptedAction: interruptedAction
+            )
+        }
+    }
+
+    func prepareForImmediateUserMessage() {
+        if speechSpeaker.isSpeaking {
+            speechSpeaker.stop()
+        }
+        if hostPipelineHold == .speechOutput {
+            setHostPipelineHold(.none)
+        }
+        if immediateUserMessageInFlight {
+            immediateUserMessageInFlight = false
+            releaseChatResponseSlot()
+        }
+        if currentHostPipelineActionIsAwaitingChatResponse {
+            currentHostPipelineActionIsAwaitingChatResponse = false
+            releaseChatResponseSlot()
+        }
+        dropQueuedConversationMessages()
+        abortSupersededPullSenseFulfillment()
+        conversationDispatchGeneration += 1
+        refreshUserSendAvailability()
+    }
+
+    func performImmediateUserMessageDispatch(
+        generation: Int,
+        text: String,
+        source: LanguageInputSource,
+        attachments: [[String: JSONValue]],
+        mediaPayload: String?,
+        stimulusContext: StimulusContext,
+        speakResponse: Bool,
+        sendInterruptFirst: Bool = false,
+        interruptedAction: String? = nil
+    ) async {
+        defer {
+            if generation == conversationDispatchGeneration {
+                if immediateUserMessageInFlight {
+                    immediateUserMessageInFlight = false
+                }
+                releaseChatResponseSlot()
+            }
+        }
+        guard generation == conversationDispatchGeneration else { return }
+        if sendInterruptFirst {
+            await sendInterruptToBrain(
+                userText: text,
+                reason: "user_requested_interrupt",
+                interruptedAction: interruptedAction,
+                canceledQueuedActionCount: 0
+            )
+            guard generation == conversationDispatchGeneration else { return }
+        }
+        if let mediaPayload {
+            await sendMediaUploadedEvent(payload: mediaPayload)
+            guard generation == conversationDispatchGeneration else { return }
+        }
+        guard generation == conversationDispatchGeneration else { return }
+        await sendTextToBrain(
+            text,
+            source: source,
+            attachments: attachments,
+            stimulusContext: stimulusContext,
+            speakResponse: speakResponse,
+            deliveryGeneration: generation
+        )
+    }
+
+    func dropQueuedConversationMessages() {
+        var removedChatResponses = 0
+        hostPipelineQueue.removeAll { action in
+            let isConversation: Bool = switch action {
+            case .typedText, .imageText:
+                true
+            default:
+                false
+            }
+            if isConversation, action.presentsChatResponse {
+                removedChatResponses += 1
+            }
+            return isConversation
+        }
+        if removedChatResponses > 0 {
+            pendingChatResponseCount = max(0, pendingChatResponseCount - removedChatResponses)
+            refreshAwaitingChatResponse()
         }
     }
 
@@ -501,6 +689,65 @@ extension AffectiveViewModel {
             )
         } catch {
             appendEventLog(kind: .error, title: "media event", body: error.localizedDescription)
+        }
+    }
+
+    func reactToBrainUtterance(entryID: UUID, emoji: String) async {
+        guard let normalized = EmojiReactionValidation.normalizedReaction(from: emoji) else { return }
+        guard let index = chatEntries.firstIndex(where: { $0.id == entryID }) else { return }
+        let entry = chatEntries[index]
+        guard entry.kind == .brain || entry.kind == .emote else { return }
+        let utteranceText = entry.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !utteranceText.isEmpty else { return }
+
+        chatEntries[index] = LogEntry(
+            kind: entry.kind,
+            title: entry.title,
+            body: entry.body,
+            metadata: entry.metadata,
+            userReaction: normalized,
+            id: entry.id,
+            createdAt: entry.createdAt
+        )
+
+        reserveChatResponseSlot()
+        defer { releaseChatResponseSlot() }
+
+        do {
+            if !isBrainConnected {
+                await connectToBrain()
+            }
+            guard isBrainConnected else {
+                throw BrainCoreError.unavailable("The core is not connected.")
+            }
+            let response = try await brainCore.sendEmojiReaction(
+                emoji: normalized,
+                utteranceText: utteranceText,
+                speakerLabel: "You",
+                utteranceEventID: entry.metadata["event_id"]
+            )
+            guard !response.events.isEmpty else {
+                appendEventLog(
+                    kind: .error,
+                    title: "emoji_reaction",
+                    body: "Core returned no event batch for the emoji_reaction dispatch.",
+                    metadata: response.metadata
+                )
+                return
+            }
+            _ = await applyCoreEvents(
+                response.events,
+                mirrorChatMessages: true,
+                speak: response.shouldSpeak
+            )
+            appendEventLog(
+                kind: .sent,
+                title: "emoji_reaction",
+                body: "\(normalized) on \(utteranceText)",
+                metadata: response.metadata
+            )
+        } catch {
+            appendEventLog(kind: .error, title: "emoji_reaction failed", body: error.localizedDescription)
         }
     }
 
@@ -533,12 +780,14 @@ extension AffectiveViewModel {
         guard normalizedMode != autonomyMode else { return }
         let previousMode = autonomyMode
         autonomyMode = normalizedMode
+        setRuntimeOptionValue("autonomy_mode", value: normalizedMode, commit: true)
         appendEventLog(kind: .sent, title: "option autonomy_mode", body: normalizedMode)
 
         do {
             try saveAutonomyMode()
             statusText = normalizedMode == "off" ? "Autonomy disabled" : "Autonomy \(normalizedMode)"
             refreshBoredomSense()
+            refreshAutonomySense()
         } catch {
             autonomyMode = previousMode
             statusText = "Could not save autonomy"
@@ -562,7 +811,7 @@ extension AffectiveViewModel {
             if hostPipelineHold == .speechOutput {
                 setHostPipelineHold(.none)
             }
-            canSend = hostPipelineQueue.isEmpty
+            refreshUserSendAvailability()
             statusText = "Brain voice disabled"
         }
     }
@@ -598,6 +847,11 @@ extension AffectiveViewModel {
                 }
             }
             optionGroups = committedGroups
+            if let mode = runtimeOptionStringValue(for: "autonomy_mode") {
+                autonomyMode = Self.normalizeAutonomyMode(mode)
+                refreshBoredomSense()
+                refreshAutonomySense()
+            }
             statusText = "Preferences saved"
         } catch {
             statusText = "Could not save preferences"
@@ -630,11 +884,15 @@ extension AffectiveViewModel {
         stimulusContext: StimulusContext? = nil,
         mirrorChatMessages: Bool = true,
         speakResponse: Bool = true,
-        handleHostRequests: Bool = true
+        handleHostRequests: Bool = true,
+        deliveryGeneration: Int? = nil
     ) async {
         guard !isBrainUnavailableForConversation else {
             statusText = brainModeStatusText
             appendEventLog(kind: .state, title: "conversation blocked", body: brainModeStatusText, metadata: ["brain_mode": brainMode])
+            return
+        }
+        guard deliveryGeneration == nil || deliveryGeneration == conversationDispatchGeneration else {
             return
         }
         do {
@@ -647,6 +905,14 @@ extension AffectiveViewModel {
                 attachments: attachments,
                 stimulusContext: stimulusContext
             )
+            guard deliveryGeneration == nil || deliveryGeneration == conversationDispatchGeneration else {
+                appendEventLog(
+                    kind: .state,
+                    title: "stale user message",
+                    body: "Skipped stale brain response after a newer user message."
+                )
+                return
+            }
             guard !response.events.isEmpty else {
                 canSend = true
                 statusText = "Core protocol error"
@@ -663,7 +929,7 @@ extension AffectiveViewModel {
             let eventResult = await applyCoreEvents(
                 response.events,
                 mirrorChatMessages: mirrorChatMessages,
-                speak: speakResponse,
+                speak: speakResponse && response.shouldSpeak,
                 handleHostRequests: handleHostRequests
             )
             let resolvedText = eventResult.resolvedBrainText?
@@ -733,7 +999,8 @@ extension AffectiveViewModel {
                 }
             }
             applyAutonomyControlSnapshot(response.readModels)
-            appendEventLog(kind: .state, title: response.toolName, body: readModelsSnapshotSummary(response.readModels), metadata: response.metadata)
+            innerStateSummary = readModelsSnapshotSummary(response.readModels)
+            appendEventLog(kind: .state, title: response.toolName, body: innerStateSummary, metadata: response.metadata)
         } catch {
             appendEventLog(kind: .error, title: "read_models_snapshot failed", body: error.localizedDescription)
         }
@@ -916,15 +1183,43 @@ extension AffectiveViewModel {
         refreshAwaitingChatResponse()
     }
 
-    func fulfillCurrentChatResponseIfNeeded() {
-        guard currentHostPipelineActionIsAwaitingChatResponse else { return }
-        currentHostPipelineActionIsAwaitingChatResponse = false
+    func reserveChatResponseSlot() {
+        noteQueuedChatResponses(1)
+    }
+
+    func releaseChatResponseSlot() {
         pendingChatResponseCount = max(0, pendingChatResponseCount - 1)
         refreshAwaitingChatResponse()
     }
 
+    func fulfillCurrentChatResponseIfNeeded() {
+        guard currentHostPipelineActionIsAwaitingChatResponse else { return }
+        currentHostPipelineActionIsAwaitingChatResponse = false
+        releaseChatResponseSlot()
+    }
+
     func refreshAwaitingChatResponse() {
         isAwaitingChatResponse = pendingChatResponseCount > 0
+    }
+
+    func refreshUserSendAvailability() {
+        if isBrainUnavailableForConversation {
+            canSend = false
+        } else if speechSpeaker.isSpeaking || hostPipelineHold == .speechOutput {
+            canSend = false
+        } else {
+            canSend = true
+        }
+    }
+
+    func waitForHostPipelineIdle(timeout: Duration = .seconds(10)) async {
+        let deadline = ContinuousClock.now + timeout
+        while isHostPipelineRunning || !hostPipelineQueue.isEmpty {
+            if ContinuousClock.now >= deadline {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
     }
 
     var canInterruptUserMessage: Bool {
@@ -1130,6 +1425,14 @@ extension AffectiveViewModel {
         }
     }
 
+    func refreshAutonomySense() {
+        if autonomySenseIsAwake {
+            startAutonomySenseIfNeeded()
+        } else {
+            stopAutonomySense()
+        }
+    }
+
     func startBoredomSenseIfNeeded() {
         guard boredomSenseTask == nil else { return }
         recordHostStimulus()
@@ -1161,6 +1464,81 @@ extension AffectiveViewModel {
         boredomSenseGeneration += 1
         boredomSenseTask?.cancel()
         boredomSenseTask = nil
+    }
+
+    var autonomySenseIsAwake: Bool {
+        isBrainConnected && autonomyIsEnabled
+    }
+
+    func autonomyTickIntervalSeconds() -> Int {
+        max(runtimeOptionIntValue(for: "autonomy_interval_seconds") ?? 300, 30)
+    }
+
+    func startAutonomySenseIfNeeded() {
+        guard autonomySenseTask == nil else { return }
+        autonomySenseGeneration += 1
+        let generation = autonomySenseGeneration
+        autonomySenseTask = Task { [weak self] in
+            defer {
+                if self?.autonomySenseGeneration == generation {
+                    self?.autonomySenseTask = nil
+                }
+            }
+            while !Task.isCancelled {
+                guard let waitSeconds = self?.autonomyTickIntervalSeconds() else { return }
+                do {
+                    try await Task.sleep(for: .seconds(waitSeconds))
+                } catch {
+                    return
+                }
+                guard let self else { return }
+                guard self.autonomySenseGeneration == generation else { return }
+                guard self.autonomySenseIsAwake else { return }
+                await self.refreshReadModelsSnapshot()
+                guard self.canRunAutonomyTick() else { continue }
+                await self.runAutonomyTick()
+            }
+        }
+    }
+
+    func stopAutonomySense() {
+        autonomySenseGeneration += 1
+        autonomySenseTask?.cancel()
+        autonomySenseTask = nil
+    }
+
+    func canRunAutonomyTick() -> Bool {
+        guard autonomySenseIsAwake else { return false }
+        guard !isHostPipelineRunning, hostPipelineHold == .none, hostPipelineQueue.isEmpty else { return false }
+        guard !isAwaitingChatResponse, !speechSpeaker.isSpeaking, !isPoking else { return false }
+        return true
+    }
+
+    func runAutonomyTick() async {
+        do {
+            if !isBrainConnected {
+                await connectToBrain()
+            }
+            let response = try await brainCore.autonomyTick()
+            let eventResult = await applyCoreEvents(
+                response.events,
+                mirrorChatMessages: false,
+                speak: response.shouldSpeak,
+                handleHostRequests: true
+            )
+            await refreshReadModelsSnapshot()
+            appendEventLog(
+                kind: .result,
+                title: response.toolName,
+                body: response.text,
+                metadata: response.metadata
+            )
+            if eventResult.didRequestSpeech {
+                await speakBrainResponseAndWait(response.text)
+            }
+        } catch {
+            appendEventLog(kind: .error, title: "autonomy_tick failed", body: error.localizedDescription)
+        }
     }
 
     func canEmitBoredomStimulus(waitSeconds: Int, now: Date = Date()) -> Bool {
@@ -1220,6 +1598,18 @@ extension AffectiveViewModel {
         if case .number(let value) = controlModel["max_capacity"] {
             autonomyMaxCapacity = max(0.01, value)
         }
+        if case .number(let value) = controlModel["replenish_points_per_minute"] {
+            autonomyReplenishPointsPerMinute = max(0, value)
+        } else {
+            autonomyReplenishPointsPerMinute = 0
+        }
+        if case .number(let value) = controlModel["last_capacity_replenish_at"] {
+            autonomyLastCapacityReplenishAt = Date(timeIntervalSince1970: value)
+        } else if autonomyIsEnabled, effectiveAutonomyReplenishPointsPerMinute > 0 {
+            autonomyLastCapacityReplenishAt = Date()
+        } else {
+            autonomyLastCapacityReplenishAt = nil
+        }
     }
 
 }
@@ -1229,11 +1619,13 @@ private extension HostPipelineAction {
         switch self {
         case .typedText, .imageText:
             return true
-        case .interrupt:
+        case .interrupt, .pullSenseRequest:
             return false
         case .coreTouch, .pokeSequence, .pushedMotionGesture, .boredomStimulus:
             return false
         case .refreshBrainState:
+            return false
+        case .collectMailbox, .mailboxMarkRead:
             return false
         }
     }
@@ -1246,6 +1638,8 @@ private extension HostPipelineAction {
             return "experience:user_message"
         case .imageText:
             return "image_text"
+        case .pullSenseRequest(let event, _):
+            return "pull_sense:\(event.sense ?? event.senseID ?? "unknown")"
         case .coreTouch(let name, _):
             return name
         case .pokeSequence:
@@ -1256,6 +1650,10 @@ private extension HostPipelineAction {
             return "experience:host_boredom"
         case .refreshBrainState:
             return "refresh_brain_state"
+        case .collectMailbox:
+            return "collect_mailbox"
+        case .mailboxMarkRead:
+            return "mailbox_mark_read"
         }
     }
 }

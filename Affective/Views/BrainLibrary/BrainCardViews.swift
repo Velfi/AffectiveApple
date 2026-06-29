@@ -381,7 +381,14 @@ struct BrainAvatar: View {
                 placeholderAvatar
             }
             #else
-            placeholderAvatar
+            if let image = AvatarAssetImageLoader.loadImage(from: avatarURL, layerID: brain.id) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .id(brain.avatarRenderToken)
+            } else {
+                placeholderAvatar
+            }
             #endif
         } else {
             placeholderAvatar

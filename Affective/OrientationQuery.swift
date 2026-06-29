@@ -22,10 +22,10 @@ struct OrientationPermissionPrompt: Identifiable, Equatable {
 }
 
 #if os(iOS) && canImport(CoreMotion) && !targetEnvironment(simulator)
-final class CoreMotionSensorHub: @unchecked Sendable {
+nonisolated final class CoreMotionSensorHub: @unchecked Sendable {
     nonisolated static let shared = CoreMotionSensorHub()
 
-    private let manager = CMMotionManager()
+    nonisolated(unsafe) private let manager = CMMotionManager()
 
     private init() {}
 

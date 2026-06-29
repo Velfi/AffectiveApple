@@ -8,12 +8,13 @@ enum LlmTesterRunner {
         return try JSONDecoder().decode(LlmTesterManifest.self, from: data)
     }
 
-    static func makeClient(preference: HostTextProviderPreference) -> HostLLMCompletionClient {
-        HostLLMCompletionClient(
+    static func makeClient(preference: HostTextProviderPreference) throws -> HostLLMCompletionClient {
+        let store = KeychainCredentialStore()
+        let keys = ProviderCredentialKey.credentialKeys(for: preference)
+        let credentials = ProviderCredentialKey.resolvedCredentials(using: store, keys: keys)
+        return HostLLMCompletionClient(
             providerRouter: HostProviderRouter(
-                credentialProvider: {
-                    ProviderCredentialKey.resolvedCredentials(using: KeychainCredentialStore())
-                }
+                credentialProvider: { credentials }
             ),
             textProviderPreference: preference
         )
@@ -62,16 +63,35 @@ enum LlmTesterRunner {
                 )
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 let validation = validateJSON(text: completion.text, expectsJSON: responseFormat == .jsonObject)
+                let semantic = ScenarioGrader.grade(scenarioId: scenario.id, rawText: completion.text)
+                let status: String
+                if responseFormat != .jsonObject {
+                    status = "ok"
+                } else if !validation.jsonValid {
+                    status = "invalid_json"
+                } else if !semantic.passed {
+                    status = "semantic_fail"
+                } else {
+                    status = "ok"
+                }
+                let semanticMessage: String? = switch semantic {
+                case .fail(let message):
+                    message
+                default:
+                    nil
+                }
                 results.append(
                     LlmTesterScenarioResult(
                         scenario: scenario,
                         combinedPrompt: combinedPrompt,
                         provider: completion.source,
                         durationMs: durationMs,
-                        status: validation.jsonValid || responseFormat == .text ? "ok" : "invalid_json",
+                        status: status,
                         rawText: completion.text,
                         prettyJSON: validation.prettyJSON,
                         jsonValid: validation.jsonValid,
+                        semanticPassed: semantic.passed ? true : (semantic == .notApplicable ? nil : false),
+                        semanticMessage: semanticMessage,
                         errorMessage: validation.errorMessage
                     )
                 )

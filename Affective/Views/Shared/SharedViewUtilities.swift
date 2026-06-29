@@ -131,6 +131,52 @@ struct CompactStatusPill: View {
     }
 }
 
+struct AutonomyCapacityRing: View {
+    let fraction: Double
+    var size: CGFloat = 28
+    var lineWidth: CGFloat = 3
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(AppTheme.separator.opacity(0.9), lineWidth: lineWidth)
+            Circle()
+                .trim(from: 0, to: min(max(fraction, 0), 1))
+                .stroke(
+                    AppTheme.accent,
+                    style: StrokeStyle(lineWidth: lineWidth, lineCap: .round)
+                )
+                .rotationEffect(.degrees(-90))
+                .animation(.linear(duration: 0.25), value: fraction)
+            Text("\(Int((fraction * 100).rounded()))")
+                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(AppTheme.secondaryText)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(width: size, height: size)
+        .accessibilityElement(children: .ignore)
+    }
+}
+
+struct AnimatedAutonomyCapacityRing: View {
+    @ObservedObject var model: AffectiveViewModel
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !shouldAnimate)) { context in
+            let fraction = model.autonomyCapacityFraction(at: context.date)
+            AutonomyCapacityRing(fraction: fraction)
+                .accessibilityLabel("Autonomy control capacity \(model.autonomyCapacityPercentText(at: context.date))")
+        }
+    }
+
+    private var shouldAnimate: Bool {
+        model.autonomyIsEnabled
+            && model.effectiveAutonomyReplenishPointsPerMinute > 0
+            && model.autonomyCapacityFraction(at: Date()) < 0.999
+    }
+}
+
 struct CompactIconStatusPill: View {
     let text: String
     let systemImage: String
@@ -228,6 +274,64 @@ struct StatusNoteCard: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(tint.opacity(0.18))
         )
+    }
+}
+
+struct CoreConnectingScreen: View {
+    @ObservedObject var model: AffectiveViewModel
+
+    var body: some View {
+        ZStack {
+            AppTheme.background
+                .ignoresSafeArea()
+
+            VStack(spacing: 28) {
+                BrainAvatar(brain: model.brain, sizing: .fixedHeight(128))
+                    .frame(maxWidth: 240)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(AppTheme.separator)
+                    )
+
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .controlSize(.large)
+
+                    Text(model.coreLoadProgressLabel.isEmpty ? model.statusText : model.coreLoadProgressLabel)
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(AppTheme.primaryText)
+                        .multilineTextAlignment(.center)
+
+                    if !model.coreLoadProgressDetail.isEmpty {
+                        Text(model.coreLoadProgressDetail)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(AppTheme.secondaryText)
+                            .multilineTextAlignment(.center)
+                    }
+
+                    Text("\(HeaderStrip.hostName) - connecting")
+                        .font(.callout)
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+            }
+            .padding(32)
+            .frame(maxWidth: 420)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(coreConnectingAccessibilityLabel)
+    }
+
+    private var coreConnectingAccessibilityLabel: String {
+        var parts = ["Connecting to Zig core"]
+        let label = model.coreLoadProgressLabel.isEmpty ? model.statusText : model.coreLoadProgressLabel
+        if !label.isEmpty {
+            parts.append(label)
+        }
+        if !model.coreLoadProgressDetail.isEmpty {
+            parts.append(model.coreLoadProgressDetail)
+        }
+        return parts.joined(separator: ", ")
     }
 }
 
@@ -339,6 +443,8 @@ extension LogKind {
         switch self {
         case .user, .sent: AppTheme.accent
         case .brain, .result: .blue
+        case .process: .purple
+        case .emote: AppTheme.secondaryText.opacity(0.55)
         case .state: AppTheme.primaryText
         case .error: .red
         }
@@ -347,6 +453,7 @@ extension LogKind {
     var badgeForeground: Color {
         switch self {
         case .state: AppTheme.inverseText
+        case .emote: AppTheme.primaryText
         default: AppTheme.textOnAccent
         }
     }
@@ -355,6 +462,8 @@ extension LogKind {
         switch self {
         case .user, .sent: AppTheme.logUserBackground
         case .brain, .result: AppTheme.logBrainBackground
+        case .process: AppTheme.logBrainBackground.opacity(0.82)
+        case .emote: AppTheme.logStateBackground.opacity(0.72)
         case .state: AppTheme.logStateBackground
         case .error: AppTheme.logErrorBackground
         }
@@ -677,5 +786,61 @@ extension Array where Element == BrainSeedCard {
         map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: "\n")
+    }
+}
+
+@MainActor
+enum LocalFileImageCache {
+    #if canImport(UIKit)
+    typealias PlatformImage = UIImage
+    #elseif canImport(AppKit)
+    typealias PlatformImage = NSImage
+    #endif
+
+    private static var cache: [URL: PlatformImage] = [:]
+
+    static func image(at url: URL) -> PlatformImage? {
+        if let cached = cache[url] {
+            return cached
+        }
+        #if canImport(UIKit)
+        guard let image = UIImage(contentsOfFile: url.path) else { return nil }
+        #elseif canImport(AppKit)
+        guard let image = NSImage(contentsOf: url) else { return nil }
+        #else
+        return nil
+        #endif
+        cache[url] = image
+        return image
+    }
+}
+
+struct LocalCachedFileImageView: View {
+    let url: URL
+    var missingContent: AnyView?
+
+    @State private var loadedImage: LocalFileImageCache.PlatformImage?
+
+    var body: some View {
+        Group {
+            if let loadedImage {
+                #if canImport(UIKit)
+                Image(uiImage: loadedImage)
+                    .resizable()
+                    .scaledToFill()
+                #elseif canImport(AppKit)
+                Image(nsImage: loadedImage)
+                    .resizable()
+                    .scaledToFill()
+                #endif
+            } else if let missingContent {
+                missingContent
+            } else {
+                ProgressView()
+            }
+        }
+        .task(id: url) {
+            loadedImage = LocalFileImageCache.image(at: url)
+        }
     }
 }

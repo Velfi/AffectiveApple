@@ -20,10 +20,11 @@ import PhotosUI
 
 struct WorkspaceSidebar: View {
     @ObservedObject var model: AffectiveViewModel
+    var closeBrain: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            LogHeader(model: model)
+            LogHeader(model: model, closeBrain: closeBrain)
 
             Divider()
                 .overlay(AppTheme.softSeparator)
@@ -104,31 +105,68 @@ struct WorkspaceDetail: View {
         ZStack {
             AppTheme.controlBackground
 
-            switch model.selectedSection {
-            case .chat:
-                ChatWorkspace(model: model, composerFocused: composerFocused)
-            case .mailbox:
-                DreamMailboxWorkspace(model: model)
-            case .developer:
-                DeveloperWorkspace(model: model)
-            case .knowledge:
-                KnowledgeWorkspace(model: model)
-            case .stats:
-                BrainStatsWorkspace(model: model)
-            case .settings:
-                OptionsView(model: model)
-            }
+            sectionContent(model.selectedSection)
         }
+        .animation(.smooth(duration: 0.22), value: model.selectedSection)
         .onDrop(of: [.image, .fileURL, .url], isTargeted: nil) { providers in
             handleDrop(providers)
         }
     }
 
+    @ViewBuilder
+    func sectionContent(_ section: WorkspaceSection) -> some View {
+        switch section {
+        case .chat:
+            ChatWorkspace(model: model, composerFocused: composerFocused)
+        case .mailbox:
+            DreamMailboxWorkspace(model: model)
+        case .developer:
+            DeveloperWorkspace(model: model)
+        case .knowledge:
+            KnowledgeWorkspace(model: model)
+        case .stats:
+            BrainStatsWorkspace(model: model)
+        case .settings:
+            OptionsView(model: model)
+        }
+    }
+
     func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         guard let provider = providers.first else { return false }
-        let name = provider.suggestedName ?? "dropped image"
-        model.reportDroppedImage(name: name)
-        return true
+
+        if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+            provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, error in
+                guard let data, error == nil else { return }
+                Task { @MainActor in
+                    model.sendImage(
+                        data: data,
+                        suggestedName: provider.suggestedName ?? "dropped-image.png"
+                    )
+                }
+            }
+            return true
+        }
+
+        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
+                guard error == nil else { return }
+                let url: URL?
+                if let fileURL = item as? URL {
+                    url = fileURL
+                } else if let nsURL = item as? NSURL {
+                    url = nsURL as URL
+                } else {
+                    url = nil
+                }
+                guard let url, let data = try? Data(contentsOf: url) else { return }
+                Task { @MainActor in
+                    model.sendImage(data: data, suggestedName: url.lastPathComponent)
+                }
+            }
+            return true
+        }
+
+        return false
     }
 }
 
@@ -139,13 +177,16 @@ struct ChatWorkspace: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     var body: some View {
-        if horizontalSizeClass == .compact {
-            portraitBody
-        } else if verticalSizeClass == .compact {
-            landscapeBody
-        } else {
-            portraitBody
+        Group {
+            if horizontalSizeClass == .compact {
+                portraitBody
+            } else if verticalSizeClass == .compact {
+                landscapeBody
+            } else {
+                portraitBody
+            }
         }
+        .keyboardDoneToolbar()
     }
 
     var portraitBody: some View {
@@ -171,7 +212,10 @@ struct ChatWorkspace: View {
                 ChatTranscriptView(
                     entries: model.chatEntries,
                     brainRootURL: model.brain.rootURL,
-                    isResponding: model.isAwaitingChatResponse
+                    isResponding: model.isAwaitingChatResponse,
+                    onReactToBrainUtterance: { entryID, emoji in
+                        Task { await model.reactToBrainUtterance(entryID: entryID, emoji: emoji) }
+                    }
                 )
                 .frame(maxHeight: .infinity)
                 .layoutPriority(1)
@@ -182,7 +226,10 @@ struct ChatWorkspace: View {
                 ChatTranscriptView(
                     entries: model.chatEntries,
                     brainRootURL: model.brain.rootURL,
-                    isResponding: model.isAwaitingChatResponse
+                    isResponding: model.isAwaitingChatResponse,
+                    onReactToBrainUtterance: { entryID, emoji in
+                        Task { await model.reactToBrainUtterance(entryID: entryID, emoji: emoji) }
+                    }
                 )
                 .frame(maxHeight: .infinity)
                 .layoutPriority(1)
@@ -195,6 +242,7 @@ struct ChatWorkspace: View {
                     .background(AppTheme.sidebarBackground.opacity(0.45))
             }
         }
+        .animation(.smooth(duration: 0.18), value: composerFocused.wrappedValue)
     }
 
     var compactPortraitComposer: some View {
@@ -217,7 +265,10 @@ struct ChatWorkspace: View {
                 ChatTranscriptView(
                     entries: model.chatEntries,
                     brainRootURL: model.brain.rootURL,
-                    isResponding: model.isAwaitingChatResponse
+                    isResponding: model.isAwaitingChatResponse,
+                    onReactToBrainUtterance: { entryID, emoji in
+                        Task { await model.reactToBrainUtterance(entryID: entryID, emoji: emoji) }
+                    }
                 )
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -628,25 +679,7 @@ struct MailboxItemImage: View {
 
     @ViewBuilder
     func localImage(url: URL) -> some View {
-        #if canImport(UIKit)
-        if let image = UIImage(contentsOfFile: url.path) {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFill()
-        } else {
-            missingImage
-        }
-        #elseif canImport(AppKit)
-        if let image = NSImage(contentsOf: url) {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFill()
-        } else {
-            missingImage
-        }
-        #else
-        missingImage
-        #endif
+        LocalCachedFileImageView(url: url, missingContent: AnyView(missingImage))
     }
 
     var missingImage: some View {
@@ -1075,7 +1108,8 @@ struct KnowledgeWorkspace: View {
             EntriesList(
                 entries: model.filteredKnowledgeEntries,
                 emptyTitle: "Memory and knowledge activity will appear here.",
-                brainRootURL: model.brain.rootURL
+                brainRootURL: model.brain.rootURL,
+                showsCopyButton: true
             )
         }
     }
@@ -1520,6 +1554,14 @@ struct SidebarBrainPanel: View {
             }
 
             HeaderStrip(model: model)
+
+            if !model.innerStateSummary.isEmpty {
+                Text(model.innerStateSummary)
+                    .font(.caption2)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(6)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }

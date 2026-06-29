@@ -16,7 +16,6 @@ final class BrainNotificationSounds {
     private var botActionPlayer: AVAudioPlayer?
     private var speechSoundURL: URL?
     private var botActionSoundURL: URL?
-    private var audioSessionConfigured = false
     private var lastBotActionClickPlayedAt: TimeInterval = 0
     private let minimumBotActionClickInterval: TimeInterval = 0.08
 
@@ -32,18 +31,16 @@ final class BrainNotificationSounds {
     }
 
     private func activatePlaybackSessionIfNeeded() {
-        guard !audioSessionConfigured else { return }
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.ambient, options: [.mixWithOthers])
             try session.setActive(true)
-            audioSessionConfigured = true
         } catch {
             fatalError("Could not configure audio session for bundled sounds: \(error)")
         }
         #else
-        audioSessionConfigured = true
+        return
         #endif
     }
 

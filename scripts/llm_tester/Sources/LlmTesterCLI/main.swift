@@ -5,7 +5,7 @@ do {
     let options = try LlmTesterOptions.parse(Array(CommandLine.arguments.dropFirst()))
     let manifest = try LlmTesterRunner.loadManifest(at: options.manifestPath)
     let providerPreference = LlmTesterRunner.hostTextProviderPreference(for: options.provider)
-    let client = LlmTesterRunner.makeClient(preference: providerPreference)
+    let client = try LlmTesterRunner.makeClient(preference: providerPreference)
     let summary = await LlmTesterRunner.run(
         manifest: manifest,
         client: client,

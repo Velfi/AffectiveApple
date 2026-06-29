@@ -68,30 +68,34 @@ enum SettingsScope: String, CaseIterable, Identifiable {
     }
 }
 
-enum LogKind: String, CaseIterable, Identifiable {
+nonisolated enum LogKind: String, CaseIterable, Identifiable {
     case user = "user"
     case brain = "brain"
+    case emote = "emote"
     case sent = "sent"
     case result = "result"
     case state = "state"
+    case process = "process"
     case error = "error"
 
     var id: String { rawValue }
 }
 
-struct LogEntry: Identifiable, Equatable {
+nonisolated struct LogEntry: Identifiable, Equatable {
     let id: UUID
     let kind: LogKind
     let title: String
     let body: String
     let metadata: [String: String]
+    let userReaction: String?
     let createdAt: Date
 
-    init(
+    nonisolated init(
         kind: LogKind,
         title: String,
         body: String,
         metadata: [String: String] = [:],
+        userReaction: String? = nil,
         id: UUID = UUID(),
         createdAt: Date = Date()
     ) {
@@ -100,6 +104,7 @@ struct LogEntry: Identifiable, Equatable {
         self.title = title
         self.body = body
         self.metadata = metadata
+        self.userReaction = userReaction
         self.createdAt = createdAt
     }
 }
@@ -215,15 +220,47 @@ struct RuntimeOptionGroup: Identifiable, Equatable {
             .number(key: "conversation_idle_timeout_seconds", label: "Conversation idle timeout", value: "120", unit: "sec"),
             .number(key: "boredom_interval_seconds", label: "Boredom interval max", value: "600", unit: "sec"),
         ]),
-        .init(title: "Tuning", note: "Recognition, autonomy, and reasoning knobs.", isExpanded: true, options: [
+        .init(title: "Tuning", note: "Recognition and reasoning knobs.", isExpanded: true, options: [
+            .select(
+                key: AffectiveViewModel.llmQualityOptionKey,
+                label: "LLM quality",
+                value: "auto",
+                choices: [
+                    RuntimeOptionChoice(value: "frugal", label: "Frugal"),
+                    RuntimeOptionChoice(value: "auto", label: "Decide for me"),
+                    RuntimeOptionChoice(value: "best", label: "Best"),
+                ],
+                requiresRestart: true
+            ),
             .number(key: "known_threshold", label: "Known face threshold", value: "0.85"),
             .number(key: "uncertain_threshold", label: "Uncertain face threshold", value: "0.60"),
-            .number(key: "autonomy_interval_seconds", label: "Autonomy interval", value: "300", unit: "sec"),
-            .select(key: "autonomy_sleep", label: "Sleep during quiet hours", value: "off", choices: ["off", "on"]),
-            .timeRange(key: "autonomy_quiet_hours", label: "Quiet hours", value: "22:00-08:00"),
-            .number(key: "autonomy_limited_max_capacity", label: "Limited max capacity", value: "0.55"),
-            .number(key: "autonomy_full_max_capacity", label: "Full max capacity", value: "1.0"),
             .select(key: "make_up_lost_dream_time", label: "Make up for lost dream time", value: "off", choices: ["off", "on"]),
+        ]),
+        .init(title: "Autonomy", note: "Self-directed action budget, replenishment, and scheduling.", isExpanded: true, options: [
+            .select(
+                key: "autonomy_mode",
+                label: "Autonomy mode",
+                value: "off",
+                choices: [
+                    RuntimeOptionChoice(value: "off", label: "Off"),
+                    RuntimeOptionChoice(value: "limited", label: "Limited"),
+                    RuntimeOptionChoice(value: "full", label: "Full"),
+                ]
+            ),
+            .number(key: "autonomy_interval_seconds", label: "Autonomy tick interval", value: "300", unit: "sec"),
+            .select(key: "autonomy_sleep", label: "Start asleep", value: "off", choices: ["off", "on"]),
+            .timeRange(key: "autonomy_quiet_hours", label: "Quiet hours", value: "22:00-08:00"),
+            .number(key: "autonomy_limited_max_capacity", label: "Limited max capacity", value: "25", unit: "points"),
+            .number(key: "autonomy_full_max_capacity", label: "Full max capacity", value: "50", unit: "points"),
+            .number(key: "autonomy_limited_replenish_actions_per_minute", label: "Limited replenish rate", value: "2.0", unit: "points/min"),
+            .number(key: "autonomy_full_replenish_actions_per_minute", label: "Full replenish rate", value: "8.0", unit: "points/min"),
+            .number(key: "autonomy_social_engagement_boost", label: "User-turn engagement boost", value: "3", unit: "points"),
+            .number(key: "autonomy_limited_threshold_bias", label: "Limited threshold bias", value: "0.20"),
+            .number(key: "autonomy_full_threshold_bias", label: "Full threshold bias", value: "0.00"),
+            .number(key: "autonomy_social_reserve", label: "Social reserve", value: "0.12"),
+            .number(key: "autonomy_safety_reserve", label: "Safety reserve", value: "0.20"),
+            .number(key: "autonomy_opportunity_reserve", label: "Opportunity reserve", value: "0.15"),
+            .number(key: AffectiveViewModel.autonomyBudgetOptionKey, label: "Extra action budget", value: "0", unit: "points"),
         ]),
         .init(title: "Biometric Privacy", note: "Local face-template controls for this brain. Owner-managed consent is required before use.", isExpanded: true, options: [
             .select(
@@ -286,7 +323,7 @@ struct RuntimeOptionGroup: Identifiable, Equatable {
                 key: AffectiveViewModel.textProviderPreferenceOptionKey,
                 label: "Text provider",
                 value: HostTextProviderPreference.random.rawValue,
-                choices: HostTextProviderPreference.allCases.map {
+                choices: HostTextProviderPreference.selectableCases.map {
                     RuntimeOptionChoice(value: $0.rawValue, label: $0.displayName)
                 },
                 requiresRestart: true

@@ -74,15 +74,10 @@ struct WelcomeView: View {
         #endif
         .sheet(isPresented: $isCreatingBrain) {
             BrainCreationSheet { request in
-                do {
-                    let brain = try library.createBrain(request)
-                    selectedBrainID = brain.id
-                    statusText = "Created \(brain.displayName)."
-                    isCreatingBrain = false
-                } catch {
-                    statusText = "Create failed: \(error.localizedDescription)"
-                    throw error
-                }
+                let brain = try library.createBrain(request)
+                selectedBrainID = brain.id
+                statusText = "Created \(brain.displayName)."
+                isCreatingBrain = false
             }
         }
         .sheet(item: $brainBeingRenamed) { brain in
@@ -607,9 +602,9 @@ struct WelcomeView: View {
         if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.removeItem(at: destination)
         }
-        let core = BrainCore(brain: brain)
+        let core = BrainCore(brain: brain, tracksLiveFileSession: false)
         do {
-            _ = try await BrainArchiveOperationGate.shared.run {
+            _ = try await BrainFileAccessGate.runExclusive(brainID: brain.id) {
                 try await core.exportBrain(to: destination)
             }
             await core.disconnect()

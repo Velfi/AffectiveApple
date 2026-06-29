@@ -184,8 +184,7 @@ struct InlineAutonomyControls: View {
             boredomIntervalLabel
 
             if model.autonomyIsEnabled {
-                CompactStatusPill(text: model.autonomyCapacityPercentText)
-                    .accessibilityLabel("Autonomy control capacity \(model.autonomyCapacityPercentText)")
+                AnimatedAutonomyCapacityRing(model: model)
             }
         }
     }
@@ -198,8 +197,7 @@ struct InlineAutonomyControls: View {
             Spacer(minLength: 4)
 
             if model.autonomyIsEnabled {
-                CompactStatusPill(text: model.autonomyCapacityPercentText)
-                    .accessibilityLabel("Autonomy control capacity \(model.autonomyCapacityPercentText)")
+                AnimatedAutonomyCapacityRing(model: model)
             }
         }
     }
@@ -209,8 +207,7 @@ struct InlineAutonomyControls: View {
             AutonomyToggleButton(model: model)
 
             if model.autonomyIsEnabled {
-                CompactStatusPill(text: model.autonomyCapacityPercentText)
-                    .accessibilityLabel("Autonomy control capacity \(model.autonomyCapacityPercentText)")
+                AnimatedAutonomyCapacityRing(model: model)
             }
 
             Spacer(minLength: 0)
@@ -402,6 +399,6 @@ struct WakeButton: View {
         .buttonStyle(.plain)
         .help("Tap to wake Affective")
         .accessibilityLabel("Tap to wake Affective")
-        .opacity(!model.canSend ? 0.62 : 1)
+        .opacity(model.isBrainUnavailableForConversation ? 0.62 : 1)
     }
 }

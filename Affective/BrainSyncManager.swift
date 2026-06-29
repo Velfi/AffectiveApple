@@ -297,6 +297,12 @@ final class BrainSyncManager: ObservableObject {
     }
 
     private func runSync(brain: BrainDescriptor) async {
+        await BrainFileAccessGate.runExclusive(brainID: brain.id) {
+            await runSyncBody(brain: brain)
+        }
+    }
+
+    private func runSyncBody(brain: BrainDescriptor) async {
         setState(.checking, for: brain.id)
         do {
             let includeBiometricData = BiometricDataPolicy.load(for: brain).shouldIncludeInExport
@@ -345,6 +351,12 @@ final class BrainSyncManager: ObservableObject {
     }
 
     private func uploadLocalWinner(brain: BrainDescriptor) async {
+        await BrainFileAccessGate.runExclusive(brainID: brain.id) {
+            await uploadLocalWinnerBody(brain: brain)
+        }
+    }
+
+    private func uploadLocalWinnerBody(brain: BrainDescriptor) async {
         setState(.uploading, for: brain.id)
         do {
             let cloudManifest = try await store.loadManifest(brainID: brain.id)
@@ -412,33 +424,26 @@ final class BrainSyncManager: ObservableObject {
         let archiveURL = scratch.appendingPathComponent(BrainCloudArchive.archiveFileName(for: brain.id))
         try fileManager.createDirectory(at: scratch, withIntermediateDirectories: true)
 
-        let exportBrain: BrainDescriptor
-        if includeBiometricData {
-            exportBrain = brain
-        } else {
-            let scrubbedRoot = scratch.appendingPathComponent("scrubbed", isDirectory: true)
-            try BrainLibrary.copyBrain(
-                from: brain.rootURL,
-                to: scrubbedRoot,
-                includeBiometricData: false,
-                fileManager: fileManager
-            )
-            exportBrain = BrainDescriptor(
-                id: brain.id,
-                displayName: brain.displayName,
-                rootURL: scrubbedRoot,
-                avatarURL: nil,
-                avatarManifest: nil,
-                modifiedAt: brain.modifiedAt,
-                isRecent: brain.isRecent
-            )
-        }
+        let exportRoot = scratch.appendingPathComponent("export-root", isDirectory: true)
+        try BrainLibrary.copyBrain(
+            from: brain.rootURL,
+            to: exportRoot,
+            includeBiometricData: includeBiometricData,
+            fileManager: fileManager
+        )
+        let exportBrain = BrainDescriptor(
+            id: brain.id,
+            displayName: brain.displayName,
+            rootURL: exportRoot,
+            avatarURL: nil,
+            avatarManifest: nil,
+            modifiedAt: brain.modifiedAt,
+            isRecent: brain.isRecent
+        )
 
-        let core = BrainCore(brain: exportBrain)
+        let core = BrainCore(brain: exportBrain, tracksLiveFileSession: false)
         do {
-            _ = try await BrainArchiveOperationGate.shared.run {
-                try await core.exportBrain(to: archiveURL)
-            }
+            _ = try await core.exportBrain(to: archiveURL)
             await core.disconnect()
         } catch {
             await core.disconnect()

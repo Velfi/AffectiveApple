@@ -181,6 +181,9 @@ struct ComposerPanel: View {
         guard canSubmit else { return }
         model.sendText()
         composerFocused.wrappedValue = false
+        #if canImport(UIKit)
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        #endif
     }
 
     func submitInterruptMessage() {
@@ -328,7 +331,7 @@ struct PokeButton: View {
             .frame(width: 44, height: 44)
             .contentShape(Circle())
             .gesture(pokeGesture)
-            .opacity(!model.canSend && !model.isPoking ? 0.56 : 1)
+            .opacity(model.isBrainUnavailableForConversation && !model.isPoking ? 0.56 : 1)
             .animation(.smooth(duration: 0.18), value: model.isPoking)
             .accessibilityAddTraits(.isButton)
             .accessibilityLabel(model.isPoking ? "Release poke" : "Poke Affective")

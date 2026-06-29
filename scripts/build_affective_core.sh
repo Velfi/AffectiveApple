@@ -1,7 +1,17 @@
 set -eu
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+AFFECTIVE_APP_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 AFFECTIVE_CORE_ROOT="${AFFECTIVE_CORE_ROOT:-/Users/zelda/Documents/AffectiveCore}"
 ZIG="${ZIG:-zig}"
+
+if [ -z "${DERIVED_FILE_DIR:-}" ]; then
+    DERIVED_FILE_DIR="${AFFECTIVE_APP_ROOT}/.derivedData/AffectiveCore-manual"
+    echo "note: building outside Xcode; output goes to ${DERIVED_FILE_DIR}" >&2
+fi
+PLATFORM_NAME="${PLATFORM_NAME:-iphonesimulator}"
+ARCHS="${ARCHS:-arm64}"
+
 OUTPUT_ROOT="${DERIVED_FILE_DIR}/AffectiveCore/${PLATFORM_NAME}"
 HEADER_ROOT="${DERIVED_FILE_DIR}/AffectiveCore/include"
 STAGE_ROOT="${DERIVED_FILE_DIR}/AffectiveCore/stage/${PLATFORM_NAME}"

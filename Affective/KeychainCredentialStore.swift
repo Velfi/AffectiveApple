@@ -91,8 +91,11 @@ nonisolated enum ProviderCredentialKey: String, CaseIterable {
         return credentials
     }
 
-    static func resolvedCredentials(using store: KeychainCredentialStore) -> [ProviderCredentialKey: String] {
-        var credentials = allCases.reduce(into: [ProviderCredentialKey: String]()) { values, key in
+    static func resolvedCredentials(
+        using store: KeychainCredentialStore,
+        keys: [ProviderCredentialKey] = ProviderCredentialKey.allCases
+    ) -> [ProviderCredentialKey: String] {
+        var credentials = keys.reduce(into: [ProviderCredentialKey: String]()) { values, key in
             guard
                 let value = try? store.credential(for: key)?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -102,10 +105,29 @@ nonisolated enum ProviderCredentialKey: String, CaseIterable {
             }
             values[key] = value
         }
-        for (key, value) in environmentCredentialValues() where credentials[key] == nil {
-            credentials[key] = value
+        for key in keys {
+            if credentials[key] == nil, let value = environmentCredentialValues()[key] {
+                credentials[key] = value
+            }
         }
         return credentials
+    }
+
+    static func credentialKeys(for preference: HostTextProviderPreference) -> [ProviderCredentialKey] {
+        switch preference {
+        case .openAI:
+            return [.openAI]
+        case .anthropic:
+            return [.anthropic]
+        case .google:
+            return [.google]
+        case .deepseek:
+            return [.deepseek]
+        case .local:
+            return []
+        case .random:
+            return allCases
+        }
     }
 }
 
@@ -243,6 +265,19 @@ nonisolated enum HostTextProviderPreference: String, CaseIterable, Equatable {
             return .deepseek
         }
     }
+
+    static var selectableCases: [HostTextProviderPreference] {
+        allCases.filter { preference in
+            preference != .local || AppleFoundationModelsTextClient.isFeatureEnabled
+        }
+    }
+
+    func resolvedForHostRouting() -> HostTextProviderPreference {
+        if self == .local && !AppleFoundationModelsTextClient.isFeatureEnabled {
+            return .random
+        }
+        return self
+    }
 }
 
 nonisolated enum HostProviderRoutingError: Error, CustomStringConvertible {
@@ -358,6 +393,11 @@ nonisolated struct HostLLMCompletionClient {
         }
         routes.append(contentsOf: try providerRouter.configuredProviders().map { .credential($0) })
         return routes
+    }
+
+    /// First route `complete(_:)` will try; used to pick MainActor vs background blocking for embedded host callbacks.
+    func primaryRoute() throws -> HostLLMCompletionProvider? {
+        try orderedRoutes().first
     }
 
     private func orderedRoutes() throws -> [HostLLMCompletionProvider] {
@@ -511,7 +551,10 @@ nonisolated struct HostLLMCompletionClient {
                 ],
             ]
             if completionRequest.responseFormat == .jsonObject {
-                body["response_format"] = ["type": "json_object"]
+                body["response_format"] = try openAIJSONResponseFormat(
+                    name: "text_completion",
+                    schema: completionRequest.jsonSchema
+                )
             }
             var request = URLRequest(url: URL(string: "https://api.deepseek.com/v1/chat/completions")!)
             request.httpMethod = "POST"

@@ -14,7 +14,7 @@ enum AppForegroundMonitor {
         NSApplication.shared.isActive
     }
 
-    static func installMacActiveStateHandler(_ handler: @escaping (Bool) -> Void) -> [NSObject] {
+    static func installMacActiveStateHandler(_ handler: @escaping (Bool) -> Void) -> [any NSObjectProtocol] {
         let activeObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification,
             object: nil,
@@ -29,7 +29,8 @@ enum AppForegroundMonitor {
         ) { _ in
             handler(false)
         }
-        return [activeObserver, inactiveObserver]
+        let observers: [any NSObjectProtocol] = [activeObserver, inactiveObserver]
+        return observers
     }
 
     static func isForeground(scenePhaseActive: Bool) -> Bool {

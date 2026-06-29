@@ -35,6 +35,22 @@ extension AffectiveViewModel {
         avatarMouthSprite = manifest.neutralMouthSpriteName()
     }
 
+    func handleAvatarDidUpdate(for brainID: String) {
+        guard brain.id == brainID else { return }
+        let library = BrainLibrary()
+        library.refresh()
+        guard let updated = library.brains.first(where: { $0.id == brainID }) else { return }
+        reloadBrain(updated)
+        guard isBrainConnected else { return }
+        Task {
+            do {
+                _ = try await brainCore.refreshFacialExpressionCatalog()
+            } catch {
+                statusText = "Avatar saved, but expression catalog refresh failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
     func applyFacialExpressionFromEvent(_ event: BrainEvent) {
         guard supportsAvatarFacialExpressions else { return }
 

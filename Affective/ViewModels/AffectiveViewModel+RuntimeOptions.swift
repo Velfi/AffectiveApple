@@ -286,6 +286,14 @@ extension AffectiveViewModel {
                     canSend = enabled
                     statusText = enabled ? "Ready" : (brainVoiceEnabled ? "Affective is speaking" : "Affective is thinking")
                 }
+            case "developer_log":
+                let title = event.title ?? "developer_log"
+                appendEventLog(
+                    kind: logKind(for: event.kind, title: title),
+                    title: title,
+                    body: event.text ?? event.body ?? "",
+                    metadata: metadata
+                )
             case "mise_en_scene":
                 if case .miseEnScene(let payload) = event.payload {
                     applyMiseEnScene(name: payload.name, themeColor: payload.themeColor)
@@ -309,9 +317,29 @@ extension AffectiveViewModel {
                     switch expressionModality(for: event) {
                     case "face", "facial_expression":
                         applyFacialExpressionFromEvent(event)
+                        logFacialExpressionEvent(event, metadata: metadata)
+                    case "emote":
+                        logEmoteEvent(event, metadata: metadata)
                     default:
                         break
                     }
+                }
+                if expressionIsPublic(event),
+                   isSelfEventRole(event.role ?? "self"),
+                   expressionModality(for: event) == "emote" {
+                    let body = emoteBody(from: event)
+                    guard !body.isEmpty else { continue }
+                    chatEntries.append(.init(
+                        kind: .emote,
+                        title: chatSenderTitle(for: event.title),
+                        body: body,
+                        metadata: metadata
+                    ))
+                    recordConversationTurn(role: "self", text: "*\(body)*", source: event.type, metadata: metadata)
+                    didAppendBrainChat = true
+                    didRecordBrainTurn = true
+                    didEmitSocialSignal = true
+                    continue
                 }
                 guard mirrorChatMessages else { continue }
                 guard expressionIsPublic(event) else { continue }
@@ -337,12 +365,6 @@ extension AffectiveViewModel {
                     if !facialExpressionSummary(for: event).isEmpty {
                         didEmitSocialSignal = true
                     }
-                    appendEventLog(
-                        kind: .state,
-                        title: "facial expression",
-                        body: [event.eyes, event.mouth].compactMap { $0 }.joined(separator: " / "),
-                        metadata: metadata
-                    )
                 default:
                     appendEventLog(
                         kind: .state,
@@ -353,26 +375,22 @@ extension AffectiveViewModel {
                 }
             case "capability_request":
                 if event.capability == "speak",
-                   eventPresentation(for: event).mirrorsToChat,
                    let text = event.text,
                    !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     speechText = text
-                    resolvedBrainText = text
-                    didEmitSocialSignal = true
+                    if eventPresentation(for: event).mirrorsToChat {
+                        resolvedBrainText = text
+                        didEmitSocialSignal = true
+                    }
                 }
-                if event.capability == "show_expression",
+                if isFacialExpressionCapability(event.capability),
                    eventPresentation(for: event).mirrorsToChat,
                    !facialExpressionSummary(for: event).isEmpty {
                     didEmitSocialSignal = true
                 }
-                if event.capability == "show_expression" {
+                if isFacialExpressionCapability(event.capability) {
                     applyFacialExpressionFromEvent(event)
-                    appendEventLog(
-                        kind: .state,
-                        title: "facial expression",
-                        body: [event.eyes, event.mouth].compactMap { $0 }.joined(separator: " / "),
-                        metadata: metadata
-                    )
+                    logFacialExpressionEvent(event, metadata: metadata)
                 } else if event.capability == "sense_catalog" {
                     appendEventLog(
                         kind: .state,
@@ -403,10 +421,7 @@ extension AffectiveViewModel {
                 )
                 if handleHostRequests {
                     let observationPresentation: BrainEventPresentation = mirrorChatMessages ? .chat : .internalOnly
-                    await fulfillSenseRequest(
-                        event,
-                        observationResponsePresentation: observationPresentation
-                    )
+                    enqueueHostPipelineAction(.pullSenseRequest(event, observationPresentation))
                 }
             default:
                 appendEventLog(
@@ -508,11 +523,13 @@ extension AffectiveViewModel {
         switch currentHostPipelineAction {
         case .typedText, .imageText, .interrupt:
             return .internalOnly
+        case .pullSenseRequest(_, let presentation):
+            return presentation
         case .coreTouch, .pokeSequence:
             return .chat
         case .pushedMotionGesture, .boredomStimulus:
             return .internalOnly
-        case .refreshBrainState:
+        case .refreshBrainState, .collectMailbox, .mailboxMarkRead:
             return .internalOnly
         }
     }
@@ -576,12 +593,58 @@ extension AffectiveViewModel {
             .joined(separator: " / ")
     }
 
+    func isFacialExpressionCapability(_ capability: String?) -> Bool {
+        switch capability {
+        case "show_expression", "facial_expression", "facial_expression_output":
+            return true
+        default:
+            return false
+        }
+    }
+
+    func logFacialExpressionEvent(_ event: BrainEvent, metadata: [String: String]) {
+        let summary = facialExpressionSummary(for: event)
+        guard !summary.isEmpty else { return }
+        appendEventLog(
+            kind: .state,
+            title: "facial expression",
+            body: summary,
+            metadata: metadata
+        )
+    }
+
+    func logEmoteEvent(_ event: BrainEvent, metadata: [String: String]) {
+        let body = emoteBody(from: event)
+        guard !body.isEmpty else { return }
+        appendEventLog(
+            kind: .state,
+            title: "emote",
+            body: body,
+            metadata: metadata
+        )
+    }
+
+    func emoteBody(from event: BrainEvent) -> String {
+        let raw = event.text ?? event.body ?? ""
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2,
+              trimmed.hasPrefix("*"),
+              trimmed.hasSuffix("*") else {
+            return trimmed
+        }
+        trimmed.removeFirst()
+        trimmed.removeLast()
+        return trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     func coreEventMetadata(_ event: BrainEvent) -> [String: String] {
         var metadata = [
             "source": "core_event",
             "event_type": event.type,
+            "event_id": event.id,
         ]
         if let requestID = event.requestID { metadata["request_id"] = requestID }
+        if let turnID = event.turnID { metadata["turn_id"] = turnID }
         if let expressionID = event.expressionID { metadata["expression_id"] = expressionID }
         if let modality = event.modality { metadata["modality"] = modality }
         metadata["visibility"] = event.visibility.rawValue
@@ -658,8 +721,12 @@ extension AffectiveViewModel {
         brainSenderName
     }
 
-    func logKind(for coreKind: String?) -> LogKind {
+    func logKind(for coreKind: String?, title: String? = nil) -> LogKind {
+        if let title, title.hasPrefix("turn.") {
+            return .process
+        }
         guard let coreKind else { return .state }
+        if coreKind == "process" { return .process }
         return LogKind(rawValue: coreKind) ?? .state
     }
 
@@ -796,11 +863,14 @@ extension AffectiveViewModel {
                     option.committedValue = ""
                     groups[groupIndex].options[optionIndex] = option
                 } else if let storedValue = storedValues[option.key] {
-                    option.value = storedValue
-                    option.committedValue = storedValue
+                    let resolvedValue = option.key == "autonomy_mode"
+                        ? Self.normalizeAutonomyMode(storedValue)
+                        : storedValue
+                    option.value = resolvedValue
+                    option.committedValue = resolvedValue
                     if case .select(let choices) = option.kind,
-                       !choices.contains(where: { $0.value == storedValue }) {
-                        option.kind = .select(([RuntimeOptionChoice(value: storedValue, label: storedValue)] + choices).uniqued())
+                       !choices.contains(where: { $0.value == resolvedValue }) {
+                        option.kind = .select(([RuntimeOptionChoice(value: resolvedValue, label: resolvedValue)] + choices).uniqued())
                     }
                     groups[groupIndex].options[optionIndex] = option
                 }
@@ -854,7 +924,6 @@ extension AffectiveViewModel {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
 
         var storedValues = try Self.loadRuntimeOptionsObject(brain: brain)
-        storedValues["autonomy_mode"] = normalizedAutonomyMode
         Self.removeStoredSecrets(from: &storedValues)
         for option in optionGroups.flatMap(\.options) where !option.isReadOnly {
             if let credentialKey = ProviderCredentialKey(rawValue: option.key) {
@@ -869,12 +938,17 @@ extension AffectiveViewModel {
                     try Self.credentialStore.saveCredential(credential, for: credentialKey)
                 }
                 storedValues.removeValue(forKey: option.key)
+            } else if option.key == "autonomy_mode" {
+                storedValues[option.key] = Self.normalizeAutonomyMode(option.value)
             } else {
                 storedValues[option.key] = option.jsonValue
             }
         }
         if (storedValues[BiometricPolicyKeys.exportIncluded] as? Bool) == true {
             storedValues[BiometricPolicyKeys.exportConfirmationRequired] = true
+        }
+        if storedValues["autonomy_mode"] == nil {
+            storedValues["autonomy_mode"] = normalizedAutonomyMode
         }
 
         let data = try JSONSerialization.data(withJSONObject: storedValues, options: [.prettyPrinted, .sortedKeys])
