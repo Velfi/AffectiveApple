@@ -9,6 +9,8 @@ import Combine
 extension AffectiveViewModel {
     func enqueueHostPipelineAction(_ action: HostPipelineAction) {
         recordHostStimulus()
+        noteSocialSenseInput(for: action)
+        noteHostPipelineProgress()
         hostPipelineQueue.append(action)
         noteQueuedChatResponses(action.presentsChatResponse ? 1 : 0)
         if !isHostPipelineRunning {
@@ -25,8 +27,22 @@ extension AffectiveViewModel {
     func enqueuePriorityHostPipelineActions(_ actions: [HostPipelineAction]) {
         guard !actions.isEmpty else { return }
         recordHostStimulus()
-        hostPipelineQueue.insert(contentsOf: actions, at: 0)
-        noteQueuedChatResponses(actions.filter(\.presentsChatResponse).count)
+        for action in actions {
+            noteSocialSenseInput(for: action)
+        }
+        var queuedActions: [HostPipelineAction] = []
+        for action in actions {
+            if case .interrupt = action {
+                Task {
+                    await self.performHostPipelineAction(action)
+                }
+            } else {
+                queuedActions.append(action)
+            }
+        }
+        guard !queuedActions.isEmpty else { return }
+        hostPipelineQueue.insert(contentsOf: queuedActions, at: 0)
+        noteQueuedChatResponses(queuedActions.filter(\.presentsChatResponse).count)
         if !isHostPipelineRunning {
             Task {
                 await drainHostPipeline()
@@ -56,7 +72,9 @@ extension AffectiveViewModel {
             do {
                 currentHostPipelineAction = action
                 currentHostPipelineActionIsAwaitingChatResponse = action.presentsChatResponse
+                noteHostPipelineActionStarted(action)
                 defer {
+                    noteHostPipelineActionFinished()
                     fulfillCurrentChatResponseIfNeeded()
                     currentHostPipelineAction = nil
                     currentHostPipelineActionIsAwaitingChatResponse = false
@@ -75,33 +93,39 @@ extension AffectiveViewModel {
                 interruptedAction: interruptedAction,
                 canceledQueuedActionCount: canceledQueuedActionCount
             )
-        case .typedText(let text, let stimulusContext):
-            await sendTextToBrain(text, source: .typedText, stimulusContext: stimulusContext)
+        case .typedText(let text, let stimulusContext, let delivery):
+            await deliverHostStimulusToBrain(
+                text: text,
+                stimulusContext: stimulusContext,
+                delivery: delivery
+            )
         case .imageText(let prompt, let attachment, let mediaPayload, let stimulusContext):
             await sendMediaUploadedEvent(payload: mediaPayload)
-            await sendTextToBrain(prompt, source: .typedText, attachments: [attachment], stimulusContext: stimulusContext)
+            await deliverHostStimulusToBrain(
+                text: prompt,
+                stimulusContext: stimulusContext,
+                attachments: [attachment],
+                delivery: .counterpartSpeech(name: nil, source: .typedText)
+            )
         case .pullSenseRequest(let event, let observationResponsePresentation):
-            await fulfillSenseRequest(event, observationResponsePresentation: observationResponsePresentation)
+            scheduleAsyncPullSenseFulfillment(
+                event: event,
+                observationResponsePresentation: observationResponsePresentation
+            )
         case .coreTouch(let name, let title):
             await callCoreTouch(name: name, title: title)
         case .pokeSequence(let pulses):
             await callCorePokeSequence(pulses)
         case .pushedMotionGesture(let observation):
             await sendPushedMotionGestureObservation(observation)
-        case .boredomStimulus(let text, let stimulusContext):
-            await sendTextToBrain(
-                text,
-                source: .typedText,
-                stimulusContext: stimulusContext,
-                mirrorChatMessages: false,
-                speakResponse: false
-            )
+        case .boredomStimulus:
+            await runAutonomyTick()
         case .refreshBrainState:
             await performRefreshBrainState()
         case .collectMailbox:
             await collectMailboxItems()
         case .mailboxMarkRead(let mailboxID):
-            _ = try? await brainCore.mailboxMarkRead(mailboxID: mailboxID)
+            await markMailboxReadInCore(mailboxID: mailboxID)
         }
     }
 
@@ -114,12 +138,15 @@ extension AffectiveViewModel {
         speechSpeaker.stop()
         stopBoredomSense()
         stopAutonomySense()
+        stopHostPipelineHealthMonitor()
         stopMotionGestureMonitoring()
         pokeFlushTask?.cancel()
         pokeFlushTask = nil
         if isPoking {
             isPoking = false
         }
+        BrainHostServiceRoutes.clearLLMCompletionObserver()
+        await clearCoreEventSinkHandler()
         await brainCore.disconnect()
         isBrainConnected = false
         isBrainConnectionInFlight = false
@@ -147,6 +174,7 @@ extension AffectiveViewModel {
         coreLoadProgressDetail = ""
         CoreLoadPerformanceSession.writeStartupToConsole(brainID: brain.id)
         appendEventLog(kind: .sent, title: "initialize", body: "brain-core")
+        installHostLLMCompletionObserver()
 
         do {
             let envelope = try await brainCore.connect(progress: loadSession)
@@ -167,8 +195,15 @@ extension AffectiveViewModel {
                 )
             }
             _ = await loadSession.measure(id: "apply_core_events", label: "Applying core events") {
-                await applyCoreEvents(envelope.events, mirrorChatMessages: false, speak: false, handleHostRequests: false)
+                await applyCoreEvents(
+                    envelope.events,
+                    mirrorChatMessages: false,
+                    speak: false,
+                    context: .diagnosticStatus
+                )
             }
+            noteBrainResponseMetadata(envelope.metadata())
+            ensureAwaitingHostSenseFulfillmentIfNeeded()
             await loadSession.measure(id: "refresh_senses", label: "Starting background senses") {
                 refreshBoredomSense()
                 refreshAutonomySense()
@@ -192,9 +227,7 @@ extension AffectiveViewModel {
                 }
             }
 
-            await loadSession.measure(id: "dream_on_load", label: "Checking dream schedule") {
-                await enterDreamOnLoadIfNeeded()
-            }
+            await enterDreamOnLoadIfNeeded(loadSession: loadSession)
             if motionGestureOptionEnabled {
                 await loadSession.measure(id: "motion_gesture_monitor", label: "Starting motion gestures") {
                     startMotionGestureMonitoringIfAvailable()
@@ -209,6 +242,8 @@ extension AffectiveViewModel {
             if !isBrainUnavailableForConversation {
                 statusText = "Ready"
             }
+            await installCoreEventSinkHandler()
+            startHostPipelineHealthMonitor()
         } catch {
             let metrics = loadSession.report()
             recordCoreLoadMetrics(metrics)
@@ -217,10 +252,30 @@ extension AffectiveViewModel {
             isBrainConnected = false
             stopBoredomSense()
             stopAutonomySense()
+            stopHostPipelineHealthMonitor()
             stopMotionGestureMonitoring()
             statusText = "Core unavailable"
             appendEventLog(kind: .error, title: "core connect failed", body: error.localizedDescription)
         }
+    }
+
+    private func installCoreEventSinkHandler() async {
+        await brainCore.setEventSinkHandler { [weak self] events in
+            guard !events.isEmpty else { return }
+            Task { @MainActor [weak self] in
+                guard let self, self.isBrainConnected else { return }
+                _ = await self.applyCoreEvents(
+                    events,
+                    mirrorChatMessages: true,
+                    speak: self.brainVoiceEnabled,
+                    context: .eventSink
+                )
+            }
+        }
+    }
+
+    private func clearCoreEventSinkHandler() async {
+        await brainCore.setEventSinkHandler(nil)
     }
 
     func shortTapWake() {
@@ -348,7 +403,11 @@ extension AffectiveViewModel {
             summary: pokeStimulusSummary(pulses),
             metadata: pokeMetadata(pulses: pulses, mirrorToChat: false)
         )
-        enqueueHostPipelineAction(.pokeSequence(pulses))
+        if isHostPipelineRunning || !hostPipelineQueue.isEmpty {
+            enqueueHostPipelineAction(.pokeSequence(pulses))
+        } else {
+            await callCorePokeSequence(pulses)
+        }
     }
 
     func refreshBrainState() {
@@ -433,7 +492,8 @@ extension AffectiveViewModel {
         }
         enqueueHostPipelineAction(.typedText(
             text: text,
-            stimulusContext: currentStimulusContext(kind: "user_memory_share")
+            stimulusContext: currentStimulusContext(kind: "user_memory_share"),
+            delivery: .hostNarration
         ))
     }
 
@@ -450,7 +510,8 @@ extension AffectiveViewModel {
         if !tags.isEmpty { parts.append("tags: \(tags.joined(separator: ", "))") }
         enqueueHostPipelineAction(.typedText(
             text: "What do you remember about \(parts.joined(separator: " "))?",
-            stimulusContext: currentStimulusContext(kind: "user_memory_question")
+            stimulusContext: currentStimulusContext(kind: "user_memory_question"),
+            delivery: .hostNarration
         ))
     }
 
@@ -465,14 +526,16 @@ extension AffectiveViewModel {
         reminderText = ""
         enqueueHostPipelineAction(.typedText(
             text: "Please remind me \(schedule): \(text)",
-            stimulusContext: currentStimulusContext(kind: "user_reminder_request")
+            stimulusContext: currentStimulusContext(kind: "user_reminder_request"),
+            delivery: .hostNarration
         ))
     }
 
     func listReminders() {
         enqueueHostPipelineAction(.typedText(
             text: "What reminders do you have for me?",
-            stimulusContext: currentStimulusContext(kind: "user_reminder_question")
+            stimulusContext: currentStimulusContext(kind: "user_reminder_question"),
+            delivery: .hostNarration
         ))
     }
 
@@ -485,21 +548,36 @@ extension AffectiveViewModel {
             return
         }
         let context = currentStimulusContext(kind: interrupt ? "user_interrupt_message" : "user_message")
-        let interruptedAction = interrupt ? currentHostPipelineAction?.stimulusDescription : nil
+        let interruptedAction = interrupt ? ongoingHostActionDescription : nil
         clearSocialTurnResponseWindow()
         chatEntries.append(.init(kind: .user, title: "Other", body: trimmed, metadata: ["source": "typed text"]))
         recordConversationTurn(role: "other", text: trimmed, source: "experience", metadata: ["source": "typed text"])
         appendEventLog(kind: .sent, title: "text", body: trimmed)
         messageText = ""
-        dispatchUserMessageImmediately(
-            text: trimmed,
-            stimulusContext: context,
-            sendInterruptFirst: interrupt,
-            interruptedAction: interruptedAction
-        )
+        dropQueuedBoredomStimuli()
+        if !interrupt,
+           shouldCoalesceUserMessageWhileHostPipelineBusy {
+            enqueueCoalescedUserMessage(text: trimmed, stimulusContext: context)
+            return
+        }
+        prepareForIncomingUserMessage()
+        if interrupt {
+            enqueuePriorityHostPipelineActions([
+                .interrupt(
+                    userText: trimmed,
+                    reason: "user_requested_interrupt",
+                    interruptedAction: interruptedAction,
+                    canceledQueuedActionCount: 0
+                ),
+                .typedText(text: trimmed, stimulusContext: context),
+            ])
+        } else {
+            enqueueHostPipelineAction(.typedText(text: trimmed, stimulusContext: context))
+        }
     }
 
     func markInputActivity() {
+        recordHostStimulus()
         markCounterpartActive()
         let nextStatus = "Typing"
         guard statusText != nextStatus else { return }
@@ -542,110 +620,82 @@ extension AffectiveViewModel {
                 "caption": .string(caption),
                 "source": .string("user_upload"),
             ]
-            dispatchUserMessageImmediately(
-                text: prompt,
-                attachments: [attachment],
+            enqueueHostPipelineAction(.imageText(
+                prompt: prompt,
+                attachment: attachment,
                 mediaPayload: mediaPayload,
                 stimulusContext: context
-            )
+            ))
         } catch {
             reportImageSendFailure(error.localizedDescription)
         }
     }
 
-    func dispatchUserMessageImmediately(
-        text: String,
-        source: LanguageInputSource = .typedText,
-        attachments: [[String: JSONValue]] = [],
-        mediaPayload: String? = nil,
-        stimulusContext: StimulusContext,
-        speakResponse: Bool = true,
-        sendInterruptFirst: Bool = false,
-        interruptedAction: String? = nil
-    ) {
-        prepareForImmediateUserMessage()
-        let generation = conversationDispatchGeneration
-        immediateUserMessageInFlight = true
-        reserveChatResponseSlot()
-        statusText = attachments.isEmpty ? "Sending to core" : "Sending picture to core"
-        Task {
-            await performImmediateUserMessageDispatch(
-                generation: generation,
-                text: text,
-                source: source,
-                attachments: attachments,
-                mediaPayload: mediaPayload,
-                stimulusContext: stimulusContext,
-                speakResponse: speakResponse,
-                sendInterruptFirst: sendInterruptFirst,
-                interruptedAction: interruptedAction
-            )
-        }
-    }
-
-    func prepareForImmediateUserMessage() {
+    func prepareForIncomingUserMessage() {
         if speechSpeaker.isSpeaking {
             speechSpeaker.stop()
         }
         if hostPipelineHold == .speechOutput {
             setHostPipelineHold(.none)
         }
-        if immediateUserMessageInFlight {
-            immediateUserMessageInFlight = false
-            releaseChatResponseSlot()
-        }
         if currentHostPipelineActionIsAwaitingChatResponse {
             currentHostPipelineActionIsAwaitingChatResponse = false
             releaseChatResponseSlot()
         }
         dropQueuedConversationMessages()
-        abortSupersededPullSenseFulfillment()
+        dropQueuedBoredomStimuli()
         conversationDispatchGeneration += 1
+        let generation = conversationDispatchGeneration
+        Task {
+            await self.brainCore.syncConversationDispatchGeneration(generation)
+        }
         refreshUserSendAvailability()
     }
 
-    func performImmediateUserMessageDispatch(
-        generation: Int,
-        text: String,
-        source: LanguageInputSource,
-        attachments: [[String: JSONValue]],
-        mediaPayload: String?,
-        stimulusContext: StimulusContext,
-        speakResponse: Bool,
-        sendInterruptFirst: Bool = false,
-        interruptedAction: String? = nil
-    ) async {
-        defer {
-            if generation == conversationDispatchGeneration {
-                if immediateUserMessageInFlight {
-                    immediateUserMessageInFlight = false
-                }
-                releaseChatResponseSlot()
-            }
+    func prepareForConversationInterrupt() {
+        prepareForIncomingUserMessage()
+    }
+
+    var shouldCoalesceUserMessageWhileHostPipelineBusy: Bool {
+        guard isHostPipelineRunning else { return false }
+        return currentHostPipelineAction?.presentsChatResponse == true
+    }
+
+    func enqueueCoalescedUserMessage(text: String, stimulusContext: StimulusContext) {
+        statusText = "Queued message for core inbox"
+        Task {
+            await self.deliverCoalescedUserMessage(text: text, stimulusContext: stimulusContext)
         }
-        guard generation == conversationDispatchGeneration else { return }
-        if sendInterruptFirst {
-            await sendInterruptToBrain(
-                userText: text,
-                reason: "user_requested_interrupt",
-                interruptedAction: interruptedAction,
-                canceledQueuedActionCount: 0
-            )
-            guard generation == conversationDispatchGeneration else { return }
-        }
-        if let mediaPayload {
-            await sendMediaUploadedEvent(payload: mediaPayload)
-            guard generation == conversationDispatchGeneration else { return }
-        }
-        guard generation == conversationDispatchGeneration else { return }
-        await sendTextToBrain(
-            text,
-            source: source,
-            attachments: attachments,
-            stimulusContext: stimulusContext,
-            speakResponse: speakResponse,
-            deliveryGeneration: generation
+    }
+
+    func deliverCoalescedUserMessage(text: String, stimulusContext: StimulusContext) async {
+        let record = recordStimulus(
+            kind: stimulusContext.kind,
+            summary: stimulusSummary(text: text, attachments: [], delivery: .counterpartSpeech(name: nil, source: .typedText)),
+            metadata: stimulusRecordMetadata(for: stimulusContext, attachments: [], delivery: .counterpartSpeech(name: nil, source: .typedText))
         )
+        do {
+            if !isBrainConnected {
+                await connectToBrain()
+            }
+            let ingestArguments = BrainCore.speechStimulusArguments(
+                text: text,
+                source: .typedText,
+                stimulusContext: stimulusContext
+            )
+            _ = try await brainCore.ingestStimulus(
+                "stimulus_ingest",
+                arguments: ingestArguments
+            )
+            stimulusInbox.markDelivered(sequenceIDs: [record.id])
+            stimulusInboxPendingCount = stimulusInbox.pendingCount
+        } catch {
+            appendEventLog(kind: .error, title: "inbox coalesce failed", body: error.localizedDescription)
+        }
+    }
+
+    var ongoingHostActionDescription: String? {
+        currentHostPipelineAction?.stimulusDescription ?? hostPipelineHold.stimulusDescription
     }
 
     func dropQueuedConversationMessages() {
@@ -665,6 +715,167 @@ extension AffectiveViewModel {
         if removedChatResponses > 0 {
             pendingChatResponseCount = max(0, pendingChatResponseCount - removedChatResponses)
             refreshAwaitingChatResponse()
+        }
+    }
+
+    func dropQueuedBoredomStimuli() {
+        hostPipelineQueue.removeAll { action in
+            if case .boredomStimulus = action {
+                return true
+            }
+            return false
+        }
+    }
+
+    func deliverBoredomStimulusToBrain(text: String, stimulusContext: StimulusContext) async {
+        await deliverHostStimulusToBrain(
+            text: text,
+            stimulusContext: stimulusContext,
+            delivery: .hostNarration,
+            expectResponse: false
+        )
+    }
+
+    func canRunBoredomDelivery() -> Bool {
+        !isAwaitingChatResponse
+            && !isHostPipelineRunning
+            && hostPipelineHold == .none
+    }
+
+    func deliverHostStimulusToBrain(
+        text: String,
+        stimulusContext: StimulusContext?,
+        attachments: [[String: JSONValue]] = [],
+        delivery: HostStimulusDelivery,
+        mirrorChatMessages: Bool = true,
+        speakResponse: Bool = true,
+        expectResponse: Bool = true
+    ) async {
+        if expectResponse, isBrainUnavailableForConversation {
+            statusText = brainModeStatusText
+            appendEventLog(kind: .state, title: "conversation blocked", body: brainModeStatusText, metadata: ["brain_mode": brainMode])
+            return
+        }
+        if !expectResponse, !canRunBoredomDelivery() {
+            return
+        }
+
+        let stimulusText = hostStimulusBodyText(
+            text: text,
+            attachments: attachments,
+            delivery: delivery
+        )
+        var recordedStimulus: StimulusRecord?
+        if let stimulusContext {
+            recordedStimulus = recordStimulus(
+                kind: stimulusContext.kind,
+                summary: stimulusSummary(text: text, attachments: attachments, delivery: delivery),
+                metadata: stimulusRecordMetadata(for: stimulusContext, attachments: attachments, delivery: delivery)
+            )
+        }
+        statusText = attachments.isEmpty ? "Sending stimulus to core" : "Sending picture stimulus to core"
+
+        do {
+            if !isBrainConnected {
+                await connectToBrain()
+            }
+            var ingestArguments = BrainCore.speechStimulusArguments(
+                text: stimulusText,
+                source: delivery.languageInputSource,
+                stimulusContext: stimulusContext
+            )
+            if !attachments.isEmpty {
+                ingestArguments["attachments"] = .array(attachments.map { .object($0) })
+                ingestArguments["raw_magnitude"] = .number(0.90)
+            }
+            let ingestEnvelope = try await brainCore.ingestStimulus(
+                "stimulus_ingest",
+                arguments: ingestArguments
+            )
+            if ingestEnvelope.stimulusWasQueued {
+                if let recordedStimulus {
+                    stimulusInbox.markDelivered(sequenceIDs: [recordedStimulus.id])
+                    stimulusInboxPendingCount = stimulusInbox.pendingCount
+                }
+                statusText = "Message queued for core"
+                appendEventLog(
+                    kind: .state,
+                    title: "stimulus queued",
+                    body: "Core accepted the message while busy; it will integrate on the next deliberation pass.",
+                    metadata: ["request_id": ingestEnvelope.requestID]
+                )
+                refreshUserSendAvailability()
+                return
+            }
+            if let recordedStimulus {
+                stimulusInbox.markDelivered(sequenceIDs: [recordedStimulus.id])
+                stimulusInboxPendingCount = stimulusInbox.pendingCount
+            }
+            statusText = expectResponse ? "Message accepted by core" : statusText
+            appendEventLog(
+                kind: .state,
+                title: "stimulus accepted",
+                body: "Core accepted the stimulus; any brain work will arrive as events.",
+                metadata: ["request_id": ingestEnvelope.requestID]
+            )
+            if expectResponse, autonomyIsEnabled {
+                await runAutonomyTick()
+            }
+            refreshUserSendAvailability()
+        } catch {
+            canSend = true
+            statusText = "Core error"
+            appendEventLog(kind: .error, title: "stimulus delivery failed", body: error.localizedDescription)
+        }
+    }
+
+    func stimulusSummary(
+        text: String,
+        attachments: [[String: JSONValue]],
+        delivery: HostStimulusDelivery
+    ) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = String(trimmed.prefix(180))
+        if attachments.isEmpty {
+            switch delivery {
+            case .hostNarration:
+                return prefix.isEmpty ? "Host sent a text stimulus." : prefix
+            case .counterpartSpeech:
+                return prefix.isEmpty ? "User sent a text stimulus." : "User said: \(prefix)"
+            }
+        }
+        return prefix.isEmpty ? "User sent media." : "User sent media: \(prefix)"
+    }
+
+    func stimulusRecordMetadata(
+        for context: StimulusContext,
+        attachments: [[String: JSONValue]],
+        delivery: HostStimulusDelivery
+    ) -> [String: String] {
+        var metadata: [String: String] = [
+            "stimulus_kind": context.kind,
+            "source": delivery.languageInputSource.rawValue,
+            "salience": attachments.isEmpty ? "0.65" : "0.8",
+        ]
+        if !attachments.isEmpty {
+            metadata["media_kind"] = "image"
+            metadata["raw_payload_available"] = "true"
+        }
+        if let attachment = attachments.first,
+           let path = attachment["path"]?.stringValue {
+            metadata["image_path"] = path
+        }
+        return metadata
+    }
+
+    func hostStimulusBodyText(
+        text: String,
+        attachments: [[String: JSONValue]],
+        delivery: HostStimulusDelivery
+    ) -> String {
+        switch delivery {
+        case .hostNarration, .counterpartSpeech:
+            return BrainCore.textByAppendingAttachmentMarkers(text, attachments: attachments)
         }
     }
 
@@ -726,26 +937,20 @@ extension AffectiveViewModel {
                 speakerLabel: "You",
                 utteranceEventID: entry.metadata["event_id"]
             )
-            guard !response.events.isEmpty else {
-                appendEventLog(
-                    kind: .error,
-                    title: "emoji_reaction",
-                    body: "Core returned no event batch for the emoji_reaction dispatch.",
-                    metadata: response.metadata
-                )
-                return
-            }
-            _ = await applyCoreEvents(
-                response.events,
-                mirrorChatMessages: true,
-                speak: response.shouldSpeak
-            )
             appendEventLog(
                 kind: .sent,
                 title: "emoji_reaction",
                 body: "\(normalized) on \(utteranceText)",
                 metadata: response.metadata
             )
+            if !response.events.isEmpty {
+                _ = await applyCoreEvents(
+                    response.events,
+                    mirrorChatMessages: true,
+                    speak: response.shouldSpeak,
+                    context: .dispatchResponse(operation: response.toolName, requestID: response.metadata["request_id"])
+                )
+            }
         } catch {
             appendEventLog(kind: .error, title: "emoji_reaction failed", body: error.localizedDescription)
         }
@@ -781,17 +986,54 @@ extension AffectiveViewModel {
         let previousMode = autonomyMode
         autonomyMode = normalizedMode
         setRuntimeOptionValue("autonomy_mode", value: normalizedMode, commit: true)
-        appendEventLog(kind: .sent, title: "option autonomy_mode", body: normalizedMode)
+        appendEventLog(kind: .sent, title: "option background agency", body: normalizedMode)
 
         do {
             try saveAutonomyMode()
-            statusText = normalizedMode == "off" ? "Autonomy disabled" : "Autonomy \(normalizedMode)"
+            statusText = "Attention settings updated"
             refreshBoredomSense()
             refreshAutonomySense()
+            syncInnerStateSummary()
         } catch {
             autonomyMode = previousMode
-            statusText = "Could not save autonomy"
-            appendEventLog(kind: .error, title: "autonomy save failed", body: error.localizedDescription)
+            statusText = "Could not save agency"
+            appendEventLog(kind: .error, title: "agency save failed", body: error.localizedDescription)
+        }
+    }
+
+    func setAttentionPaused(_ paused: Bool) {
+        let value = paused ? "on" : "off"
+        guard runtimeOptionStringValue(for: "autonomy_sleep") != value else { return }
+        setRuntimeOptionValue("autonomy_sleep", value: value, commit: true)
+        autonomyControlBlockedReason = paused ? "sleep" : "none"
+        do {
+            try saveRuntimeOption(key: "autonomy_sleep", value: value)
+            statusText = paused ? "Attention paused" : "Attention resumed"
+            appendEventLog(kind: .sent, title: "option autonomy_sleep", body: value)
+            syncInnerStateSummary()
+        } catch {
+            statusText = "Could not update attention"
+            appendEventLog(kind: .error, title: "attention save failed", body: error.localizedDescription)
+        }
+    }
+
+    func setCameraCaptureEnabled(_ enabled: Bool) {
+        let value = enabled ? "on" : "off"
+        guard runtimeOptionStringValue(for: Self.cameraCaptureEnabledOptionKey) != value else { return }
+        setRuntimeOptionValue(Self.cameraCaptureEnabledOptionKey, value: value, commit: true)
+        if !enabled {
+            cancelActiveCameraCapture()
+        }
+        do {
+            try saveRuntimeOption(key: Self.cameraCaptureEnabledOptionKey, value: value)
+            statusText = enabled ? "Camera sense enabled" : "Camera sense paused"
+            appendEventLog(kind: .sent, title: "option camera_capture_enabled", body: value)
+            Task {
+                await self.advertiseCameraCapabilityConfiguration(requestID: "camera-toggle-\(value)")
+            }
+        } catch {
+            statusText = "Could not update camera sense"
+            appendEventLog(kind: .error, title: "camera sense save failed", body: error.localizedDescription)
         }
     }
 
@@ -813,22 +1055,6 @@ extension AffectiveViewModel {
             }
             refreshUserSendAvailability()
             statusText = "Brain voice disabled"
-        }
-    }
-
-    func addAutonomyActionBudget() {
-        let previousGroups = optionGroups
-        let newBudget = autonomyActionBudget + 1
-        setRuntimeOptionValue(Self.autonomyBudgetOptionKey, value: "\(newBudget)", commit: true)
-        appendEventLog(kind: .sent, title: "option \(Self.autonomyBudgetOptionKey)", body: "\(newBudget)")
-
-        do {
-            try saveRuntimeOption(key: Self.autonomyBudgetOptionKey, value: newBudget)
-            statusText = "Added 1 autonomy action"
-        } catch {
-            optionGroups = previousGroups
-            statusText = "Could not save autonomy budget"
-            appendEventLog(kind: .error, title: "autonomy budget save failed", body: error.localizedDescription)
         }
     }
 
@@ -884,89 +1110,17 @@ extension AffectiveViewModel {
         stimulusContext: StimulusContext? = nil,
         mirrorChatMessages: Bool = true,
         speakResponse: Bool = true,
-        handleHostRequests: Bool = true,
-        deliveryGeneration: Int? = nil
+        handleHostRequests: Bool = true
     ) async {
-        guard !isBrainUnavailableForConversation else {
-            statusText = brainModeStatusText
-            appendEventLog(kind: .state, title: "conversation blocked", body: brainModeStatusText, metadata: ["brain_mode": brainMode])
-            return
-        }
-        guard deliveryGeneration == nil || deliveryGeneration == conversationDispatchGeneration else {
-            return
-        }
-        do {
-            if !isBrainConnected {
-                await connectToBrain()
-            }
-            let response = try await brainCore.sendText(
-                text,
-                source: source,
-                attachments: attachments,
-                stimulusContext: stimulusContext
-            )
-            guard deliveryGeneration == nil || deliveryGeneration == conversationDispatchGeneration else {
-                appendEventLog(
-                    kind: .state,
-                    title: "stale user message",
-                    body: "Skipped stale brain response after a newer user message."
-                )
-                return
-            }
-            guard !response.events.isEmpty else {
-                canSend = true
-                statusText = "Core protocol error"
-                appendEventLog(
-                    kind: .error,
-                    title: "user_text",
-                    body: "Core returned no event batch for the user_text dispatch.",
-                    metadata: response.metadata
-                )
-                return
-            }
-            let responseText = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let awaitingHostSense = response.metadata["awaiting_host_sense"] == "true"
-            let eventResult = await applyCoreEvents(
-                response.events,
-                mirrorChatMessages: mirrorChatMessages,
-                speak: speakResponse && response.shouldSpeak,
-                handleHostRequests: handleHostRequests
-            )
-            let resolvedText = eventResult.resolvedBrainText?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !eventResult.didApplyActivityStatus {
-                statusText = responseText.isEmpty ? "Core returned no reply" : "Zig core responded"
-            }
-            if awaitingHostSense {
-                if resolvedText.isEmpty {
-                    appendEventLog(
-                        kind: .result,
-                        title: response.toolName,
-                        body: Self.pausedForHostSenseLabel(metadata: response.metadata),
-                        metadata: response.metadata
-                    )
-                }
-            } else {
-                appendEventLog(kind: .result, title: response.toolName, body: response.text, metadata: response.metadata)
-            }
-            if !awaitingHostSense || !responseText.isEmpty {
-                appendEventLog(
-                    kind: .state,
-                    title: "chat display",
-                    body: conversationDisplaySummary(responseText: responseText, metadata: response.metadata),
-                    metadata: response.metadata
-                )
-            } else {
-                statusText = Self.awaitingHostSenseStatusText(metadata: response.metadata)
-            }
-            if responseText.isEmpty, response.metadata["awaiting_host_sense"] != "true" {
-                canSend = true
-            }
-        } catch {
-            canSend = true
-            statusText = "Core error"
-            appendEventLog(kind: .error, title: "text send failed", body: error.localizedDescription)
-        }
+        await deliverHostStimulusToBrain(
+            text: text,
+            stimulusContext: stimulusContext,
+            attachments: attachments,
+            delivery: .counterpartSpeech(name: nil, source: source),
+            mirrorChatMessages: mirrorChatMessages,
+            speakResponse: speakResponse,
+            expectResponse: handleHostRequests
+        )
     }
 
     func refreshBrainMode() async {
@@ -984,7 +1138,7 @@ extension AffectiveViewModel {
                 }
             }
         } catch {
-            appendEventLog(kind: .error, title: "brain_mode failed", body: error.localizedDescription)
+            appendEventLog(kind: .error, title: "brain_read failed", body: error.localizedDescription)
         }
     }
 
@@ -999,32 +1153,42 @@ extension AffectiveViewModel {
                 }
             }
             applyAutonomyControlSnapshot(response.readModels)
-            innerStateSummary = readModelsSnapshotSummary(response.readModels)
+            applyActiveProcessModel(from: response.readModels)
+            if let presentMoment = response.readModels.objectValue?["present_moment_model"]?.objectValue,
+               case .number(let pending) = presentMoment["stimulus_inbox_pending"] {
+                stimulusInboxPendingCount = Int(pending)
+            }
+            innerStateSummaryCore = readModelsSnapshotCoreSummary(response.readModels)
+            syncInnerStateSummary()
             appendEventLog(kind: .state, title: response.toolName, body: innerStateSummary, metadata: response.metadata)
         } catch {
             appendEventLog(kind: .error, title: "read_models_snapshot failed", body: error.localizedDescription)
         }
     }
 
-    func readModelsSnapshotSummary(_ readModels: JSONValue) -> String {
-        guard let object = readModels.objectValue else { return "read models unavailable" }
-        var autonomySummary: String?
-        if let control = object["autonomy_control_model"]?.objectValue,
-           case .number(let controlCapacity) = control["control_capacity"],
-           case .number(let maxCapacity) = control["max_capacity"],
-           let mode = control["mode"]?.stringValue,
-           maxCapacity > 0 {
-            let percent = Int((max(0, controlCapacity) / maxCapacity * 100).rounded())
-            autonomySummary = "autonomy=\(Self.normalizeAutonomyMode(mode)) \(percent)%"
+    func scheduleDeferredReadModelsRefresh(delay: Duration = .milliseconds(250)) {
+        readModelsRefreshTask?.cancel()
+        readModelsRefreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, !Task.isCancelled else { return }
+            await self.refreshReadModelsSnapshot()
         }
+    }
+
+    func readModelsSnapshotCoreSummary(_ readModels: JSONValue) -> String {
+        guard let object = readModels.objectValue else { return "read models unavailable" }
         let parts = [
             object["brain_mode"]?.stringValue.map { "mode=\($0)" },
-            autonomySummary,
             object["salient_belief"]?.objectValue?["proposition"]?.stringValue.map { "belief=\($0)" },
             object["strongest_self_trust"]?.objectValue?["faculty"]?.stringValue.map { "self_trust=\($0)" },
             object["winning_disposition"]?.objectValue?["action_tendency"]?.stringValue.map { "disposition=\($0)" },
         ].compactMap { $0 }
-        return parts.isEmpty ? "read models refreshed" : parts.joined(separator: " ")
+        return parts.joined(separator: " ")
+    }
+
+    func readModelsSnapshotSummary(_ readModels: JSONValue) -> String {
+        innerStateSummaryCore = readModelsSnapshotCoreSummary(readModels)
+        return composedInnerStateSummary()
     }
 
     func currentStimulusContext(kind: String, now: Date = Date()) -> StimulusContext {
@@ -1033,21 +1197,63 @@ extension AffectiveViewModel {
         let isOngoing = isHostPipelineRunning || hold != nil || isAwaitingChatResponse || speechSpeaker.isSpeaking
         let socialTurnRemaining = socialTurnResponseWindowRemainingSeconds(now: now)
         let counterpartActivityRemaining = counterpartActivityWindowRemainingSeconds(now: now)
+        let contextPayload = stimulusContextPayload(kind: kind, now: now)
         return StimulusContext(
             kind: kind,
             receivedDuring: isOngoing ? "ongoing_action" : (socialTurnRemaining > 0 ? "awaiting_social_response" : "idle"),
             ongoingAction: ongoingAction,
             hostHold: hold,
             queuedActionCount: hostPipelineQueue.count,
+            inboxPendingCount: stimulusInboxPendingCount,
             speechOutputActive: speechSpeaker.isSpeaking,
             awaitingSocialResponse: socialTurnRemaining > 0,
             socialTurnResponseWindowRemainingSeconds: socialTurnRemaining,
             counterpartActive: counterpartActivityRemaining > 0,
             counterpartActivityWindowRemainingSeconds: counterpartActivityRemaining,
-            recentStimuli: recentStimulusSnapshots(now: now),
-            senseInventory: stimulusInventorySnapshots(now: now),
+            activeProcessGoal: activeProcessGoal,
+            activeProcessState: activeProcessState,
+            activeProcessStepName: activeProcessStepName,
+            recentStimuli: contextPayload.recent,
+            sensePacket: contextPayload.packet,
+            senseInventory: contextPayload.inventory,
             localTime: now,
             conversationContext: conversationContextSnapshot(now: now)
+        )
+    }
+
+    func stimulusContextPayload(
+        kind: String,
+        now: Date = Date()
+    ) -> (
+        recent: [RecentStimulusSnapshot],
+        packet: SensePacketSnapshot?,
+        inventory: [StimulusInventorySnapshot]
+    ) {
+        if kind == "autonomy_tick" {
+            let packet = stimulusInbox.sensePacket(for: .autonomyTick, triggerKind: kind, now: now)
+            return (
+                recent: [],
+                packet: packet,
+                inventory: []
+            )
+        }
+        let context = stimulusInbox.fullContext(now: now)
+        let packet = context.packet.map {
+            SensePacketSnapshot(
+                packetID: "\(kind)-\($0.sequenceIDs.min() ?? 0)-\($0.sequenceIDs.max() ?? 0)",
+                triggerKind: kind,
+                windowSeconds: $0.windowSeconds,
+                openedAt: $0.openedAt,
+                closedAt: $0.closedAt,
+                records: $0.records,
+                digest: $0.digest,
+                inventory: $0.inventory
+            )
+        }
+        return (
+            recent: context.recent,
+            packet: packet,
+            inventory: context.inventory
         )
     }
 
@@ -1199,7 +1405,11 @@ extension AffectiveViewModel {
     }
 
     func refreshAwaitingChatResponse() {
+        let wasAwaiting = isAwaitingChatResponse
         isAwaitingChatResponse = pendingChatResponseCount > 0
+        if wasAwaiting, !isAwaitingChatResponse {
+            clearChatWorkingActivity()
+        }
     }
 
     func refreshUserSendAvailability() {
@@ -1214,7 +1424,7 @@ extension AffectiveViewModel {
 
     func waitForHostPipelineIdle(timeout: Duration = .seconds(10)) async {
         let deadline = ContinuousClock.now + timeout
-        while isHostPipelineRunning || !hostPipelineQueue.isEmpty {
+        while isHostPipelineRunning || !hostPipelineQueue.isEmpty || activePullSenseFulfillmentCount > 0 {
             if ContinuousClock.now >= deadline {
                 return
             }
@@ -1227,7 +1437,8 @@ extension AffectiveViewModel {
     }
 
     func interruptWithUserMessage(_ text: String, stimulusContext: StimulusContext) {
-        let interruptedAction = currentHostPipelineAction?.stimulusDescription
+        prepareForConversationInterrupt()
+        let interruptedAction = ongoingHostActionDescription
         enqueuePriorityHostPipelineActions([
             .interrupt(
                 userText: text,
@@ -1259,7 +1470,7 @@ extension AffectiveViewModel {
                 response.events,
                 mirrorChatMessages: false,
                 speak: false,
-                handleHostRequests: false
+                context: .diagnosticStatus
             )
             appendEventLog(kind: .state, title: response.toolName, body: response.text, metadata: response.metadata)
             if eventResult.didRequestSpeech {
@@ -1293,89 +1504,120 @@ extension AffectiveViewModel {
         lastHostStimulusAt = now
     }
 
+    @discardableResult
     func recordRecentStimulus(
         kind: String,
         summary: String,
         metadata: [String: String],
         now: Date = Date()
-    ) {
-        markCounterpartActive(now: now)
-        clearSocialTurnResponseWindow()
-        pruneRecentStimuli(now: now)
-        let id = nextStimulusSequence
-        nextStimulusSequence += 1
-        stimulusInventory[kind] = StimulusInventoryRecord(
-            kind: kind,
-            totalCount: (stimulusInventory[kind]?.totalCount ?? 0) + 1,
-            lastOccurredAt: now,
-            lastSummary: summary,
-            lastMetadata: metadata
-        )
-        recentStimuli.append(.init(
-            id: id,
-            kind: kind,
-            occurredAt: now,
-            summary: summary,
-            salience: stimulusSalience(from: metadata),
-            metadata: metadata
-        ))
-        if recentStimuli.count > Self.recentStimulusLimit {
-            recentStimuli.removeFirst(recentStimuli.count - Self.recentStimulusLimit)
+    ) -> StimulusRecord {
+        if stimulusShouldMarkCounterpartActive(kind: kind, metadata: metadata) {
+            markCounterpartActive(now: now)
+            clearSocialTurnResponseWindow()
         }
+        let record = stimulusInbox.record(
+            kind: kind,
+            summary: summary,
+            metadata: metadataForStimulusRecord(metadata),
+            context: currentStimulusRecordContext(now: now),
+            now: now
+        )
+        stimulusInboxPendingCount = stimulusInbox.pendingCount
+        return record
+    }
+
+    @discardableResult
+    func recordStimulus(
+        kind: String,
+        summary: String,
+        metadata: [String: String],
+        now: Date = Date()
+    ) -> StimulusRecord {
+        recordRecentStimulus(kind: kind, summary: summary, metadata: metadata, now: now)
+    }
+
+    func stimulusShouldMarkCounterpartActive(kind: String, metadata: [String: String]) -> Bool {
+        if kind.hasPrefix("user_") {
+            return true
+        }
+        if kind == "short_touch" || kind == "long_touch" || kind == "poke_sequence" {
+            return true
+        }
+        if metadata["tool"] == "short_touch" || metadata["tool"] == "long_touch" || metadata["tool"] == "poke_sequence" {
+            return true
+        }
+        return false
+    }
+
+    func metadataForStimulusRecord(_ metadata: [String: String]) -> [String: String] {
+        var enriched = metadata
+        if let activeProcessGoal {
+            enriched["active_process_goal"] = activeProcessGoal
+        }
+        if let activeProcessState {
+            enriched["active_process_state"] = activeProcessState
+        }
+        if let activeProcessStepName {
+            enriched["active_process_step"] = activeProcessStepName
+        }
+        return enriched
+    }
+
+    func currentStimulusRecordContext(now: Date = Date()) -> StimulusRecordContext {
+        let hold = hostPipelineHold.stimulusDescription
+        let socialTurnRemaining = socialTurnResponseWindowRemainingSeconds(now: now)
+        let isOngoing = isHostPipelineRunning || hold != nil || isAwaitingChatResponse || speechSpeaker.isSpeaking
+        return StimulusRecordContext(
+            receivedDuring: isOngoing ? "ongoing_action" : (socialTurnRemaining > 0 ? "awaiting_social_response" : "idle"),
+            activeProcessGoal: activeProcessGoal,
+            activeProcessState: activeProcessState,
+            activeProcessStepName: activeProcessStepName
+        )
     }
 
     func recentStimulusSnapshots(now: Date = Date()) -> [RecentStimulusSnapshot] {
-        pruneRecentStimuli(now: now)
-        return recentStimuli
-            .sorted { lhs, rhs in
-                if lhs.salience == rhs.salience {
-                    return lhs.occurredAt > rhs.occurredAt
-                }
-                return lhs.salience > rhs.salience
-            }
-            .map { stimulus in
-            RecentStimulusSnapshot(
-                id: stimulus.id,
-                kind: stimulus.kind,
-                ageSeconds: max(0, now.timeIntervalSince(stimulus.occurredAt)),
-                summary: stimulus.summary,
-                salience: stimulus.salience,
-                metadata: stimulus.metadata
-            )
-        }
+        stimulusInbox.recentSnapshots(now: now)
     }
 
     func stimulusInventorySnapshots(now: Date = Date()) -> [StimulusInventorySnapshot] {
-        let recentCounts = Dictionary(grouping: recentStimuli, by: \.kind)
-            .mapValues(\.count)
-        return stimulusInventory.values
-            .sorted { lhs, rhs in
-                if lhs.lastOccurredAt == rhs.lastOccurredAt {
-                    return lhs.kind < rhs.kind
-                }
-                return lhs.lastOccurredAt > rhs.lastOccurredAt
-            }
-            .map { record in
-                StimulusInventorySnapshot(
-                    kind: record.kind,
-                    totalCount: record.totalCount,
-                    recentCount: recentCounts[record.kind] ?? 0,
-                    lastAgeSeconds: max(0, now.timeIntervalSince(record.lastOccurredAt)),
-                    lastSummary: record.lastSummary,
-                    lastMetadata: record.lastMetadata
-                )
-            }
+        stimulusInbox.inventorySummary(now: now)
     }
 
     func pruneRecentStimuli(now: Date = Date()) {
-        recentStimuli.removeAll { now.timeIntervalSince($0.occurredAt) > Self.recentStimulusRetentionSeconds }
+        _ = stimulusInbox.recentSnapshots(now: now)
     }
 
     func stimulusSalience(from metadata: [String: String]) -> Double {
-        guard let rawValue = metadata["salience"], let value = Double(rawValue) else {
-            return 0.5
-        }
-        return min(max(value, 0), 1)
+        StimulusInbox.salience(from: metadata)
+    }
+
+    func sensePacketDigestKey(kind: String, metadata: [String: String]) -> String {
+        StimulusInbox.digestKey(kind: kind, metadata: metadata)
+    }
+
+    func stimulusRawPayloadReference(from metadata: [String: String]) -> String? {
+        StimulusInbox.rawPayloadReference(from: metadata)
+    }
+
+    func stimulusRawPayloadAvailable(from metadata: [String: String]) -> Bool {
+        if stimulusRawPayloadReference(from: metadata) != nil { return true }
+        return metadata["raw_payload_available"] == "true"
+    }
+
+    func stimulusProcessingState(from metadata: [String: String], salience: Double) -> String {
+        StimulusInbox.processingState(from: metadata, salience: salience)
+    }
+
+    func sensePacketDigestProcessingState(for stimuli: [RecentStimulus], salience: Double) -> String {
+        StimulusInbox.digestProcessingState(for: stimuli, salience: salience)
+    }
+
+    func sensePacketDigestSummary(for stimuli: [RecentStimulus]) -> String {
+        StimulusInbox.digestSummary(for: stimuli)
+    }
+
+    func stimulusPossibleMeanings(kind: String, metadata: [String: String]) -> [String] {
+        StimulusInbox.features(kind: kind, metadata: metadata, rawPayloadReference: stimulusRawPayloadReference(from: metadata))
     }
 
     func markAwaitingSocialResponse(now: Date = Date()) {
@@ -1470,12 +1712,33 @@ extension AffectiveViewModel {
         isBrainConnected && autonomyIsEnabled
     }
 
-    func autonomyTickIntervalSeconds() -> Int {
+    func autonomyTickBaseIntervalSeconds() -> Int {
         max(runtimeOptionIntValue(for: "autonomy_interval_seconds") ?? 300, 30)
+    }
+
+    func autonomyTickIntervalSeconds(now: Date = Date()) -> Int {
+        let base = autonomyTickBaseIntervalSeconds()
+        guard let lastSocialSenseInputAt else { return base }
+        let engaged = min(max(runtimeOptionIntValue(for: "autonomy_engaged_interval_seconds") ?? 60, 15), base)
+        let decaySeconds = Double(max(runtimeOptionIntValue(for: "autonomy_engagement_decay_seconds") ?? 600, 1))
+        let elapsed = now.timeIntervalSince(lastSocialSenseInputAt)
+        guard elapsed < decaySeconds else { return base }
+        let recovered = max(elapsed, 0) / decaySeconds
+        return Int((Double(engaged) + Double(base - engaged) * recovered).rounded())
+    }
+
+    func autonomyTickIsDue(now: Date = Date()) -> Bool {
+        now.timeIntervalSince(lastAutonomyTickAt) >= Double(autonomyTickIntervalSeconds(now: now))
+    }
+
+    func noteSocialSenseInput(for action: HostPipelineAction, now: Date = Date()) {
+        guard action.isSocialSenseInput else { return }
+        lastSocialSenseInputAt = now
     }
 
     func startAutonomySenseIfNeeded() {
         guard autonomySenseTask == nil else { return }
+        lastAutonomyTickAt = Date()
         autonomySenseGeneration += 1
         let generation = autonomySenseGeneration
         autonomySenseTask = Task { [weak self] in
@@ -1485,17 +1748,15 @@ extension AffectiveViewModel {
                 }
             }
             while !Task.isCancelled {
-                guard let waitSeconds = self?.autonomyTickIntervalSeconds() else { return }
                 do {
-                    try await Task.sleep(for: .seconds(waitSeconds))
+                    try await Task.sleep(for: .seconds(AffectiveViewModel.autonomySensePollSeconds))
                 } catch {
                     return
                 }
                 guard let self else { return }
                 guard self.autonomySenseGeneration == generation else { return }
                 guard self.autonomySenseIsAwake else { return }
-                await self.refreshReadModelsSnapshot()
-                guard self.canRunAutonomyTick() else { continue }
+                guard self.autonomyTickIsDue(), self.canRunAutonomyTick() else { continue }
                 await self.runAutonomyTick()
             }
         }
@@ -1509,35 +1770,55 @@ extension AffectiveViewModel {
 
     func canRunAutonomyTick() -> Bool {
         guard autonomySenseIsAwake else { return false }
-        guard !isHostPipelineRunning, hostPipelineHold == .none, hostPipelineQueue.isEmpty else { return false }
+        guard !isHostPipelineRunning, hostPipelineQueue.isEmpty else { return false }
+        switch hostPipelineHold {
+        case .cameraPermission, .orientationPermission, .cameraCapture, .speechOutput:
+            return false
+        case .none:
+            break
+        }
         guard !isAwaitingChatResponse, !speechSpeaker.isSpeaking, !isPoking else { return false }
         return true
     }
 
     func runAutonomyTick() async {
+        lastAutonomyTickAt = Date()
+        let autonomyContext = currentStimulusContext(kind: "autonomy_tick")
+        let deliveredSequenceIDs = autonomyContext.sensePacket?.sequenceIDs ?? []
         do {
             if !isBrainConnected {
                 await connectToBrain()
             }
-            let response = try await brainCore.autonomyTick()
-            let eventResult = await applyCoreEvents(
-                response.events,
-                mirrorChatMessages: false,
-                speak: response.shouldSpeak,
-                handleHostRequests: true
-            )
-            await refreshReadModelsSnapshot()
-            appendEventLog(
-                kind: .result,
-                title: response.toolName,
-                body: response.text,
-                metadata: response.metadata
-            )
-            if eventResult.didRequestSpeech {
-                await speakBrainResponseAndWait(response.text)
+            let response = try await brainCore.autonomyTick(stimulusContext: autonomyContext)
+            noteBrainResponseMetadata(response.metadata)
+            if !response.events.isEmpty {
+                _ = await applyCoreEvents(
+                    response.events,
+                    mirrorChatMessages: true,
+                    speak: response.shouldSpeak,
+                    context: .dispatchResponse(operation: response.toolName, requestID: response.envelope.requestID)
+                )
             }
+            ensureAwaitingHostSenseFulfillmentIfNeeded()
+            stimulusInbox.markDelivered(sequenceIDs: deliveredSequenceIDs)
+            stimulusInboxPendingCount = stimulusInbox.pendingCount
         } catch {
             appendEventLog(kind: .error, title: "autonomy_tick failed", body: error.localizedDescription)
+        }
+    }
+
+    func runAutonomyTickForSenseInput(triggerKind: String, now: Date = Date()) async {
+        guard stimulusInbox.sensePacket(for: .autonomyTick, triggerKind: triggerKind, now: now) != nil else {
+            return
+        }
+        await runAutonomyTick()
+    }
+
+    func markMailboxReadInCore(mailboxID: String) async {
+        do {
+            _ = try await brainCore.mailboxMarkRead(mailboxID: mailboxID)
+        } catch {
+            appendEventLog(kind: .error, title: "mailbox_update failed", body: error.localizedDescription)
         }
     }
 
@@ -1545,14 +1826,18 @@ extension AffectiveViewModel {
         guard boredomSenseIsAwake else { return false }
         guard !isHostPipelineRunning, hostPipelineHold == .none, hostPipelineQueue.isEmpty else { return false }
         guard !isAwaitingChatResponse, !speechSpeaker.isSpeaking, !isPoking else { return false }
+        guard !hostIsSociallyEngaged(now: now) else { return false }
         return hostIdleSeconds(now: now) >= waitSeconds
+    }
+
+    func hostIsSociallyEngaged(now: Date = Date()) -> Bool {
+        socialTurnResponseWindowRemainingSeconds(now: now) > 0
+            || counterpartActivityWindowRemainingSeconds(now: now) > 0
     }
 
     func emitBoredomStimulus(waitSeconds: Int, now: Date = Date()) {
         let idleSeconds = hostIdleSeconds(now: now)
         let summary = boredomStimulusSummary(idleSeconds: idleSeconds)
-        let body = boredomStimulusText(idleSeconds: idleSeconds)
-        let context = currentStimulusContext(kind: "boredom", now: now)
         let metadata: [String: String] = [
             "brain": brain.id,
             "stimulus_kind": "boredom",
@@ -1563,7 +1848,7 @@ extension AffectiveViewModel {
         appendEventLog(
             kind: .sent,
             title: "boredom stimulus",
-            body: body,
+            body: summary,
             metadata: metadata
         )
         recordRecentStimulus(
@@ -1572,7 +1857,10 @@ extension AffectiveViewModel {
             metadata: metadata,
             now: now
         )
-        enqueueHostPipelineAction(.boredomStimulus(text: body, stimulusContext: context))
+        Task {
+            await runAutonomyTickForSenseInput(triggerKind: "boredom", now: now)
+            recordHostStimulus()
+        }
     }
 
     func boredomStimulusSummary(idleSeconds: Int) -> String {
@@ -1592,29 +1880,29 @@ extension AffectiveViewModel {
         if let mode = controlModel["mode"]?.stringValue {
             autonomyMode = Self.normalizeAutonomyMode(mode)
         }
-        if case .number(let value) = controlModel["control_capacity"] {
-            autonomyControlCapacity = max(0, value)
-        }
-        if case .number(let value) = controlModel["max_capacity"] {
-            autonomyMaxCapacity = max(0.01, value)
-        }
-        if case .number(let value) = controlModel["replenish_points_per_minute"] {
-            autonomyReplenishPointsPerMinute = max(0, value)
+        if let blockedReason = controlModel["blocked_reason"]?.stringValue {
+            autonomyControlBlockedReason = blockedReason
         } else {
-            autonomyReplenishPointsPerMinute = 0
+            autonomyControlBlockedReason = "none"
         }
-        if case .number(let value) = controlModel["last_capacity_replenish_at"] {
-            autonomyLastCapacityReplenishAt = Date(timeIntervalSince1970: value)
-        } else if autonomyIsEnabled, effectiveAutonomyReplenishPointsPerMinute > 0 {
-            autonomyLastCapacityReplenishAt = Date()
-        } else {
-            autonomyLastCapacityReplenishAt = nil
-        }
+        syncInnerStateSummary()
     }
 
 }
 
 private extension HostPipelineAction {
+    var isSocialSenseInput: Bool {
+        switch self {
+        case .typedText, .imageText, .interrupt:
+            return true
+        case .coreTouch, .pokeSequence:
+            return true
+        case .pullSenseRequest, .pushedMotionGesture, .boredomStimulus,
+             .refreshBrainState, .collectMailbox, .mailboxMarkRead:
+            return false
+        }
+    }
+
     var presentsChatResponse: Bool {
         switch self {
         case .typedText, .imageText:
@@ -1635,7 +1923,7 @@ private extension HostPipelineAction {
         case .interrupt:
             return "interrupt"
         case .typedText:
-            return "experience:user_message"
+            return "experience:counterpart_speech"
         case .imageText:
             return "image_text"
         case .pullSenseRequest(let event, _):
@@ -1655,6 +1943,26 @@ private extension HostPipelineAction {
         case .mailboxMarkRead:
             return "mailbox_mark_read"
         }
+    }
+}
+
+extension AffectiveViewModel {
+    func installHostLLMCompletionObserver() {
+        BrainHostServiceRoutes.llmCompletionObserver = { [weak self] observation in
+            guard let self else { return }
+            Task { @MainActor in
+                self.recordHostLLMCompletion(observation)
+            }
+        }
+    }
+
+    func recordHostLLMCompletion(_ observation: HostLLMCompletionObservation) {
+        appendEventLog(
+            kind: .process,
+            title: "llm complete",
+            body: observation.eventLogBody,
+            metadata: observation.eventLogMetadata
+        )
     }
 }
 

@@ -28,18 +28,12 @@ struct ComposerPanel: View {
 
     var body: some View {
         VStack(spacing: isCompact ? 6 : 8) {
-            if showsInlineAutonomy {
-                InlineAutonomyControls(model: model, isCompact: isCompact)
-            }
-
             HStack(alignment: .center, spacing: isCompact ? 6 : 8) {
                 if isCompact {
                     PokeButton(model: model)
                 } else {
                     WakeButton(model: model, size: controlSize)
                 }
-
-                BrainVoiceToggleButton(model: model)
 
                 photoButton
 
@@ -171,10 +165,6 @@ struct ComposerPanel: View {
 
     var controlSize: CGFloat {
         isCompact ? 34 : 36
-    }
-
-    var showsInlineAutonomy: Bool {
-        !isCompact || !composerFocused.wrappedValue
     }
 
     func submitMessage() {

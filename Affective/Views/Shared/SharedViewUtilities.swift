@@ -131,52 +131,6 @@ struct CompactStatusPill: View {
     }
 }
 
-struct AutonomyCapacityRing: View {
-    let fraction: Double
-    var size: CGFloat = 28
-    var lineWidth: CGFloat = 3
-
-    var body: some View {
-        ZStack {
-            Circle()
-                .stroke(AppTheme.separator.opacity(0.9), lineWidth: lineWidth)
-            Circle()
-                .trim(from: 0, to: min(max(fraction, 0), 1))
-                .stroke(
-                    AppTheme.accent,
-                    style: StrokeStyle(lineWidth: lineWidth, lineCap: .round)
-                )
-                .rotationEffect(.degrees(-90))
-                .animation(.linear(duration: 0.25), value: fraction)
-            Text("\(Int((fraction * 100).rounded()))")
-                .font(.system(size: 9, weight: .bold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(AppTheme.secondaryText)
-                .minimumScaleFactor(0.7)
-        }
-        .frame(width: size, height: size)
-        .accessibilityElement(children: .ignore)
-    }
-}
-
-struct AnimatedAutonomyCapacityRing: View {
-    @ObservedObject var model: AffectiveViewModel
-
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !shouldAnimate)) { context in
-            let fraction = model.autonomyCapacityFraction(at: context.date)
-            AutonomyCapacityRing(fraction: fraction)
-                .accessibilityLabel("Autonomy control capacity \(model.autonomyCapacityPercentText(at: context.date))")
-        }
-    }
-
-    private var shouldAnimate: Bool {
-        model.autonomyIsEnabled
-            && model.effectiveAutonomyReplenishPointsPerMinute > 0
-            && model.autonomyCapacityFraction(at: Date()) < 0.999
-    }
-}
-
 struct CompactIconStatusPill: View {
     let text: String
     let systemImage: String
@@ -310,7 +264,11 @@ struct CoreConnectingScreen: View {
                             .multilineTextAlignment(.center)
                     }
 
-                    Text("\(HeaderStrip.hostName) - connecting")
+                    Text(
+                        model.isDreamTimeInFlight
+                            ? "\(HeaderStrip.hostName) - dreaming"
+                            : "\(HeaderStrip.hostName) - connecting"
+                    )
                         .font(.callout)
                         .foregroundStyle(AppTheme.secondaryText)
                 }
@@ -332,6 +290,104 @@ struct CoreConnectingScreen: View {
             parts.append(model.coreLoadProgressDetail)
         }
         return parts.joined(separator: ", ")
+    }
+}
+
+struct HostPipelineDeadlockOverlay: View {
+    let deadlock: HostPipelineDeadlock
+    var onDismiss: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.82)
+                .ignoresSafeArea()
+
+            VStack(spacing: 22) {
+                DeadlockMark()
+                    .frame(width: 120, height: 120)
+                    .accessibilityHidden(true)
+
+                VStack(spacing: 8) {
+                    Text("Host Pipeline Deadlock")
+                        .font(.title2.weight(.bold))
+                        .foregroundStyle(.white)
+
+                    Text(deadlock.title)
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.95))
+                        .multilineTextAlignment(.center)
+
+                    Text(deadlock.detail)
+                        .font(.body)
+                        .foregroundStyle(.white.opacity(0.82))
+                        .multilineTextAlignment(.center)
+                }
+
+                if !deadlock.sortedDiagnostics.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Diagnostics")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.white.opacity(0.7))
+                            .textCase(.uppercase)
+
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(deadlock.sortedDiagnostics, id: \.key) { item in
+                                    HStack(alignment: .top, spacing: 10) {
+                                        Text(item.key)
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.white.opacity(0.62))
+                                            .frame(width: 180, alignment: .leading)
+                                        Text(item.value)
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.white.opacity(0.92))
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                            }
+                        }
+                        .frame(maxHeight: 180)
+                    }
+                    .padding(14)
+                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(.white.opacity(0.12))
+                    )
+                }
+
+                Text(deadlock.kind.rawValue.replacingOccurrences(of: "_", with: " "))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.red.opacity(0.9))
+
+                Button("Dismiss Overlay", action: onDismiss)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                    .controlSize(.large)
+            }
+            .padding(28)
+            .frame(maxWidth: 520)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Host pipeline deadlock. \(deadlock.title). \(deadlock.detail)")
+    }
+}
+
+private struct DeadlockMark: View {
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.red.opacity(0.28), lineWidth: 8)
+
+            Path { path in
+                let inset: CGFloat = 28
+                path.move(to: CGPoint(x: inset, y: inset))
+                path.addLine(to: CGPoint(x: 120 - inset, y: 120 - inset))
+                path.move(to: CGPoint(x: 120 - inset, y: inset))
+                path.addLine(to: CGPoint(x: inset, y: 120 - inset))
+            }
+            .stroke(Color.red, style: StrokeStyle(lineWidth: 14, lineCap: .round))
+        }
     }
 }
 

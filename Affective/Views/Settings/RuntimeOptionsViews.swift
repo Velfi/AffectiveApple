@@ -40,62 +40,72 @@ struct OptionsView: View {
 
     var regularBody: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Settings")
-                                .font(.system(size: 30, weight: .semibold, design: .rounded))
+            ScrollViewReader { scrollProxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Settings")
+                                    .font(.system(size: 30, weight: .semibold, design: .rounded))
 
-                            Text("Brain settings travel with the selected brain. Host settings belong to this Mac and include provider account links.")
-                                .font(.callout)
-                                .foregroundStyle(AppTheme.secondaryText)
-                                .fixedSize(horizontal: false, vertical: true)
+                                Text("Brain settings travel with the selected brain. Host settings belong to this Mac and include provider account links.")
+                                    .font(.callout)
+                                    .foregroundStyle(AppTheme.secondaryText)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Scope")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(AppTheme.secondaryText)
+
+                                settingsScopePicker
+                                    .frame(maxWidth: 460)
+
+                                Text("Switch between brain-specific options and host credentials without losing your place.")
+                                    .font(.caption)
+                                    .foregroundStyle(AppTheme.secondaryText)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(14)
+                            .background(AppTheme.controlBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .stroke(AppTheme.separator)
+                            )
                         }
 
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("Scope")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(AppTheme.secondaryText)
+                        Text("Live changes apply at the next safe point. Restart-required changes are saved now and used after the next launch.")
+                            .font(.caption)
+                            .foregroundStyle(AppTheme.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, 2)
 
-                            settingsScopePicker
-                                .frame(maxWidth: 460)
+                        avatarEditorButton
 
-                            Text("Switch between brain-specific options and host credentials without losing your place.")
-                                .font(.caption)
-                                .foregroundStyle(AppTheme.secondaryText)
-                                .fixedSize(horizontal: false, vertical: true)
+                        if model.selectedSettingsScope == .brain {
+                            BiometricPolicyCard(model: model)
                         }
-                        .padding(14)
-                        .background(AppTheme.controlBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .stroke(AppTheme.separator)
-                        )
+
+                        DonationSupportCard()
+
+                        ForEach(model.optionGroups.indices.filter { model.optionGroups[$0].scope == model.selectedSettingsScope }, id: \.self) { index in
+                            RuntimeOptionGroupView(model: model, group: $model.optionGroups[index])
+                                .id(model.optionGroups[index].title)
+                        }
                     }
-
-                    Text("Live changes apply at the next safe point. Restart-required changes are saved now and used after the next launch.")
-                        .font(.caption)
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal, 2)
-
-                    avatarEditorButton
-
-                    if model.selectedSettingsScope == .brain {
-                        BiometricPolicyCard(model: model)
-                    }
-
-                    DonationSupportCard()
-
-                    ForEach(model.optionGroups.indices.filter { model.optionGroups[$0].scope == model.selectedSettingsScope }, id: \.self) { index in
-                        RuntimeOptionGroupView(model: model, group: $model.optionGroups[index])
-                    }
+                    .padding(horizontalSizeClass == .compact ? 18 : 32)
+                    .padding(.bottom, 10)
+                    .frame(maxWidth: 960, alignment: .leading)
+                    .frame(maxWidth: .infinity)
                 }
-                .padding(horizontalSizeClass == .compact ? 18 : 32)
-                .padding(.bottom, 10)
-                .frame(maxWidth: 960, alignment: .leading)
-                .frame(maxWidth: .infinity)
+                .onAppear { scrollToFocusedSettingsGroup(using: scrollProxy) }
+                .onChange(of: model.focusedSettingsGroupTitle) { _, _ in
+                    scrollToFocusedSettingsGroup(using: scrollProxy)
+                }
+                .onChange(of: model.selectedSettingsScope) { _, _ in
+                    scrollToFocusedSettingsGroup(using: scrollProxy)
+                }
             }
 
             Divider()
@@ -110,45 +120,55 @@ struct OptionsView: View {
 
     var compactBody: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    HeaderStrip(model: model)
-                        .panelStyle()
+            ScrollViewReader { scrollProxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HeaderStrip(model: model)
+                            .panelStyle()
 
-                    HStack(alignment: .firstTextBaseline, spacing: 10) {
-                        Text("Settings")
-                            .font(.system(size: 23, weight: .semibold, design: .rounded))
-                            .lineLimit(1)
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Text("Settings")
+                                .font(.system(size: 23, weight: .semibold, design: .rounded))
+                                .lineLimit(1)
 
-                        Spacer(minLength: 8)
+                            Spacer(minLength: 8)
 
-                        CompactStatusPill(text: compactDirtyText)
-                            .accessibilityLabel(model.dirtyOptionCount == 0 ? "No unsaved changes" : "\(model.dirtyOptionCount) unsaved changes")
+                            CompactStatusPill(text: compactDirtyText)
+                                .accessibilityLabel(model.dirtyOptionCount == 0 ? "No unsaved changes" : "\(model.dirtyOptionCount) unsaved changes")
+                        }
+
+                        settingsScopePicker
+
+                        Text("Changes apply at the next safe point. Restart-marked settings take effect after relaunch.")
+                            .font(.caption)
+                            .foregroundStyle(AppTheme.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        avatarEditorButton
+
+                        if model.selectedSettingsScope == .brain {
+                            BiometricPolicyCard(model: model)
+                        }
+
+                        DonationSupportCard()
+
+                        ForEach(model.optionGroups.indices.filter { model.optionGroups[$0].scope == model.selectedSettingsScope }, id: \.self) { index in
+                            RuntimeOptionGroupView(model: model, group: $model.optionGroups[index])
+                                .id(model.optionGroups[index].title)
+                        }
                     }
-
-                    settingsScopePicker
-
-                    Text("Changes apply at the next safe point. Restart-marked settings take effect after relaunch.")
-                        .font(.caption)
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    avatarEditorButton
-
-                    if model.selectedSettingsScope == .brain {
-                        BiometricPolicyCard(model: model)
-                    }
-
-                    DonationSupportCard()
-
-                    ForEach(model.optionGroups.indices.filter { model.optionGroups[$0].scope == model.selectedSettingsScope }, id: \.self) { index in
-                        RuntimeOptionGroupView(model: model, group: $model.optionGroups[index])
-                    }
+                    .padding(.horizontal, 14)
+                    .padding(.top, 14)
+                    .padding(.bottom, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(.horizontal, 14)
-                .padding(.top, 14)
-                .padding(.bottom, 10)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .onAppear { scrollToFocusedSettingsGroup(using: scrollProxy) }
+                .onChange(of: model.focusedSettingsGroupTitle) { _, _ in
+                    scrollToFocusedSettingsGroup(using: scrollProxy)
+                }
+                .onChange(of: model.selectedSettingsScope) { _, _ in
+                    scrollToFocusedSettingsGroup(using: scrollProxy)
+                }
             }
             .frame(maxHeight: .infinity)
             .layoutPriority(1)
@@ -190,6 +210,15 @@ struct OptionsView: View {
 
     var compactDirtyText: String {
         model.dirtyOptionCount == 0 ? "Saved" : "\(model.dirtyOptionCount)"
+    }
+
+    func scrollToFocusedSettingsGroup(using scrollProxy: ScrollViewProxy) {
+        guard let groupTitle = model.focusedSettingsGroupTitle else { return }
+        DispatchQueue.main.async {
+            withAnimation(.smooth(duration: 0.22)) {
+                scrollProxy.scrollTo(groupTitle, anchor: .top)
+            }
+        }
     }
 }
 
@@ -297,7 +326,7 @@ struct BiometricPolicyCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "person.crop.circle.badge.shield.checkmark")
+                Image(systemName: "person.crop.circle.badge.checkmark")
                     .font(.system(size: 22, weight: .semibold))
                     .foregroundStyle(AppTheme.accent)
 

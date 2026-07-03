@@ -27,6 +27,8 @@ struct EventFilterBar: View {
             HStack(spacing: 10) {
                 searchField
                 kindPicker
+                sortPicker
+                clearButton
                 copyLogButton
             }
 
@@ -34,6 +36,8 @@ struct EventFilterBar: View {
                 searchField
                 HStack(spacing: 10) {
                     kindPicker
+                    sortPicker
+                    clearButton
                     copyLogButton
                 }
             }
@@ -59,6 +63,44 @@ struct EventFilterBar: View {
         .tint(AppTheme.primaryText)
         .frame(width: 132)
         .optionFieldStyle(isDirty: model.selectedEventKind != nil)
+    }
+
+    var sortPicker: some View {
+        Picker("Sort", selection: $model.developerEventSort) {
+            ForEach(DeveloperEventSort.allCases) { sort in
+                Label(sort.rawValue, systemImage: sort.systemImage).tag(sort)
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .tint(AppTheme.primaryText)
+        .frame(width: 116)
+        .optionFieldStyle(isDirty: model.developerEventSort != .newestFirst)
+        .help("Change event order")
+    }
+
+    @ViewBuilder
+    var clearButton: some View {
+        if model.selectedEventKind != nil || !model.eventSearchText.isEmpty {
+            Button {
+                model.eventSearchText = ""
+                model.selectedEventKind = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.bold))
+                    .frame(width: 17, height: 17)
+                    .hitTarget(34)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(AppTheme.secondaryText)
+            .background(AppTheme.editorBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(AppTheme.separator)
+            )
+            .help("Clear event filters")
+            .accessibilityLabel("Clear event filters")
+        }
     }
 
     var copyLogButton: some View {
@@ -106,6 +148,7 @@ struct EventFilterBar: View {
 
 struct KnowledgeFilterBar: View {
     @ObservedObject var model: AffectiveViewModel
+    var filteredCount: Int?
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -128,11 +171,12 @@ struct KnowledgeFilterBar: View {
     }
 
     var countPill: some View {
-        CompactIconStatusPill(
-            text: "\(model.filteredKnowledgeEntries.count)",
+        let count = filteredCount ?? model.filteredKnowledgeEntries.count
+        return CompactIconStatusPill(
+            text: "\(count)",
             systemImage: "line.3.horizontal.decrease.circle"
         )
-        .accessibilityLabel("\(model.filteredKnowledgeEntries.count) filtered knowledge entries")
+        .accessibilityLabel("\(count) filtered knowledge entries")
     }
 }
 
@@ -180,6 +224,161 @@ struct LogHeader: View {
         }
         let count = model.visibleEntryCount
         return "\(count) \(count == 1 ? "entry" : "entries")"
+    }
+}
+
+struct LogEntryCardModel {
+    struct Fact: Identifiable, Equatable {
+        let key: String
+        let value: String
+
+        var id: String { "\(key)=\(value)" }
+    }
+
+    let entry: LogEntry
+    let headline: String
+    let badgeText: String
+    let preview: String
+    let primaryFacts: [Fact]
+    let relatedFacts: [Fact]
+    let detailFacts: [Fact]
+
+    init(entry: LogEntry) {
+        self.entry = entry
+        badgeText = entry.kind.rawValue.uppercased()
+        headline = Self.headline(for: entry)
+        preview = Self.preview(for: entry)
+        primaryFacts = Self.facts(for: entry, keys: Self.primaryFactKeys, limit: 5)
+        relatedFacts = Self.facts(for: entry, keys: Self.relatedFactKeys, limit: nil)
+        let promotedKeys = Set(Self.primaryFactKeys + Self.relatedFactKeys + Self.mediaFactKeys)
+        detailFacts = entry.metadata
+            .filter { key, value in
+                !promotedKeys.contains(key) && !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+            .map { Fact(key: $0.key, value: $0.value) }
+    }
+
+    var bodyText: String {
+        let trimmed = entry.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "No payload body." : entry.body
+    }
+
+    var rowFactSummary: String {
+        let facts = primaryFacts.prefix(3)
+        guard !facts.isEmpty else { return entry.kind.rawValue.optionDisplayName }
+        return facts.map { "\($0.key)=\($0.value)" }.joined(separator: "  ")
+    }
+
+    var mediaFacts: [Fact] {
+        Self.facts(for: entry, keys: Self.mediaFactKeys, limit: nil)
+    }
+
+    static let primaryFactKeys = [
+        "event_type",
+        "kind",
+        "capability",
+        "sense",
+        "status",
+        "presentation",
+        "visibility",
+        "role",
+    ]
+
+    static let relatedFactKeys = [
+        "event_id",
+        "request_id",
+        "turn_id",
+        "expression_id",
+        "sense_id",
+    ]
+
+    static let mediaFactKeys = [
+        "media_kind",
+        "image_path",
+        "image_url",
+        "audio_path",
+        "audio_url",
+        "path",
+        "url",
+        "mime_type",
+    ]
+
+    static func headline(for entry: LogEntry) -> String {
+        let eventType = entry.metadata["event_type"] ?? ""
+        let title = entry.title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if eventType == "developer_log", title.hasPrefix("turn.") {
+            let step = title.dropFirst("turn.".count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "_", with: " ")
+            return step.isEmpty ? "Turn process update" : "Turn: \(step.optionDisplayName)"
+        }
+
+        switch eventType {
+        case "sense_request":
+            let sense = entry.metadata["sense"] ?? entry.metadata["sense_id"]
+            return sense.map { "\($0.optionDisplayName) sense requested" } ?? "Host sense requested"
+        case "capability_request":
+            let capability = entry.metadata["capability"] ?? title
+            return "\(capability.optionDisplayName) requested"
+        case "attention_state":
+            return "Attention state updated"
+        case "memory_mutation":
+            return "Memory updated"
+        case "memory_result":
+            return "Memory result"
+        case "expression":
+            if let modality = entry.metadata["modality"], !modality.isEmpty {
+                return "\(modality.optionDisplayName) expression emitted"
+            }
+            return "Expression emitted"
+        case "control":
+            return "Control state changed"
+        case "mise_en_scene":
+            return "Scene updated"
+        case "error":
+            return title.isEmpty ? "Core error" : title
+        default:
+            if !title.isEmpty {
+                return title
+            }
+            if !eventType.isEmpty {
+                return eventType.optionDisplayName
+            }
+            return entry.kind.rawValue.optionDisplayName
+        }
+    }
+
+    static func preview(for entry: LogEntry) -> String {
+        let body = entry.body
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !body.isEmpty {
+            return body
+        }
+
+        for key in ["reason", "status", "capability", "sense", "request_id"] {
+            if let value = entry.metadata[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return "\(key)=\(value)"
+            }
+        }
+        return "No payload preview."
+    }
+
+    static func facts(for entry: LogEntry, keys: [String], limit: Int?) -> [Fact] {
+        var facts: [Fact] = []
+        for key in keys {
+            guard let value = entry.metadata[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty else {
+                continue
+            }
+            facts.append(Fact(key: key, value: value))
+            if let limit, facts.count >= limit {
+                break
+            }
+        }
+        return facts
     }
 }
 
@@ -234,12 +433,16 @@ struct EntriesList: View {
 struct DeveloperConsoleList: View {
     let entries: [LogEntry]
     let emptyTitle: String
+    var selectedEntryID: LogEntry.ID?
+    var onSelect: (LogEntry) -> Void = { _ in }
 
     var body: some View {
         CompactActivityList(
             entries: entries,
             emptyTitle: emptyTitle,
-            emptySystemImage: "terminal"
+            emptySystemImage: "terminal",
+            selectedEntryID: selectedEntryID,
+            onSelect: onSelect
         )
     }
 }
@@ -248,63 +451,95 @@ struct CompactActivityList: View {
     let entries: [LogEntry]
     let emptyTitle: String
     var emptySystemImage = "tray"
+    var selectedEntryID: LogEntry.ID?
+    var displayLimit = AffectiveViewModel.visibleLogEntryLimit
+    var onSelect: (LogEntry) -> Void = { _ in }
 
     var body: some View {
-        ScrollViewReader { reader in
-            ScrollView {
-                LazyVStack(spacing: 1) {
-                    if entries.isEmpty {
-                        EmptyStateCard(title: emptyTitle, systemImage: emptySystemImage)
-                            .padding(.top, 48)
-                            .frame(maxWidth: .infinity)
-                    } else {
-                        ForEach(entries) { entry in
-                            CompactActivityRow(entry: entry)
-                                .id(entry.id)
-                        }
+        let visibleEntries = entries.prefix(displayLimit)
+
+        ScrollView {
+            LazyVStack(spacing: 1) {
+                if entries.isEmpty {
+                    EmptyStateCard(title: emptyTitle, systemImage: emptySystemImage)
+                        .padding(.top, 48)
+                        .frame(maxWidth: .infinity)
+                } else {
+                    ForEach(visibleEntries) { entry in
+                        CompactActivityRow(
+                            entry: entry,
+                            isSelected: selectedEntryID == entry.id,
+                            onSelect: { onSelect(entry) }
+                        )
+                    }
+
+                    if visibleEntries.count < entries.count {
+                        LogListLimitRow(shownCount: visibleEntries.count, totalCount: entries.count)
                     }
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 10)
             }
-            .onChange(of: entries.count) { _, _ in
-                guard let last = entries.last else { return }
-                withAnimation(.smooth(duration: 0.22)) {
-                    reader.scrollTo(last.id, anchor: .bottom)
-                }
-            }
-            .onAppear {
-                if let last = entries.last {
-                    reader.scrollTo(last.id, anchor: .bottom)
-                }
-            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 10)
         }
+    }
+}
+
+struct LogListLimitRow: View {
+    let shownCount: Int
+    let totalCount: Int
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "line.3.horizontal.decrease.circle")
+                .font(.caption.weight(.semibold))
+            Text("\(shownCount) of \(totalCount) shown")
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.82)
+        }
+        .foregroundStyle(AppTheme.secondaryText)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 12)
+        .accessibilityLabel("\(shownCount) of \(totalCount) log entries shown")
     }
 }
 
 struct CompactActivityRow: View {
     let entry: LogEntry
-    @State private var didCopy = false
+    let card: LogEntryCardModel
+    var isSelected = false
+    var onSelect: () -> Void = {}
+
+    init(
+        entry: LogEntry,
+        isSelected: Bool = false,
+        onSelect: @escaping () -> Void = {}
+    ) {
+        self.entry = entry
+        self.card = LogEntryCardModel(entry: entry)
+        self.isSelected = isSelected
+        self.onSelect = onSelect
+    }
 
     var body: some View {
         Button {
-            copyEntry()
+            onSelect()
         } label: {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 5) {
                 HStack(alignment: .firstTextBaseline, spacing: 7) {
                     Text(entry.createdAt, format: .dateTime.hour().minute().second())
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(AppTheme.secondaryText)
                         .frame(width: 58, alignment: .leading)
 
-                    Text(entry.kind.rawValue.uppercased())
+                    Text(card.badgeText)
                         .font(.system(size: 9, weight: .bold, design: .rounded))
                         .foregroundStyle(entry.kind.badgeForeground)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
                         .background(entry.kind.badgeBackground, in: Capsule())
 
-                    Text(entry.title)
+                    Text(card.headline)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(AppTheme.primaryText)
                         .lineLimit(1)
@@ -312,56 +547,199 @@ struct CompactActivityRow: View {
 
                     Spacer(minLength: 6)
 
-                    Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                    Image(systemName: "sidebar.right")
                         .font(.caption2.weight(.bold))
-                        .foregroundStyle(didCopy ? AppTheme.accent : AppTheme.secondaryText.opacity(0.75))
+                        .foregroundStyle(isSelected ? AppTheme.accent : AppTheme.secondaryText.opacity(0.75))
                 }
 
-                if !entry.body.isEmpty {
-                    Text(entry.body)
-                        .font(.system(size: 12, weight: .regular, design: .monospaced))
-                        .foregroundStyle(AppTheme.primaryText.opacity(0.88))
-                        .lineLimit(4)
-                        .textSelection(.enabled)
-                }
+                Text(card.rowFactSummary)
+                    .font(.system(size: 10, weight: .regular, design: .monospaced))
+                    .foregroundStyle(AppTheme.secondaryText.opacity(0.86))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
 
-                if !entry.metadata.isEmpty {
-                    Text(metadataSummary)
-                        .font(.system(size: 10, weight: .regular, design: .monospaced))
-                        .foregroundStyle(AppTheme.secondaryText.opacity(0.82))
-                        .lineLimit(2)
-                        .truncationMode(.middle)
-                }
+                Text(card.preview)
+                    .font(.system(size: 12, weight: .regular, design: .monospaced))
+                    .foregroundStyle(AppTheme.primaryText.opacity(0.86))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
-            .background(entry.kind.entryBackground.opacity(0.74), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .background(
+                isSelected ? AppTheme.activePanelBackground : entry.kind.entryBackground.opacity(0.74),
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
             .overlay(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .stroke(.white.opacity(0.055))
+                    .stroke(isSelected ? AppTheme.accent.opacity(0.5) : .white.opacity(0.055))
             )
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(entry.kind.rawValue) \(entry.title)")
-        .accessibilityHint("Copies this log entry")
+        .accessibilityHint("Inspect this log entry")
+    }
+}
+
+struct LogEntryInspector: View {
+    let entry: LogEntry?
+    var brainRootURL: URL?
+    var emptyTitle = "Select an entry to inspect it."
+    @State private var didCopy = false
+
+    var body: some View {
+        Group {
+            if let entry {
+                inspectorContent(entry)
+            } else {
+                EmptyStateCard(title: emptyTitle, systemImage: "sidebar.right")
+                    .padding(18)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }
+        }
+        .background(AppTheme.controlBackground)
     }
 
-    var metadataSummary: String {
-        entry.metadata
-            .sorted { $0.key < $1.key }
-            .map { "\($0.key)=\($0.value)" }
-            .joined(separator: "  ")
+    func inspectorContent(_ entry: LogEntry) -> some View {
+        let card = LogEntryCardModel(entry: entry)
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                eventSummarySection(card)
+
+                eventPayloadSection(card)
+
+                if let attachment = thumbnailAttachment(for: entry) {
+                    EventImageThumbnailView(attachment: attachment)
+                        .panelStyle()
+                }
+
+                if !card.relatedFacts.isEmpty {
+                    eventFactSection(title: "Related IDs", facts: card.relatedFacts)
+                }
+
+                if !card.mediaFacts.isEmpty {
+                    eventFactSection(title: "Media", facts: card.mediaFacts)
+                }
+
+                if !card.detailFacts.isEmpty {
+                    DisclosureGroup {
+                        eventFactFlow(card.detailFacts)
+                            .padding(.top, 8)
+                    } label: {
+                        Text("Raw Metadata")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(AppTheme.secondaryText)
+                            .textCase(.uppercase)
+                    }
+                    .panelStyle()
+                }
+            }
+            .padding(16)
+        }
     }
 
-    func copyEntry() {
-        let text = entry.copyText
+    func eventSummarySection(_ card: LogEntryCardModel) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                Text(card.badgeText)
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(card.entry.kind.badgeForeground)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(card.entry.kind.badgeBackground, in: Capsule())
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(card.headline)
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(AppTheme.primaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(card.entry.createdAt, format: .dateTime.month().day().hour().minute().second())
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+
+                Spacer(minLength: 8)
+
+                Button {
+                    copyEntry(card.entry)
+                } label: {
+                    Label(didCopy ? "Copied" : "Copy", systemImage: didCopy ? "checkmark" : "doc.on.doc")
+                        .labelStyle(.titleAndIcon)
+                        .lineLimit(1)
+                }
+                .buttonStyle(.borderless)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(didCopy ? AppTheme.accent : AppTheme.secondaryText)
+            }
+
+            Text(card.preview)
+                .font(.system(.callout, design: .monospaced))
+                .foregroundStyle(AppTheme.primaryText.opacity(0.9))
+                .lineLimit(3)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if !card.primaryFacts.isEmpty {
+                eventFactFlow(card.primaryFacts)
+            }
+        }
+        .panelStyle()
+    }
+
+    func eventPayloadSection(_ card: LogEntryCardModel) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Payload")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(AppTheme.secondaryText)
+                .textCase(.uppercase)
+
+            Text(card.bodyText)
+                .font(.system(.callout, design: .monospaced))
+                .foregroundStyle(AppTheme.primaryText)
+                .textSelection(.enabled)
+                .lineSpacing(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .panelStyle()
+    }
+
+    func eventFactSection(title: String, facts: [LogEntryCardModel.Fact]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(AppTheme.secondaryText)
+                .textCase(.uppercase)
+
+            eventFactFlow(facts)
+        }
+        .panelStyle()
+    }
+
+    func eventFactFlow(_ facts: [LogEntryCardModel.Fact]) -> some View {
+        FlowLayout(spacing: 6) {
+            ForEach(facts) { fact in
+                MetadataChip(key: fact.key, value: fact.value)
+            }
+        }
+    }
+
+    func thumbnailAttachment(for entry: LogEntry) -> ChatMediaAttachment? {
+        guard let brainRootURL else { return nil }
+        return ChatMediaAttachment.attachments(for: entry, brainRootURL: brainRootURL)
+            .first { attachment in
+                guard attachment.kind == .image, let url = attachment.url else { return false }
+                return !url.isFileURL || FileManager.default.fileExists(atPath: url.path)
+            }
+    }
+
+    func copyEntry(_ entry: LogEntry) {
         #if os(macOS)
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        pasteboard.setString(entry.copyText, forType: .string)
         #elseif canImport(UIKit)
-        UIPasteboard.general.string = text
+        UIPasteboard.general.string = entry.copyText
         #endif
         didCopy = true
         Task { @MainActor in
@@ -375,6 +753,7 @@ struct ChatTranscriptView: View {
     let entries: [LogEntry]
     let brainRootURL: URL
     var isResponding = false
+    var statusText = "Thinking"
     var onReactToBrainUtterance: ((UUID, String) -> Void)? = nil
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     private let typingIndicatorID = "chat-typing-indicator"
@@ -399,7 +778,7 @@ struct ChatTranscriptView: View {
                     }
 
                     if isResponding {
-                        TypingIndicatorBubble()
+                        TypingIndicatorBubble(statusText: statusText)
                             .id(typingIndicatorID)
                             .transition(.opacity.combined(with: .move(edge: .bottom)))
                     }
@@ -439,6 +818,7 @@ struct ChatTranscriptView: View {
 }
 
 struct TypingIndicatorBubble: View {
+    let statusText: String
     @State private var isAnimating = false
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -447,10 +827,11 @@ struct TypingIndicatorBubble: View {
             avatar
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Affective")
+                Text(displayStatusText)
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(AppTheme.secondaryText)
                     .padding(.horizontal, 4)
+                    .animation(.smooth(duration: 0.2), value: displayStatusText)
 
                 HStack(spacing: 5) {
                     ForEach(0..<3, id: \.self) { index in
@@ -471,7 +852,7 @@ struct TypingIndicatorBubble: View {
                 .padding(.vertical, 12)
                 .background(AppTheme.messageIncoming, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .accessibilityElement(children: .ignore)
-                .accessibilityLabel("Affective is thinking")
+                .accessibilityLabel(displayStatusText)
             }
             .frame(maxWidth: horizontalSizeClass == .compact ? nil : 560, alignment: .leading)
 
@@ -480,6 +861,11 @@ struct TypingIndicatorBubble: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .onAppear { isAnimating = true }
         .onDisappear { isAnimating = false }
+    }
+
+    var displayStatusText: String {
+        let trimmed = statusText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Thinking" : trimmed
     }
 
     var avatar: some View {

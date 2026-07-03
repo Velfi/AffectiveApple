@@ -8,6 +8,12 @@ enum LlmTesterRunner {
         return try JSONDecoder().decode(LlmTesterManifest.self, from: data)
     }
 
+    static func loadSnapshotSummary(at path: String) throws -> E2ESnapshotRunSummary {
+        let url = URL(fileURLWithPath: path)
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(E2ESnapshotRunSummary.self, from: data)
+    }
+
     static func makeClient(preference: HostTextProviderPreference) throws -> HostLLMCompletionClient {
         let store = KeychainCredentialStore()
         let keys = ProviderCredentialKey.credentialKeys(for: preference)
@@ -33,15 +39,32 @@ enum LlmTesterRunner {
         HostResponseFormat(rawValue: scenario.responseFormat) ?? .text
     }
 
+    static func makeImageClient() throws -> HostImageGenerationClient {
+        let store = KeychainCredentialStore()
+        let credentials = ProviderCredentialKey.resolvedCredentials(using: store, keys: [.google])
+        return HostImageGenerationClient(
+            providerRouter: HostProviderRouter(
+                credentialProvider: { credentials }
+            )
+        )
+    }
+
     static func run(
         manifest: LlmTesterManifest,
         client: HostLLMCompletionClient,
         providerPreference: HostTextProviderPreference
     ) async -> LlmTesterRunSummary {
+        let imageClient: HostImageGenerationClient? = manifest.scenarios.contains(where: { $0.responseFormat == "image_generation" })
+            ? (try? makeImageClient())
+            : nil
         var results: [LlmTesterScenarioResult] = []
         results.reserveCapacity(manifest.scenarios.count)
 
         for scenario in manifest.scenarios {
+            if scenario.responseFormat == "image_generation" {
+                results.append(await runImageGeneration(scenario: scenario, client: imageClient))
+                continue
+            }
             let responseFormat = hostResponseFormat(for: scenario)
             let combinedPrompt = HostPromptBuilder.combinedPrompt(
                 for: HostLLMPromptInput(
@@ -123,6 +146,81 @@ enum LlmTesterRunner {
             failed: results.count - succeeded,
             results: results
         )
+    }
+
+    private static func runImageGeneration(
+        scenario: LlmTesterScenario,
+        client: HostImageGenerationClient?
+    ) async -> LlmTesterScenarioResult {
+        let started = Date()
+        guard let client else {
+            return LlmTesterScenarioResult(
+                scenario: scenario,
+                combinedPrompt: scenario.userPrompt,
+                provider: nil,
+                durationMs: Int(Date().timeIntervalSince(started) * 1000),
+                status: "error",
+                rawText: nil,
+                prettyJSON: nil,
+                jsonValid: false,
+                errorMessage: "Image generation client unavailable (missing Google credential)."
+            )
+        }
+
+        do {
+            let outputDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("llm_tester_dream_images", isDirectory: true)
+                .appendingPathComponent(scenario.id, isDirectory: true)
+            try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+            let image = try await client.generate(
+                HostImageGenerationRequest(
+                    prompt: scenario.userPrompt,
+                    outputDirectory: outputDirectory
+                )
+            )
+            let attributes = try FileManager.default.attributesOfItem(atPath: image.path)
+            let byteCount = (attributes[.size] as? NSNumber)?.intValue ?? 0
+            if byteCount <= 0 {
+                throw HostImageGenerationError.invalidImageData
+            }
+            let durationMs = Int(Date().timeIntervalSince(started) * 1000)
+            let summary = "path=\(image.path) mime=\(image.mimeType) bytes=\(byteCount)"
+            let imageDataURL = imageDataURL(forPath: image.path, mimeType: image.mimeType)
+            return LlmTesterScenarioResult(
+                scenario: scenario,
+                combinedPrompt: scenario.userPrompt,
+                provider: ProviderCredentialKey.google.rawValue,
+                durationMs: durationMs,
+                status: "ok",
+                rawText: summary,
+                prettyJSON: nil,
+                jsonValid: true,
+                semanticPassed: true,
+                semanticMessage: nil,
+                errorMessage: nil,
+                imageDataURL: imageDataURL
+            )
+        } catch {
+            let durationMs = Int(Date().timeIntervalSince(started) * 1000)
+            return LlmTesterScenarioResult(
+                scenario: scenario,
+                combinedPrompt: scenario.userPrompt,
+                provider: ProviderCredentialKey.google.rawValue,
+                durationMs: durationMs,
+                status: "error",
+                rawText: nil,
+                prettyJSON: nil,
+                jsonValid: false,
+                errorMessage: String(describing: error)
+            )
+        }
+    }
+
+    private static func imageDataURL(forPath path: String, mimeType: String) -> String? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), !data.isEmpty else {
+            return nil
+        }
+        return "data:\(mimeType);base64,\(data.base64EncodedString())"
     }
 
     private static func validateJSON(text: String, expectsJSON: Bool) -> (jsonValid: Bool, prettyJSON: String?, errorMessage: String?) {

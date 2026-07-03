@@ -4,7 +4,7 @@ Affective should treat AffectiveCore as the durable brain core and Affective as 
 
 The current macOS path can keep using the `affective-core-mcp` stdio process, but that should be one transport adapter under a typed `BrainClient`, not the architecture itself. This is especially important because the iOS version cannot launch or supervise a local stdio helper process.
 
-iOS must work without an Affective remote server. A Mac peer can be useful for handoff, backup, or richer long-running autonomy, but it cannot be required for the iOS app to have a local brain.
+iOS must work without an Affective remote server. A Mac peer can be useful for handoff, backup, or richer long-running background agency, but it cannot be required for the iOS app to have a local brain.
 
 ## Current Shape
 
@@ -260,7 +260,7 @@ Use it for:
 - File upload references.
 - Better crash/restart semantics.
 - Multiple clients, including iOS relay.
-- Background autonomy service.
+- Background attention/agency service.
 
 Recommended route:
 
@@ -306,7 +306,32 @@ Current implementation:
 - `Affective/Core/BrainCore.swift` has the Swift wrapper for that ABI.
 - `Affective.xcodeproj` now has an iOS-only build phase that runs `scripts/build_affective_core.sh`.
 - The build script compiles the Zig static library for `iphoneos` and `iphonesimulator` into DerivedData, including fat simulator archives when needed.
-- Affective links `libaffective-core-embedded.a` and `sqlite3` only for iOS SDKs. macOS continues to use the MCP stdio bridge.
+- Affective links `libaffective-core-embedded.a` and `sqlite3` for iOS SDKs and for the macOS app target that runs the embedded core in-process.
+
+### Embedded host bridge (macOS and iOS current)
+
+Both macOS and iOS product builds now talk to AffectiveCore through the in-process embedded C ABI instead of blocking on synchronous host callbacks during dispatch.
+
+Host HTTP is async at the FFI boundary:
+
+- `http_post_json_begin` starts a host-owned request and returns a `request_id`.
+- `http_post_json_poll` returns `pending`, `complete`, or `failed` until the host finishes the work.
+- `free_string` releases copied FFI strings.
+
+While a dispatch holds the core `dispatch_mutex` for CPU-bound work, the core can still accept queueable operations and return immediate ack envelopes (`stimulus_queued`, `autonomy_queued`, `status_queued`). During async host HTTP polling the core temporarily releases `dispatch_mutex` so another dispatch (such as `stimulus_ingest` during a slow `sense_observation`) can proceed without deadlocking the host pipeline.
+
+On the Swift side:
+
+- `BrainCoreMessageBus` selects its host dispatch mode from `AFFECTIVE_BSP_DISPATCH_MODE`.
+- Queueable sense/input/status dispatches are coalesced by operation key in both modes, so repeated live updates keep only the latest pending dispatch rather than building a FIFO backlog.
+- `concurrent` is the default: one core dispatch is active at a time.
+- `parallel` is the opt-in mode that lets different queueable keys overlap the command lane for hosts that support multiplexed dispatch; repeated updates for the same key still coalesce.
+- `BrainCoreEmbeddedBridge` implements begin/poll HTTP tracking for the embedded host services table.
+- Dispatch/drain FFI entry points do not take the global create/destroy lock so ingest can run while another dispatch is blocked in host HTTP polling.
+- `BrainCoreEventSink` receives pushed batches from `on_host_events`; `AffectiveViewModel` installs a handler after connect and forwards pushed events through `applyCoreEvents`.
+- Completed dispatches still merge any remaining events from `try_drain_events_json` / `drain_events_json`.
+
+This keeps camera and other host pipeline work from deadlocking typed ingest while the core is mid-dispatch.
 
 Remaining iOS integration work:
 
@@ -329,7 +354,7 @@ Use the Mac peer for:
 
 - importing/exporting brains
 - copying memories and graph changes
-- running richer autonomy while the Mac is awake
+- running richer background agency while the Mac is awake
 - provider-heavy or model-heavy work when the user explicitly routes it there
 - backup and restore
 
@@ -433,7 +458,7 @@ Both sides should speak explicit capabilities:
   "uploaded_media_read": "available",
   "audio_transcription": "available | unavailable",
   "local_notifications": "available | denied",
-  "background_autonomy": "limited | available | unavailable",
+  "background_agency": "available | unavailable",
   "provider_text": "available | missing_credentials | degraded"
 }
 ```
@@ -478,11 +503,11 @@ Affective should use this to decide whether to show:
 
 ### Affective
 
-1. Affective chat now uses `BrainClient.sendText`, backed by MCP `conversation_turn` on macOS and the embedded ABI on iOS.
-2. MCP process ownership and framing stay inside `AffectiveCoreMCPBridge`, which is macOS-only.
-3. `EmbeddedBrainClient` is the iOS path and calls the Zig static library in-process.
-4. The Xcode target builds and links the embedded Zig core for iOS simulator and device SDKs.
-5. Keep view-model communication on typed `BrainCore` operations.
+1. Affective chat uses typed `BrainCore` operations backed by the embedded ABI on macOS and iOS.
+2. MCP process ownership and framing stay inside `AffectiveCoreMCPBridge` for diagnostics and legacy tooling, not the primary product runtime path.
+3. `BrainCore` is the in-process embedded client for macOS and iOS app targets.
+4. The Xcode target builds and links the embedded Zig core for macOS, iOS simulator, and device SDKs.
+5. Keep view-model communication on typed `BrainCore` operations, including queue ack handling and pushed event delivery through `BrainCoreEventSink`.
 6. Add response decoders for memory, reminders, attention, state, and conversation.
 7. Add provider account model and Keychain-backed store.
 8. Add a capability/permission model shared between macOS and iOS UI.
@@ -516,7 +541,7 @@ Affective should use this to decide whether to show:
 - Build and link the embedded iOS brain client.
 - Store brain data locally in the app container.
 - Support typed conversation, memory, graph, reminders, and brain import/export without an Affective remote server.
-- Gate provider, speech, camera, and background autonomy features through iOS host capabilities.
+- Gate provider, speech, camera, and background attention features through iOS host capabilities.
 - Verify the linked core on real iOS hardware.
 
 ### Phase 4: Local peer sync and service improvements

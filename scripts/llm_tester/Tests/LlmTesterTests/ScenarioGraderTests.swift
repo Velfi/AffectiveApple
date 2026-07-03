@@ -36,6 +36,34 @@ final class ScenarioGraderTests: XCTestCase {
         XCTAssertTrue(message.contains("interaction"))
     }
 
+    func testSpeechEchoScenarioRejectsVerbatimUserUtterance() {
+        let bad = #"{"salience":"medium","reason":"answering direct speech","action_pressures":[{"action":"say","origin":"autonomy","delay_ms":null,"scale":"tiny","text":"Can you hear me?","query":null,"memory_id":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"tags":["speech"]}]}"#
+        guard case .fail(let message) = ScenarioGrader.grade(scenarioId: "conversation_speech_no_verbatim_echo", rawText: bad) else {
+            return XCTFail("Expected semantic failure")
+        }
+        XCTAssertTrue(message.contains("full user utterance"))
+    }
+
+    func testSpeechEchoScenarioAcceptsDirectNonEchoResponse() {
+        let good = #"{"salience":"medium","reason":"answering direct speech","action_pressures":[{"action":"say","origin":"autonomy","delay_ms":null,"scale":"tiny","text":"Yes, I can hear you.","query":null,"memory_id":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"tags":["speech"]}]}"#
+        XCTAssertEqual(ScenarioGrader.grade(scenarioId: "conversation_speech_no_verbatim_echo", rawText: good), .pass)
+    }
+
+    func testSpeechEchoScenarioRejectsShortGreetingEcho() {
+        let bad = #"{"salience":"medium","reason":"answering direct speech","action_pressures":[{"action":"say","origin":"autonomy","delay_ms":null,"scale":"tiny","text":"Yo","query":null,"memory_id":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"tags":["speech"]}]}"#
+        guard case .fail = ScenarioGrader.grade(scenarioId: "conversation_speech_no_verbatim_echo_yo", rawText: bad) else {
+            return XCTFail("Expected semantic failure")
+        }
+    }
+
+    func testSpeechEchoScenarioRejectsQuotedUtteranceInsideResponse() {
+        let bad = #"{"salience":"medium","reason":"answering direct speech","action_pressures":[{"action":"say","origin":"autonomy","delay_ms":null,"scale":"tiny","text":"I noticed the message 'ty Geisha.' I'm here quietly if you'd like to continue.","query":null,"memory_id":null,"schedule":null,"heat_bias":null,"eyes":null,"mouth":null,"duration_ms":null,"tags":["speech"]}]}"#
+        guard case .fail(let message) = ScenarioGrader.grade(scenarioId: "conversation_speech_no_verbatim_echo_ty_geisha", rawText: bad) else {
+            return XCTFail("Expected semantic failure")
+        }
+        XCTAssertTrue(message.contains("full user utterance"))
+    }
+
     func testUnknownScenarioIsNotApplicable() {
         XCTAssertEqual(ScenarioGrader.grade(scenarioId: "conversation_greeting", rawText: #"{"action_pressures":[]}"#), .notApplicable)
     }

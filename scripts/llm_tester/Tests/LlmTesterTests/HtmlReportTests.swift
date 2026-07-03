@@ -425,6 +425,24 @@ final class HtmlReportTests: XCTestCase {
         XCTAssertEqual(HtmlReport.responseCopyText(for: result), "provider error output")
     }
 
+    func testImagePreviewEmbedsDataURL() throws {
+        let dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        let result = makeResult(
+            scenario: makeScenario(id: "dream_image_with_seed", responseFormat: "image_generation"),
+            combinedPrompt: "dream prompt",
+            status: "ok",
+            rawText: "path=/tmp/image.jpg mime=image/jpeg bytes=1234",
+            imageDataURL: dataURL
+        )
+        let html = HtmlReport.render(summary: makeSummary(results: [result]))
+
+        XCTAssertTrue(html.contains("Generated Image"))
+        XCTAssertTrue(html.contains("class=\"image-preview\""))
+        XCTAssertTrue(html.contains("src=\"\(dataURL)\""))
+        XCTAssertTrue(html.contains("path=/tmp/image.jpg"))
+        XCTAssertFalse(html.contains("<summary>Response</summary>"))
+    }
+
     func testCopyButtonPresentWhenNoResponseText() throws {
         let summary = makeSummary(
             results: [
@@ -450,6 +468,7 @@ final class HtmlReportTests: XCTestCase {
         subsystem: String = "conversation",
         systemPrompt: String = "System rules",
         userPrompt: String = "Hello",
+        responseFormat: String = "json_object",
         jsonSchema: String = ""
     ) -> LlmTesterScenario {
         LlmTesterScenario(
@@ -459,7 +478,7 @@ final class HtmlReportTests: XCTestCase {
             subsystem: subsystem,
             systemPrompt: systemPrompt,
             userPrompt: userPrompt,
-            responseFormat: "json_object",
+            responseFormat: responseFormat,
             jsonSchema: jsonSchema,
             maxTokens: 128,
             temperature: 0.2
@@ -472,7 +491,8 @@ final class HtmlReportTests: XCTestCase {
         status: String,
         prettyJSON: String? = nil,
         rawText: String? = nil,
-        errorMessage: String? = nil
+        errorMessage: String? = nil,
+        imageDataURL: String? = nil
     ) -> LlmTesterScenarioResult {
         LlmTesterScenarioResult(
             scenario: scenario,
@@ -483,7 +503,8 @@ final class HtmlReportTests: XCTestCase {
             rawText: rawText,
             prettyJSON: prettyJSON,
             jsonValid: prettyJSON != nil,
-            errorMessage: errorMessage
+            errorMessage: errorMessage,
+            imageDataURL: imageDataURL
         )
     }
 

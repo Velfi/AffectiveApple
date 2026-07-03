@@ -99,6 +99,9 @@ public enum HtmlReport {
             .copy-btn:hover { color: var(--text); border-color: #484f58; }
             .copy-btn.copied { color: var(--ok); border-color: rgba(63, 185, 80, 0.4); }
             .copy-source { display: none; }
+            .image-preview { padding: 0 18px 18px; border-top: 1px solid var(--border); }
+            .image-preview img { display: block; max-width: min(100%, 720px); border-radius: 8px; border: 1px solid var(--border); background: #010409; }
+            .image-preview .caption { color: var(--muted); font-size: 12px; margin-top: 8px; word-break: break-all; }
             """
         )
         html.append("</style>")
@@ -566,9 +569,13 @@ public enum HtmlReport {
 
         parts.append(section(title: "Debug: combined prompt", language: "plaintext", text: result.combinedPrompt, open: false))
 
+        if let imageDataURL = result.imageDataURL {
+            parts.append(renderImagePreview(dataURL: imageDataURL, caption: result.rawText))
+        }
+
         if let prettyJSON = result.prettyJSON {
             parts.append(section(title: "Response JSON", language: "json", text: prettyJSON, open: true))
-        } else if let rawText = result.rawText {
+        } else if let rawText = result.rawText, result.imageDataURL == nil {
             let language = result.jsonValid ? "json" : "plaintext"
             parts.append(section(title: "Response", language: language, text: rawText, open: true))
         }
@@ -583,6 +590,20 @@ public enum HtmlReport {
           <summary><a href="#\(escapeHTML(id))">▸ System prompt (shared)</a></summary>
         </details>
         """
+    }
+
+    private static func renderImagePreview(dataURL: String, caption: String?) -> String {
+        var parts: [String] = []
+        parts.append("<details open>")
+        parts.append("<summary>Generated Image</summary>")
+        parts.append("<div class=\"image-preview\">")
+        parts.append("<img src=\"\(escapeHTML(dataURL))\" alt=\"Generated dream image preview\">")
+        if let caption, !caption.isEmpty {
+            parts.append("<div class=\"caption\">\(escapeHTML(caption))</div>")
+        }
+        parts.append("</div>")
+        parts.append("</details>")
+        return parts.joined(separator: "\n")
     }
 
     private static func section(title: String, language: String, text: String, open: Bool) -> String {

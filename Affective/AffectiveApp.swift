@@ -8,6 +8,9 @@
 import SQLite3
 import SwiftUI
 import Darwin
+#if os(macOS)
+import AppKit
+#endif
 #if canImport(ImageIO)
 import ImageIO
 #endif
@@ -16,6 +19,8 @@ import ImageIO
 struct AffectiveApp: App {
     init() {
         SystemBrainSpeechNotificationService.shared.registerDelegateIfNeeded()
+        AppleSpeechVoiceCatalog.preloadIfNeeded()
+        AffectiveUnitTestHarness.prepareLaunchIfNeeded()
         #if DEBUG
         AffectiveSmokeTestHarness.prepareLaunchIfNeeded()
         AffectiveUITestHarness.prepareLaunchIfNeeded()
@@ -33,7 +38,9 @@ struct AffectiveApp: App {
     private var mainWindow: some Scene {
         WindowGroup {
             #if DEBUG
-            if AffectiveUITestHarness.isRecognitionFlowEnabled {
+            if AffectiveUnitTestHarness.isEnabled {
+                UnitTestHostPlaceholderView()
+            } else if AffectiveUITestHarness.isRecognitionFlowEnabled {
                 AffectiveUITestRecognitionFlowView()
             } else {
                 ContentView()
@@ -116,6 +123,66 @@ private struct AvatarEditorCommands: Commands {
     }
 }
 #endif
+
+#if DEBUG
+private struct UnitTestHostPlaceholderView: View {
+    var body: some View {
+        Color.clear
+            .frame(width: 1, height: 1)
+            #if os(macOS)
+            .background(UnitTestHostWindowConfigurator())
+            #endif
+    }
+}
+
+#if os(macOS)
+private struct UnitTestHostWindowConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        DispatchQueue.main.async {
+            configure(view.window)
+        }
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        DispatchQueue.main.async {
+            configure(view.window)
+        }
+    }
+
+    private func configure(_ window: NSWindow?) {
+        NSApp.setActivationPolicy(.accessory)
+        window?.setIsVisible(false)
+        window?.orderOut(nil)
+    }
+}
+#endif
+#endif
+
+enum AffectiveUnitTestHarness {
+    /// True when `AffectiveTests` is injected into the app host process.
+    static var isEnabled: Bool {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            return true
+        }
+        return ProcessInfo.processInfo.arguments.contains { argument in
+            argument.hasPrefix("-XCTest")
+        }
+        #else
+        return false
+        #endif
+    }
+
+    static func prepareLaunchIfNeeded() {
+        #if DEBUG
+        guard isEnabled else { return }
+        UserDefaults.standard.set(true, forKey: "Affective.didBypassCredentialWelcome")
+        AppleSpeechVoiceCatalog.preloadIfNeeded()
+        #endif
+    }
+}
 
 #if DEBUG
 enum AffectiveSmokeTestHarness {
@@ -215,32 +282,27 @@ enum AffectiveSmokeTestHarness {
         )
 
         log("dream time")
-        let dream = try await core.requestDreamTime(prompt: "Smoke test dream over the conversation, memory seed, and correction.")
-        guard !dream.item.mailboxID.isEmpty else {
+        let dreamResponse = try await core.requestDreamTime(prompt: "Smoke test dream over the conversation, memory seed, and correction.")
+        guard !dreamResponse.item.mailboxID.isEmpty else {
             throw SmokeTestError.missingMailboxDream
         }
         log("mailbox list")
-        let mailbox = try await core.mailboxList()
-        guard mailbox.items.contains(where: { $0.mailboxID == dream.item.mailboxID }) else {
+        let mailboxResponse = try await core.mailboxList()
+        guard mailboxResponse.items.contains(where: { $0.mailboxID == dreamResponse.item.mailboxID }) else {
             throw SmokeTestError.missingMailboxDream
         }
         log("mailbox mark read")
-        _ = try await core.mailboxMarkRead(mailboxID: dream.item.mailboxID)
+        _ = try await core.mailboxMarkRead(mailboxID: dreamResponse.item.mailboxID)
 
         log("export brain")
         let exportURL = storageRootURL.appendingPathComponent("smoke.brainarchive")
-        _ = try await core.exportBrain(to: exportURL)
+        _ = try BrainCloudArchive.createArchive(from: brainRoot, brainID: brainID, to: exportURL)
         guard fileManager.fileExists(atPath: exportURL.path) else {
             throw SmokeTestError.missingExportArchive
         }
         log("import brain")
         let importedRoot = storageRootURL.appendingPathComponent("imported-brain", isDirectory: true)
-        _ = try await core.importBrain(
-            from: exportURL,
-            brainID: "affective-smoke-imported",
-            brainRoot: importedRoot,
-            hostID: "smoke-import-host"
-        )
+        _ = try BrainCloudArchive.extractArchive(from: exportURL, to: importedRoot, expectedBrainID: brainID)
         guard fileManager.fileExists(atPath: importedRoot.appendingPathComponent("brain_profile.json").path) else {
             throw SmokeTestError.missingImportedBrain
         }

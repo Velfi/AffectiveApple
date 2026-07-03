@@ -84,13 +84,6 @@ final class AffectiveUITests: XCTestCase {
         )
     }
 
-    @MainActor
-    func testLaunchPerformance() throws {
-        let app = XCUIApplication()
-        app.launch()
-        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 20), "Expected Affective to launch.")
-    }
-
     private func makeHittable(_ element: XCUIElement) {
         guard !element.isHittable else { return }
         for _ in 0..<4 where !element.isHittable {

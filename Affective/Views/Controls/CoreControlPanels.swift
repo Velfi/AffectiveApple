@@ -166,66 +166,84 @@ struct InlineAutonomyControls: View {
 
     var fullRow: some View {
         HStack(spacing: isCompact ? 6 : 8) {
-            Text("Autonomy")
+            Text("Attention")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(AppTheme.secondaryText)
                 .lineLimit(1)
 
-            autonomyPicker
-                .frame(maxWidth: isCompact ? 190 : 220)
+            attentionStatePill
 
             Spacer(minLength: 4)
 
-            Text(summaryText)
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(AppTheme.secondaryText)
-                .lineLimit(1)
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text(model.autonomyStatusLine(at: context.date))
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .multilineTextAlignment(.trailing)
+            }
+            .layoutPriority(1)
 
             boredomIntervalLabel
-
-            if model.autonomyIsEnabled {
-                AnimatedAutonomyCapacityRing(model: model)
-            }
         }
     }
 
     var compactRow: some View {
         HStack(spacing: isCompact ? 6 : 8) {
-            autonomyPicker
-                .frame(maxWidth: isCompact ? 170 : 200)
+            attentionStatePill
 
-            Spacer(minLength: 4)
-
-            if model.autonomyIsEnabled {
-                AnimatedAutonomyCapacityRing(model: model)
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text(model.autonomyStatusLine(at: context.date))
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             }
+            .layoutPriority(1)
         }
     }
 
     var minimalRow: some View {
         HStack(spacing: 8) {
-            AutonomyToggleButton(model: model)
-
-            if model.autonomyIsEnabled {
-                AnimatedAutonomyCapacityRing(model: model)
-            }
+            AttentionStateButton(model: model)
 
             Spacer(minLength: 0)
+
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text(model.autonomyStatusLine(at: context.date))
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .multilineTextAlignment(.trailing)
+            }
         }
     }
 
-    var autonomyPicker: some View {
-        Picker("Autonomy mode", selection: Binding(
-            get: { model.normalizedAutonomyMode },
-            set: { model.setAutonomyMode($0) }
-        )) {
-            Text("Off").tag("off")
-            Text("Limited").tag("limited")
-            Text("Full").tag("full")
+    var attentionStatePill: some View {
+        Button {
+            model.showAttentionSettings()
+        } label: {
+            Label(model.attentionStatusTitle, systemImage: attentionStateSymbolName)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(AppTheme.primaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 6)
+                .background(AppTheme.editorBackground, in: Capsule())
+                .overlay(Capsule().stroke(AppTheme.accent.opacity(0.22)))
+                .contentShape(Capsule())
         }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .accessibilityLabel("Autonomy mode")
+        .buttonStyle(.plain)
+        .help("Open attention settings")
+        .accessibilityLabel("Open attention settings")
+        .accessibilityValue(model.attentionStatusTitle)
+    }
+
+    var attentionStateSymbolName: String {
+        model.attentionIsInSleepHours ? "moon.zzz.fill" : "scope"
     }
 
     @ViewBuilder
@@ -236,53 +254,131 @@ struct InlineAutonomyControls: View {
                 .labelStyle(.titleAndIcon)
                 .foregroundStyle(AppTheme.secondaryText)
                 .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .accessibilityLabel("Idle check randomly between \(AffectiveViewModel.boredomIntervalMinSeconds) and \(boredomIntervalMax) seconds")
-        }
-    }
-
-    var summaryText: String {
-        switch model.normalizedAutonomyMode {
-        case "full":
-            return "Full control"
-        case "limited":
-            return "Limited control"
-        default:
-            return "Off"
         }
     }
 }
 
-struct AutonomyToggleButton: View {
+struct ChatConversationControlStrip: View {
+    @ObservedObject var model: AffectiveViewModel
+    var isCompact = false
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            fullRow
+            compactRow
+        }
+    }
+
+    var fullRow: some View {
+        HStack(spacing: isCompact ? 6 : 8) {
+            AttentionPlaybackButton(model: model)
+            CameraSenseToggleButton(model: model)
+            BrainVoiceToggleButton(model: model)
+
+            Divider()
+                .frame(height: 22)
+                .overlay(AppTheme.softSeparator)
+
+            InlineAutonomyControls(model: model, isCompact: true)
+                .layoutPriority(1)
+        }
+        .controlGroupFrame(isCompact: isCompact)
+    }
+
+    var compactRow: some View {
+        HStack(spacing: 8) {
+            AttentionPlaybackButton(model: model)
+            CameraSenseToggleButton(model: model)
+            BrainVoiceToggleButton(model: model)
+
+            Spacer(minLength: 4)
+
+            AttentionStateButton(model: model)
+        }
+        .controlGroupFrame(isCompact: true)
+    }
+}
+
+private extension View {
+    func controlGroupFrame(isCompact: Bool) -> some View {
+        self
+            .padding(.horizontal, isCompact ? 7 : 9)
+            .padding(.vertical, isCompact ? 6 : 7)
+            .background(AppTheme.composerBackground, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(AppTheme.separator)
+            )
+    }
+}
+
+struct AttentionPlaybackButton: View {
     @ObservedObject var model: AffectiveViewModel
 
     var body: some View {
         Button {
-            model.setAutonomyMode(nextMode(from: model.normalizedAutonomyMode))
+            model.setAttentionPaused(!model.attentionIsPaused)
         } label: {
-            Image(systemName: model.autonomyIsEnabled ? "bolt.circle.fill" : "bolt.slash.circle")
-                .font(.system(size: 16, weight: .semibold))
+            Image(systemName: model.attentionIsPaused ? "play.fill" : "pause.fill")
+                .font(.system(size: 15, weight: .semibold))
                 .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(model.autonomyIsEnabled ? AppTheme.accent : AppTheme.secondaryText)
+                .foregroundStyle(model.attentionIsPaused ? AppTheme.secondaryText : AppTheme.accent)
                 .frame(width: 30, height: 30)
                 .background(AppTheme.editorBackground, in: Circle())
-                .overlay(Circle().stroke(model.autonomyIsEnabled ? AppTheme.accent.opacity(0.36) : .white.opacity(0.08)))
+                .overlay(Circle().stroke(model.attentionIsPaused ? .white.opacity(0.08) : AppTheme.accent.opacity(0.36)))
                 .hitTarget()
         }
         .buttonStyle(.plain)
-        .help("Cycle autonomy mode")
-        .accessibilityLabel("Autonomy")
-        .accessibilityValue(model.normalizedAutonomyMode.capitalized)
+        .help(model.attentionIsPaused ? "Resume attention" : "Pause attention")
+        .accessibilityLabel(model.attentionIsPaused ? "Resume attention" : "Pause attention")
     }
+}
 
-    private func nextMode(from mode: String) -> String {
-        switch mode {
-        case "off":
-            return "limited"
-        case "limited":
-            return "full"
-        default:
-            return "off"
+struct CameraSenseToggleButton: View {
+    @ObservedObject var model: AffectiveViewModel
+
+    var body: some View {
+        Button {
+            model.setCameraCaptureEnabled(!model.cameraCaptureIsEnabled)
+        } label: {
+            Image(systemName: model.cameraCaptureIsEnabled ? "camera.fill" : "video.slash.fill")
+                .font(.system(size: 15, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(model.cameraCaptureIsEnabled ? AppTheme.accent : AppTheme.secondaryText)
+                .frame(width: 30, height: 30)
+                .background(AppTheme.editorBackground, in: Circle())
+                .overlay(Circle().stroke(model.cameraCaptureIsEnabled ? AppTheme.accent.opacity(0.36) : .white.opacity(0.08)))
+                .hitTarget()
         }
+        .buttonStyle(.plain)
+        .help(model.cameraCaptureIsEnabled ? "Disable camera sense" : "Enable camera sense")
+        .accessibilityLabel("Camera sense")
+        .accessibilityValue(model.cameraCaptureIsEnabled ? "On" : "Off")
+    }
+}
+
+struct AttentionStateButton: View {
+    @ObservedObject var model: AffectiveViewModel
+
+    var body: some View {
+        Button {
+            model.showAttentionSettings()
+        } label: {
+            Image(systemName: model.attentionIsInSleepHours ? "moon.zzz.fill" : "scope")
+                .font(.system(size: 16, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(AppTheme.accent)
+                .frame(width: 30, height: 30)
+                .background(AppTheme.editorBackground, in: Circle())
+                .overlay(Circle().stroke(AppTheme.accent.opacity(0.36)))
+                .hitTarget()
+        }
+        .buttonStyle(.plain)
+        .help("Open attention settings")
+        .accessibilityLabel("Open attention settings")
+        .accessibilityValue(model.autonomyStatusLine())
     }
 }
 
@@ -313,6 +409,39 @@ struct HeaderStrip: View {
     @ObservedObject var model: AffectiveViewModel
 
     var body: some View {
+        ViewThatFits(in: .horizontal) {
+            inlineRow
+            stackedRow
+        }
+    }
+
+    var inlineRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: statusSymbolName)
+                .font(.system(size: 15, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(statusTint)
+                .frame(width: 18, height: 18)
+
+            Text(model.statusText)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(AppTheme.primaryText)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(1)
+
+            Text(connectionDetail)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(AppTheme.secondaryText)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .layoutPriority(0)
+
+            refreshButton
+        }
+    }
+
+    var stackedRow: some View {
         HStack(spacing: 10) {
             Image(systemName: statusSymbolName)
                 .font(.system(size: 15, weight: .semibold))
@@ -331,25 +460,31 @@ struct HeaderStrip: View {
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(AppTheme.secondaryText)
                     .lineLimit(1)
+                    .truncationMode(.middle)
             }
             .layoutPriority(1)
 
             Spacer()
 
-            Button {
-                model.refreshBrainState()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 14, weight: .semibold))
-                    .frame(width: 44, height: 34)
-            }
-            .buttonStyle(.bordered)
-            .tint(AppTheme.accent)
-            .controlSize(.small)
-            .disabled(model.isToolRunning)
-            .help("Refresh state")
-            .accessibilityLabel("Refresh state")
+            refreshButton
         }
+    }
+
+    var refreshButton: some View {
+        Button {
+            model.refreshBrainState()
+        } label: {
+            Image(systemName: "arrow.clockwise")
+                .font(.system(size: 14, weight: .semibold))
+                .frame(width: 38, height: 30)
+        }
+        .buttonStyle(.bordered)
+        .tint(AppTheme.accent)
+        .controlSize(.small)
+        .disabled(model.isToolRunning)
+        .help("Refresh state")
+        .accessibilityLabel("Refresh state")
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     var connectionDetail: String {

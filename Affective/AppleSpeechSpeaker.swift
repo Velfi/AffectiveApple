@@ -11,20 +11,62 @@ import Foundation
 import AVFoundation
 
 enum AppleSpeechVoiceCatalog {
-    static var names: [String] {
-        let availableNames = AVSpeechSynthesisVoice.speechVoices()
-            .map(\.name)
-            .uniqued()
-            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-        return availableNames.isEmpty ? builtInVoiceNames : availableNames
-    }
-
-    private static let builtInVoiceNames = [
+    static let builtInVoiceNames = [
         "Alex",
         "Fred",
         "Samantha",
         "Victoria",
     ]
+
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var cachedVoices: [AVSpeechSynthesisVoice]?
+
+    static var names: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let cachedVoices else { return builtInVoiceNames }
+        return voiceNames(from: cachedVoices)
+    }
+
+    static var defaultVoiceName: String {
+        builtInVoiceNames.first { $0.localizedCaseInsensitiveCompare("Fred") == .orderedSame }
+            ?? builtInVoiceNames.first
+            ?? "Fred"
+    }
+
+    static func preloadIfNeeded() {
+        lock.lock()
+        let alreadyLoaded = cachedVoices != nil
+        lock.unlock()
+        guard !alreadyLoaded else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let voices = AVSpeechSynthesisVoice.speechVoices()
+            lock.lock()
+            cachedVoices = voices
+            lock.unlock()
+        }
+    }
+
+    static func resolvedVoice(named preferredName: String) -> AVSpeechSynthesisVoice? {
+        let trimmedName = preferredName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return nil }
+        lock.lock()
+        let cachedVoices = cachedVoices
+        lock.unlock()
+        guard let cachedVoices else { return nil }
+        return cachedVoices.first { voice in
+            voice.name.localizedCaseInsensitiveCompare(trimmedName) == .orderedSame
+                || voice.identifier.localizedCaseInsensitiveContains(trimmedName)
+        }
+    }
+
+    private static func voiceNames(from voices: [AVSpeechSynthesisVoice]) -> [String] {
+        let availableNames = voices
+            .map(\.name)
+            .uniqued()
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        return availableNames.isEmpty ? builtInVoiceNames : availableNames
+    }
 }
 
 @MainActor
@@ -76,7 +118,7 @@ final class AppleSpeechSpeaker: NSObject, AVSpeechSynthesizerDelegate {
         self.completion = completion
         currentSpeechText = trimmed
         let utterance = AVSpeechUtterance(string: trimmed)
-        utterance.voice = voice(named: preferredVoiceName) ?? AVSpeechSynthesisVoice(language: Locale.current.identifier)
+        utterance.voice = resolvedVoice(named: preferredVoiceName)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0
@@ -130,14 +172,13 @@ final class AppleSpeechSpeaker: NSObject, AVSpeechSynthesizerDelegate {
         #endif
     }
 
-    private func voice(named preferredVoiceName: String?) -> AVSpeechSynthesisVoice? {
-        let trimmedName = preferredVoiceName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !trimmedName.isEmpty else { return nil }
-
-        return AVSpeechSynthesisVoice.speechVoices().first { voice in
-            voice.name.localizedCaseInsensitiveCompare(trimmedName) == .orderedSame
-                || voice.identifier.localizedCaseInsensitiveContains(trimmedName)
+    private func resolvedVoice(named preferredVoiceName: String?) -> AVSpeechSynthesisVoice? {
+        if let preferredVoiceName,
+           let voice = AppleSpeechVoiceCatalog.resolvedVoice(named: preferredVoiceName) {
+            return voice
         }
+        AppleSpeechVoiceCatalog.preloadIfNeeded()
+        return AVSpeechSynthesisVoice(language: Locale.current.language.languageCode?.identifier ?? "en-US")
     }
 
     private func finishSpeaking(for utteranceID: ObjectIdentifier?) {
@@ -158,9 +199,19 @@ final class AppleSpeechSpeaker: NSObject, AVSpeechSynthesizerDelegate {
 }
 #else
 enum AppleSpeechVoiceCatalog {
-    static let names = [
+    static let builtInVoiceNames = [
         "System Voice",
     ]
+
+    static var names: [String] {
+        builtInVoiceNames
+    }
+
+    static var defaultVoiceName: String {
+        builtInVoiceNames[0]
+    }
+
+    static func preloadIfNeeded() {}
 }
 
 @MainActor

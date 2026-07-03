@@ -289,41 +289,16 @@ final class BrainLibrary: ObservableObject {
         expectedBrainID: String? = nil
     ) async throws -> String {
         let fileManager = FileManager.default
-        let scratchRoot = fileManager.temporaryDirectory
-            .appendingPathComponent("AffectiveBrainImportHelper-\(UUID().uuidString)", isDirectory: true)
-        let helperRoot = scratchRoot.appendingPathComponent("helper", isDirectory: true)
-        defer { try? fileManager.removeItem(at: scratchRoot) }
-
-        try createMinimalBrainRoot(at: helperRoot, id: "import-helper", displayName: "Import Helper")
-        let helper = BrainDescriptor(
-            id: "import-helper",
-            displayName: "Import Helper",
-            rootURL: helperRoot,
-            avatarURL: nil,
-            avatarManifest: nil,
-            modifiedAt: nil,
-            isRecent: false
+        let imported = try BrainCloudArchive.extractArchive(
+            from: sourceURL,
+            to: destinationRoot,
+            expectedBrainID: expectedBrainID,
+            fileManager: fileManager
         )
-        let core = BrainCore(brain: helper, tracksLiveFileSession: false)
-        do {
-            let response = try await BrainFileAccessGate.runExclusive(brainID: helper.id) {
-                try await core.importBrain(
-                    from: sourceURL,
-                    brainID: expectedBrainID,
-                    brainRoot: destinationRoot,
-                    hostID: nil
-                )
-            }
-            await core.disconnect()
-            guard let importedID = response.metadata["brain_id"]?.sanitizedBrainID else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
-            try finalizeCoreImportedBrain(at: destinationRoot, manifest: response.manifest, fileManager: fileManager)
-            return importedID
-        } catch {
-            await core.disconnect()
-            throw error
-        }
+        let importedID = imported.brainID.sanitizedBrainID
+        guard !importedID.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
+        try finalizeCoreImportedBrain(at: destinationRoot, manifest: imported.manifest, fileManager: fileManager)
+        return importedID
     }
 
     static func finalizeCoreImportedBrain(

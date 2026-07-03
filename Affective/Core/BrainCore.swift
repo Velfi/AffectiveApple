@@ -6,6 +6,26 @@
 import Foundation
 import os
 
+/// Event types the core accepts into its stimulus inbox while another dispatch is active.
+nonisolated enum BrainCoreIngestEligibleOperation: Sendable {
+  static func contains(_ operation: String) -> Bool {
+    switch operation {
+    case "stimulus_ingest":
+      return true
+    default:
+      return false
+    }
+  }
+}
+
+/// Event types the host may send without waiting behind the serial command lane.
+nonisolated enum BrainCoreQueueableOperation: Sendable {
+  static func contains(_ operation: String) -> Bool {
+    BrainCoreIngestEligibleOperation.contains(operation)
+      || operation == "host_update"
+  }
+}
+
 protocol BrainCoreClient {
   func connect(progress: CoreLoadPerformanceSession?) async throws -> BrainDispatchEnvelope
   func disconnect() async
@@ -36,9 +56,9 @@ protocol BrainCoreClient {
     retention: String,
     visibility: String
   ) async throws -> BrainToolResponse
-  func shortTouch() async throws -> BrainToolResponse
-  func longTouch() async throws -> BrainToolResponse
-  func pokeSequence(_ pulses: [PokePulse]) async throws -> BrainToolResponse
+  func shortTouch(stimulusContext: StimulusContext?) async throws -> BrainToolResponse
+  func longTouch(stimulusContext: StimulusContext?) async throws -> BrainToolResponse
+  func pokeSequence(_ pulses: [PokePulse], stimulusContext: StimulusContext?) async throws -> BrainToolResponse
   func orientationObservation(
     _ observation: OrientationObservation,
     requestID: String?,
@@ -53,7 +73,9 @@ protocol BrainCoreClient {
     mimeType: String,
     source: String,
     requestID: String?,
-    presentation: BrainEventPresentation
+    presentation: BrainEventPresentation,
+    precomputedIdentity: FaceRecognitionIdentityResult?,
+    stimulusContext: StimulusContext?
   ) async throws -> BrainToolResponse
   func senseCatalog(
     senses: [PullSenseDescriptor],
@@ -84,6 +106,7 @@ protocol BrainCoreClient {
     interruptedAction: String?,
     canceledQueuedActionCount: Int
   ) async throws -> BrainToolResponse
+  func ingestStimulus(_ operation: String, arguments: [String: JSONValue]) async throws -> BrainDispatchEnvelope
   func sendText(
     _ text: String,
     source: LanguageInputSource,
@@ -97,92 +120,59 @@ protocol BrainCoreClient {
     utteranceEventID: String?
   ) async throws -> BrainTextResponse
   func brainMode() async throws -> BrainModeResponse
-  func autonomyTick() async throws -> BrainToolResponse
+  func autonomyTick(stimulusContext: StimulusContext?) async throws -> BrainToolResponse
   func readModelsSnapshot() async throws -> BrainReadModelsSnapshotResponse
   func requestDreamTime(prompt: String?) async throws -> BrainMailboxResponse
   func mailboxList() async throws -> BrainMailboxListResponse
   func mailboxMarkRead(mailboxID: String) async throws -> BrainMailboxListResponse
   func exportBrain(to fileURL: URL) async throws -> BrainArchiveResponse
   func importBrain(from fileURL: URL, brainID: String?, brainRoot: URL, hostID: String?) async throws -> BrainArchiveResponse
+  func setEventSinkHandler(_ handler: BrainCoreEventSink.Handler?) async
+}
+
+extension BrainCoreClient {
+  func shortTouch() async throws -> BrainToolResponse {
+    try await shortTouch(stimulusContext: nil)
+  }
+
+  func longTouch() async throws -> BrainToolResponse {
+    try await longTouch(stimulusContext: nil)
+  }
+
+  func pokeSequence(_ pulses: [PokePulse]) async throws -> BrainToolResponse {
+    try await pokeSequence(pulses, stimulusContext: nil)
+  }
+
+  func autonomyTick() async throws -> BrainToolResponse {
+    try await autonomyTick(stimulusContext: nil)
+  }
+
+  func syncConversationDispatchGeneration(_ generation: Int) async {}
+
+  func setEventSinkHandler(_ handler: BrainCoreEventSink.Handler?) async {}
+
+  func cameraObservation(
+    path: String,
+    mimeType: String,
+    source: String,
+    requestID: String?,
+    presentation: BrainEventPresentation
+  ) async throws -> BrainToolResponse {
+    try await cameraObservation(
+      path: path,
+      mimeType: mimeType,
+      source: source,
+      requestID: requestID,
+      presentation: presentation,
+      precomputedIdentity: nil,
+      stimulusContext: nil
+    )
+  }
 }
 
 actor BrainCore {
   nonisolated static let brainCoreLogger = Logger(subsystem: "com.zelda-built-this.AMBI", category: "brain-core")
   nonisolated static let credentialStore = KeychainCredentialStore()
-  nonisolated static let ffiLock = NSRecursiveLock()
-  // Dedicated thread for synchronous engine dispatch. The embedded engine calls
-  // back into the host (e.g. host LLM completion) and those callbacks block on a
-  // DispatchSemaphore while a child Task runs. Blocking a Swift cooperative-pool
-  // thread that way risks starving the pool (and trips the runtime's
-  // "unsafeForcedSync called from Swift Concurrent context" diagnostic), so the
-  // blocking FFI work runs here instead of on the actor's executor.
-  // GCD worker threads use a ~512 KiB stack; conversation turns can exceed that
-  // once memory, observations, and runtime actors are composed, so this thread
-  // uses an explicit 8 MiB stack.
-  nonisolated private static let ffiWorker = FFIWorker()
-
-  private final class FFIWorker: @unchecked Sendable {
-    private static let stackSize = 8 * 1024 * 1024
-
-    private final class Bootstrap: @unchecked Sendable {
-      weak var worker: FFIWorker?
-    }
-
-    private let thread: Thread
-    private let bootstrap = Bootstrap()
-    private var blocks: [() -> Void] = []
-    private let lock = NSLock()
-    private let workAvailable = DispatchSemaphore(value: 0)
-
-    init() {
-      let bootstrap = self.bootstrap
-      let thread = Thread {
-        guard let worker = bootstrap.worker else { return }
-        while true {
-          worker.workAvailable.wait()
-          worker.lock.lock()
-          if worker.blocks.isEmpty {
-            worker.lock.unlock()
-            continue
-          }
-          let block = worker.blocks.removeFirst()
-          worker.lock.unlock()
-          block()
-        }
-      }
-      thread.stackSize = Self.stackSize
-      thread.name = "com.zelda-built-this.AMBI.brain-core.ffi"
-      thread.qualityOfService = .userInitiated
-      self.thread = thread
-      bootstrap.worker = self
-      thread.start()
-    }
-
-    var isOnWorkerThread: Bool {
-      Thread.current === thread
-    }
-
-    func async(_ block: @escaping () -> Void) {
-      lock.lock()
-      blocks.append(block)
-      lock.unlock()
-      workAvailable.signal()
-    }
-
-    func sync<T>(_ block: @escaping () -> T) -> T {
-      if isOnWorkerThread {
-        return block()
-      }
-      var result: T!
-      let done = DispatchSemaphore(value: 0)
-      async {
-        result = block()
-        done.signal()
-      }
-      done.wait()
-      return result
-    }
-  }
 
   let brain: BrainDescriptor
   private let tracksLiveFileSession: Bool
@@ -192,109 +182,70 @@ actor BrainCore {
   }
 
   private final class CoreSession: @unchecked Sendable {
-      private var handle: AffectiveCoreHandle?
-      private var hostServices: EmbeddedHostServices?
+      private var transport: BrainTransport?
+      private var hostHTTPService: BrainHostHTTPService?
 
       init() {}
 
       deinit {
-        Self.destroyHandle(handle, onWorker: BrainCore.ffiWorker.isOnWorkerThread)
+        if let transport {
+          Task { await transport.disconnect() }
+        }
       }
 
       var isConnected: Bool {
-        handle != nil
+        transport != nil
       }
 
-      func install(handle: AffectiveCoreHandle, hostServices: EmbeddedHostServices) {
-        self.handle = handle
-        self.hostServices = hostServices
+      func install(transport: BrainTransport, hostHTTPService: BrainHostHTTPService) {
+        self.transport = transport
+        self.hostHTTPService = hostHTTPService
+      }
+
+      func syncConversationDispatchGeneration(_ generation: Int) {
+        hostHTTPService?.syncConversationDispatchGeneration(generation)
+      }
+
+      func beginUserTextDispatchFromCurrentConversationGeneration() {
+        hostHTTPService?.beginUserTextDispatchFromCurrentConversationGeneration()
       }
 
       func disconnect() {
-        guard let handleToDestroy = takeHandleForTeardown() else { return }
-        Self.destroyHandle(handleToDestroy, onWorker: BrainCore.ffiWorker.isOnWorkerThread)
+        if let transport {
+          Task { await transport.disconnect() }
+          self.transport = nil
+          hostHTTPService = nil
+        }
       }
 
       func disconnectAsync() async {
-        guard let handleToDestroy = takeHandleForTeardown() else { return }
-        await Self.destroyHandleAsync(handleToDestroy)
-      }
-
-      func drainEventsJSON() async -> AffectiveCoreCopiedResult {
-        guard let activeHandle = handle else {
-          return BrainCore.drainEventsJSON(nil)
-        }
-        return await withCheckedContinuation { (continuation: CheckedContinuation<AffectiveCoreCopiedResult, Never>) in
-          BrainCore.ffiWorker.async {
-            let output = BrainCore.drainEventsJSON(activeHandle)
-            continuation.resume(returning: output)
-          }
+        if let transport {
+          await transport.disconnect()
+          self.transport = nil
+          hostHTTPService = nil
         }
       }
 
-      func dispatchJSON(requestData: Data) async -> AffectiveCoreCopiedResult {
-        guard let activeHandle = handle else {
-          return BrainCore.dispatchJSON(nil, requestJSON: nil, requestJSONLength: 0)
+      func drainEvents() async throws -> BrainDispatchEnvelope {
+        guard let transport else {
+          throw BrainCoreError.unavailable("Brain Session Protocol is not connected.")
         }
-        return await withCheckedContinuation { (continuation: CheckedContinuation<AffectiveCoreCopiedResult, Never>) in
-          BrainCore.ffiWorker.async {
-            let output = requestData.withUnsafeBytes { requestBuffer in
-              let requestPointer = requestBuffer.bindMemory(to: UInt8.self).baseAddress
-              return BrainCore.dispatchJSON(
-                activeHandle,
-                requestJSON: requestPointer,
-                requestJSONLength: requestData.count
-              )
-            }
-            continuation.resume(returning: output)
-          }
-        }
+        return try await transport.drainEvents()
       }
 
-      private func takeHandleForTeardown() -> AffectiveCoreHandle? {
-        let handleToDestroy = handle
-        handle = nil
-        hostServices = nil
-        return handleToDestroy
-      }
-
-      private static func destroyHandle(_ handle: AffectiveCoreHandle?, onWorker: Bool) {
-        guard let handle else { return }
-        let destroy = {
-          BrainCore.withFFI {
-            affective_core_embedded_destroy(handle)
-          }
+      func dispatch(requestData: Data) async throws -> BrainDispatchEnvelope {
+        guard let transport else {
+          throw BrainCoreError.unavailable("Brain Session Protocol is not connected.")
         }
-        if onWorker {
-          destroy()
-        } else {
-          BrainCore.ffiWorker.sync(destroy)
-        }
-      }
-
-      private static func destroyHandleAsync(_ handle: AffectiveCoreHandle) async {
-        if BrainCore.ffiWorker.isOnWorkerThread {
-          BrainCore.withFFI {
-            affective_core_embedded_destroy(handle)
-          }
-          return
-        }
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-          BrainCore.ffiWorker.async {
-            BrainCore.withFFI {
-              affective_core_embedded_destroy(handle)
-            }
-            continuation.resume()
-          }
-        }
+        return try await transport.dispatch(requestData)
       }
     }
 
     private let coreSession = CoreSession()
+    private let messageBus = BrainCoreMessageBus()
+    private let eventSink = BrainCoreEventSink()
     private var isConnecting = false
     private var holdsLiveFileSession = false
-    private var dispatchInFlight = false
-    private var dispatchWaiters: [CheckedContinuation<Void, Never>] = []
 
   init(brain: BrainDescriptor, tracksLiveFileSession: Bool = true) {
     self.brain = brain
@@ -329,36 +280,20 @@ actor BrainCore {
         brain: brain,
         textProviderPreference: textProviderPreference
       )
-      let hostServices = EmbeddedHostServices(textProviderPreference: textProviderPreference)
+      let hostHTTPService = BrainHostHTTPService(
+        textProviderPreference: textProviderPreference,
+        eventSink: eventSink
+      )
+      let transport = LoopbackTCPTransport(hostHTTPService: hostHTTPService)
       do {
-        let created: (status: Int32, handle: AffectiveCoreHandle?, errorMessage: String)
         if let progress {
-          created = progress.measureSync(id: "embedded_create", label: "Starting embedded core") {
-            storage.withConfig { config in
-              withUnsafePointer(to: config) { pointer in
-                hostServices.withHostServices { services in
-                  withUnsafePointer(to: services) { servicesPointer in
-                    Self.createCore(pointer, hostServices: servicesPointer)
-                  }
-                }
-              }
-            }
+          _ = try await progress.measure(id: "bsp_session_create", label: "Starting brain session") {
+            try await transport.connect(config: BrainSessionConfig(storage: storage))
           }
         } else {
-          created = storage.withConfig { config in
-            withUnsafePointer(to: config) { pointer in
-              hostServices.withHostServices { services in
-                withUnsafePointer(to: services) { servicesPointer in
-                  Self.createCore(pointer, hostServices: servicesPointer)
-                }
-              }
-            }
-          }
+          _ = try await transport.connect(config: BrainSessionConfig(storage: storage))
         }
-        guard created.status == 0, let handle = created.handle else {
-          throw BrainCoreError.unavailable(created.errorMessage)
-        }
-        coreSession.install(handle: handle, hostServices: hostServices)
+        coreSession.install(transport: transport, hostHTTPService: hostHTTPService)
         let envelope: BrainDispatchEnvelope
         if let progress {
           envelope = try await progress.measure(id: "core_connect", label: "Connecting to core") {
@@ -427,7 +362,8 @@ actor BrainCore {
     sensorQuality: String,
     localPolicy: String
   ) async throws -> BrainToolResponse {
-      let envelope = try await dispatchOperation("host_attach", arguments: [
+      let envelope = try await dispatchOperation("host_update", arguments: [
+        "kind": .string("host_attach"),
         "host_id": .string(hostID),
         "platform": .string(platform),
         "permissions": .array(permissions.map(JSONValue.string)),
@@ -436,20 +372,21 @@ actor BrainCore {
         "sensor_quality": .string(sensorQuality),
         "local_policy": .string(localPolicy),
       ])
-      return BrainToolResponse(toolName: "host_attach", envelope: envelope, rawText: envelope.rawText)
+      return BrainToolResponse(toolName: "host_update", envelope: envelope, rawText: envelope.rawText)
   }
 
   func hostCapabilityManifest(hostID: String, capabilityIDs: [String]) async throws -> BrainToolResponse {
-      let envelope = try await dispatchOperation("host_capability_manifest", arguments: [
+      let envelope = try await dispatchOperation("host_update", arguments: [
+        "kind": .string("capability_manifest"),
         "host_id": .string(hostID),
         "capability_ids": .array(capabilityIDs.map(JSONValue.string)),
       ])
-      return BrainToolResponse(toolName: "host_capability_manifest", envelope: envelope, rawText: envelope.rawText)
+      return BrainToolResponse(toolName: "host_update", envelope: envelope, rawText: envelope.rawText)
   }
 
   func refreshFacialExpressionCatalog() async throws -> BrainToolResponse {
-      let envelope = try await dispatchOperation("refresh_facial_expression_catalog", arguments: [:])
-      return BrainToolResponse(toolName: "refresh_facial_expression_catalog", envelope: envelope, rawText: envelope.rawText)
+      let envelope = try await dispatchOperation("host_update", arguments: ["kind": .string("facial_expression_catalog")])
+      return BrainToolResponse(toolName: "host_update", envelope: envelope, rawText: envelope.rawText)
   }
 
   func sendExperienceEvent(
@@ -482,8 +419,10 @@ actor BrainCore {
       if let hostID, !hostID.isEmpty {
         arguments["host_id"] = .string(hostID)
       }
-      let envelope = try await dispatchOperation("send_experience_event", arguments: arguments)
-      return BrainToolResponse(toolName: "send_experience_event", envelope: envelope, rawText: envelope.rawText)
+      arguments["kind"] = .string("experience_event")
+      arguments["event_kind"] = .string(kind)
+      let envelope = try await dispatchOperation("stimulus_ingest", arguments: arguments)
+      return BrainToolResponse(toolName: "stimulus_ingest", envelope: envelope, rawText: envelope.rawText)
   }
 
   func sendEmojiReaction(
@@ -501,7 +440,8 @@ actor BrainCore {
       if let utteranceEventID, !utteranceEventID.isEmpty {
         arguments["utterance_event_id"] = .string(utteranceEventID)
       }
-      let envelope = try await dispatchOperation("emoji_reaction", arguments: arguments)
+      arguments["kind"] = .string("reaction")
+      let envelope = try await dispatchOperation("stimulus_ingest", arguments: arguments)
       let responseText = envelope.displayText
       var metadata = ["state": envelope.awaitingHostSenseStateLabel]
       metadata.merge(envelope.metadata()) { current, _ in current }
@@ -510,7 +450,7 @@ actor BrainCore {
         : (envelope.displayTextFromEvents.isEmpty ? "result_value" : "event_envelope")
       metadata["display_text_length"] = "\(responseText.count)"
       return BrainTextResponse(
-        toolName: "emoji_reaction",
+        toolName: "stimulus_ingest",
         text: responseText,
         metadata: metadata,
         events: envelope.events,
@@ -624,43 +564,29 @@ actor BrainCore {
     return String(data: data, encoding: .utf8) ?? "{}"
   }
 
-  func shortTouch() async throws -> BrainToolResponse {
-      try await ensureConnected()
-      let event = BrainEvent.hostEvent(
-        payload: .experience(BrainExperiencePayload(
-          kind: "short_touch",
-          modality: .structured,
-          role: .other,
-          text: "short touch",
-          media: [],
-          context: nil
-        )),
-        visibility: .public,
-        presentation: .chat
+  func shortTouch(stimulusContext: StimulusContext? = nil) async throws -> BrainToolResponse {
+      try await touchObservation(
+        toolName: "short_touch",
+        gesture: "short_touch",
+        durationClass: "short",
+        summary: "short touch",
+        rawMagnitude: 0.45,
+        stimulusContext: stimulusContext
       )
-      let envelope = try await dispatch(event: event, operation: "short_touch")
-      return BrainToolResponse(toolName: "short_touch", envelope: envelope, rawText: envelope.rawText)
   }
 
-  func longTouch() async throws -> BrainToolResponse {
-      try await ensureConnected()
-      let event = BrainEvent.hostEvent(
-        payload: .experience(BrainExperiencePayload(
-          kind: "long_touch",
-          modality: .structured,
-          role: .other,
-          text: "long touch",
-          media: [],
-          context: nil
-        )),
-        visibility: .public,
-        presentation: .chat
+  func longTouch(stimulusContext: StimulusContext? = nil) async throws -> BrainToolResponse {
+      try await touchObservation(
+        toolName: "long_touch",
+        gesture: "long_touch",
+        durationClass: "long",
+        summary: "long touch",
+        rawMagnitude: 0.65,
+        stimulusContext: stimulusContext
       )
-      let envelope = try await dispatch(event: event, operation: "long_touch")
-      return BrainToolResponse(toolName: "long_touch", envelope: envelope, rawText: envelope.rawText)
   }
 
-  func pokeSequence(_ pulses: [PokePulse]) async throws -> BrainToolResponse {
+  func pokeSequence(_ pulses: [PokePulse], stimulusContext: StimulusContext? = nil) async throws -> BrainToolResponse {
       try await ensureConnected()
       let pulseValues = pulses.map { pulse in
         JSONValue.object([
@@ -668,20 +594,69 @@ actor BrainCore {
           "pause_before_ms": .number(pulse.pauseBeforeMilliseconds),
         ])
       }
-      let event = BrainEvent.hostEvent(
-        payload: .experience(BrainExperiencePayload(
-          kind: "poke_sequence",
-          modality: .structured,
-          role: .other,
-          text: "poke sequence",
-          media: [],
-          context: .object(["pulses": .array(pulseValues)])
-        )),
-        visibility: .public,
-        presentation: .chat
+      var arguments = Self.touchContext(
+        gesture: "poke_sequence",
+        durationClass: nil,
+        stimulusContext: stimulusContext,
+        extra: [
+          "kind": .string("poke_sequence"),
+          "summary": .string("poke sequence"),
+          "payload": .string("poke sequence"),
+          "pulses": .array(pulseValues),
+        ]
       )
-      let envelope = try await dispatch(event: event, operation: "poke_sequence")
+      arguments["raw_magnitude"] = .number(0.50)
+      let envelope = try await dispatchOperation("stimulus_ingest", arguments: arguments)
       return BrainToolResponse(toolName: "poke_sequence", envelope: envelope, rawText: envelope.rawText)
+  }
+
+  private func touchObservation(
+    toolName: String,
+    gesture: String,
+    durationClass: String,
+    summary: String,
+    rawMagnitude: Double,
+    stimulusContext: StimulusContext?
+  ) async throws -> BrainToolResponse {
+      try await ensureConnected()
+      var arguments = Self.touchContext(
+        gesture: gesture,
+        durationClass: durationClass,
+        stimulusContext: stimulusContext,
+        extra: [
+          "kind": .string("touch"),
+          "summary": .string(summary),
+          "payload": .string(summary),
+          "raw_magnitude": .number(rawMagnitude),
+        ]
+      )
+      arguments["confidence"] = .number(1)
+      let envelope = try await dispatchOperation("stimulus_ingest", arguments: arguments)
+      return BrainToolResponse(toolName: toolName, envelope: envelope, rawText: envelope.rawText)
+  }
+
+  private nonisolated static func touchContext(
+    gesture: String,
+    durationClass: String?,
+    stimulusContext: StimulusContext?,
+    extra: [String: JSONValue] = [:]
+  ) -> [String: JSONValue] {
+      var context: [String: JSONValue] = [
+        "sense": .string("touch"),
+        "sense_id": .string("touch"),
+        "source": .string("button"),
+        "gesture": .string(gesture),
+        "input_channel": .string("physical_touch"),
+        "social_signal": .bool(true),
+      ]
+      if let durationClass {
+        context["duration_class"] = .string(durationClass)
+      }
+      if let stimulusContext {
+        context["host_context"] = .object(stimulusContext.eventArguments)
+      }
+      context.merge(extra) { current, _ in current }
+      return context
   }
 
   func orientationObservation(
@@ -690,24 +665,13 @@ actor BrainCore {
     presentation: BrainEventPresentation = .internalOnly
   ) async throws -> BrainToolResponse {
       try await ensureConnected()
-      let observedAt = Self.iso8601Now()
       var observationPayload = observation.eventArguments
-      observationPayload["observed_at"] = .string(observedAt)
-      let event = BrainEvent.hostEvent(
-        payload: .senseObservation(BrainSenseObservationPayload(
-          senseID: "orientation",
-          modality: .structured,
-          summary: observation.summary,
-          media: [],
-          value: .object(observationPayload),
-          confidence: nil,
-          observedAt: observedAt
-        )),
-        presentation: presentation,
-        traceID: requestID ?? UUID().uuidString,
-        parentID: requestID
-      )
-      let envelope = try await dispatch(event: event, operation: "sense_observation")
+      observationPayload["kind"] = .string("orientation")
+      observationPayload["summary"] = .string(observation.summary)
+      observationPayload["payload"] = .string(observation.summary)
+      observationPayload["observed_at"] = .string(Self.iso8601Now())
+      if let requestID, !requestID.isEmpty { observationPayload["request_id"] = .string(requestID) }
+      let envelope = try await dispatchOperation("stimulus_ingest", arguments: observationPayload)
       return BrainToolResponse(toolName: "sense_observation", envelope: envelope, rawText: envelope.rawText)
   }
 
@@ -716,31 +680,20 @@ actor BrainCore {
     presentation: BrainEventPresentation = .internalOnly
   ) async throws -> BrainToolResponse {
       try await ensureConnected()
-      let observedAt = Self.iso8601Now()
       var observationPayload = observation.eventArguments
-      observationPayload["observed_at"] = .string(observedAt)
-      let event = BrainEvent.hostEvent(
-        payload: .senseObservation(BrainSenseObservationPayload(
-          senseID: "motion_gesture",
-          modality: .structured,
-          summary: observation.summary,
-          media: [],
-          value: .object(observationPayload),
-          confidence: nil,
-          observedAt: observedAt
-        )),
-        presentation: presentation
-      )
-      let envelope = try await dispatch(event: event, operation: "sense_observation")
+      observationPayload["kind"] = .string("motion_gesture")
+      observationPayload["summary"] = .string(observation.summary)
+      observationPayload["payload"] = .string(observation.summary)
+      observationPayload["observed_at"] = .string(Self.iso8601Now())
+      let envelope = try await dispatchOperation("stimulus_ingest", arguments: observationPayload)
       return BrainToolResponse(toolName: "sense_observation", envelope: envelope, rawText: envelope.rawText)
   }
 
-  func cameraObservation(
+  func cameraObservationIngest(
     path: String,
     mimeType: String,
     source: String,
-    requestID: String?,
-    presentation: BrainEventPresentation = .internalOnly
+    requestID: String?
   ) async throws -> BrainToolResponse {
       try await ensureConnected()
       var observation: [String: JSONValue] = [
@@ -752,22 +705,39 @@ actor BrainCore {
       if let requestID, !requestID.isEmpty {
         observation["request_id"] = .string(requestID)
       }
-      let observedAt = observation["observed_at"]?.stringValue ?? Self.iso8601Now()
-      let event = BrainEvent.hostEvent(
-        payload: .senseObservation(BrainSenseObservationPayload(
-          senseID: "camera",
-          modality: .image,
-          summary: "camera image captured",
-          media: [BrainMediaRef(kind: .image, path: path, url: nil, mimeType: mimeType, caption: source)],
-          value: .object(observation),
-          confidence: nil,
-          observedAt: observedAt
-        )),
-        presentation: presentation,
-        traceID: requestID ?? UUID().uuidString,
-        parentID: requestID
-      )
-      let envelope = try await dispatch(event: event, operation: "sense_observation")
+      observation["kind"] = .string("camera")
+      let envelope = try await ingestStimulus("stimulus_ingest", arguments: observation)
+      return BrainToolResponse(toolName: "sense_observation", envelope: envelope, rawText: envelope.rawText)
+  }
+
+  func cameraObservation(
+    path: String,
+    mimeType: String,
+    source: String,
+    requestID: String?,
+    presentation: BrainEventPresentation = .internalOnly,
+    precomputedIdentity: FaceRecognitionIdentityResult? = nil,
+    stimulusContext: StimulusContext? = nil
+  ) async throws -> BrainToolResponse {
+      try await ensureConnected()
+      var observation: [String: JSONValue] = [
+        "path": .string(path),
+        "mime_type": .string(mimeType),
+        "source": .string(source),
+        "observed_at": .string(Self.iso8601Now()),
+      ]
+      if let requestID, !requestID.isEmpty {
+        observation["request_id"] = .string(requestID)
+      }
+      if let precomputedIdentity {
+        observation["host_identity"] = Self.identityJSONValue(precomputedIdentity)
+      }
+      if let stimulusContext {
+        observation["host_context"] = .object(stimulusContext.eventArguments)
+      }
+      observation["kind"] = .string("camera")
+      observation["summary"] = .string("camera image captured")
+      let envelope = try await dispatchOperation("stimulus_ingest", arguments: observation)
       return BrainToolResponse(toolName: "sense_observation", envelope: envelope, rawText: envelope.rawText)
   }
 
@@ -783,15 +753,19 @@ actor BrainCore {
           reason: $0.statusReason
         )
       }
-      let event = BrainEvent.hostEvent(
-        payload: .capabilityManifest(BrainCapabilityManifestPayload(
-          capabilities: [],
-          senses: descriptors
-        )),
-        traceID: requestID ?? UUID().uuidString,
-        parentID: requestID
-      )
-      let envelope = try await dispatch(event: event, operation: "sense_catalog")
+      let senseValues = descriptors.map { descriptor in
+        JSONValue.object([
+          "id": .string(descriptor.id),
+          "status": .string(descriptor.status),
+          "reason": .string(descriptor.reason ?? ""),
+        ])
+      }
+      var arguments: [String: JSONValue] = [
+        "kind": .string("sense_catalog"),
+        "senses": .array(senseValues),
+      ]
+      if let requestID, !requestID.isEmpty { arguments["request_id"] = .string(requestID) }
+      let envelope = try await dispatchOperation("host_update", arguments: arguments)
       return BrainToolResponse(toolName: "sense_catalog", envelope: envelope, rawText: envelope.rawText)
   }
 
@@ -807,24 +781,19 @@ actor BrainCore {
     terminal: Bool = true
   ) async throws -> BrainToolResponse {
       try await ensureConnected()
-      let event = BrainEvent.hostEvent(
-        payload: .capabilityStatus(BrainCapabilityStatusPayload(
-          capabilityID: "\(sense)_read",
-          status: status.rawValue,
-          reason: [reason, timeoutMS.map { "timeout_ms=\($0)" }].compactMap { $0 }.joined(separator: " "),
-          permission: Self.canonicalPermission(from: permissionState ?? availability),
-          availability: Self.canonicalAvailability(from: availability ?? status.rawValue),
-          quality: status == .fulfilled ? 0.85 : 0.0,
-          reliability: status == .fulfilled ? 0.80 : 0.0,
-          cost: 0.0,
-          latencyMS: timeoutMS,
-          risk: status == .fulfilled ? 0.05 : 0.40,
-          unavailableReason: status == .fulfilled ? "" : reason
-        )),
-        traceID: requestID ?? UUID().uuidString,
-        parentID: requestID
-      )
-      let envelope = try await dispatch(event: event, operation: "sense_status")
+      var arguments: [String: JSONValue] = [
+        "kind": .string("sense_status"),
+        "sense": .string(sense),
+        "direction": .string(direction.rawValue),
+        "status": .string(status.rawValue),
+        "reason": .string([reason, timeoutMS.map { "timeout_ms=\($0)" }].compactMap { $0 }.joined(separator: " ")),
+        "availability": .string(availability ?? status.rawValue),
+        "permission_state": .string(permissionState ?? ""),
+        "terminal": .bool(terminal),
+      ]
+      if let timeoutMS { arguments["timeout_ms"] = .number(Double(timeoutMS)) }
+      if let requestID, !requestID.isEmpty { arguments["request_id"] = .string(requestID) }
+      let envelope = try await dispatchOperation("host_update", arguments: arguments)
       return BrainToolResponse(toolName: "sense_status", envelope: envelope, rawText: envelope.rawText)
   }
 
@@ -842,6 +811,7 @@ actor BrainCore {
       } ?? "\(reason) pending_elapsed_ms=\(pendingElapsedMS)"
       let metrics = Self.hostCapabilityMetrics(for: status, pendingElapsedMS: pendingElapsedMS, reason: pendingReason)
       var arguments: [String: JSONValue] = [
+        "kind": .string("capability_status"),
         "capability_id": .string(capability),
         "host_id": .string(Self.currentHostID()),
         "permission": .string(metrics.permission),
@@ -856,13 +826,14 @@ actor BrainCore {
       if let requestID, !requestID.isEmpty {
         arguments["request_id"] = .string(requestID)
       }
-      let envelope = try await dispatchOperation("capability_status", arguments: arguments)
+      let envelope = try await dispatchOperation("host_update", arguments: arguments)
       return BrainToolResponse(toolName: "capability_status", envelope: envelope, rawText: envelope.rawText)
   }
 
   func capabilityStatusBatch(statuses: [JSONValue]) async throws -> BrainToolResponse {
       try await ensureConnected()
-      let envelope = try await dispatchOperation("capability_status_batch", arguments: [
+      let envelope = try await dispatchOperation("host_update", arguments: [
+        "kind": .string("capability_status_batch"),
         "host_id": .string(Self.currentHostID()),
         "statuses": .array(statuses),
       ])
@@ -890,7 +861,7 @@ actor BrainCore {
       return ("prompt_required", "degraded", 0.35, 0.45, 0.0, pendingElapsedMS, 0.25, reason)
     case "denied":
       return ("denied", "refused", 0.0, 0.0, 0.0, pendingElapsedMS, 0.70, reason)
-    case "unavailable", "disabled_by_policy":
+    case "unavailable", "disabled", "disabled_by_policy":
       return ("unknown", "unavailable", 0.0, 0.0, 0.0, pendingElapsedMS, 0.55, reason)
     default:
 	      return ("unknown", "unavailable", 0.0, 0.0, 0.0, pendingElapsedMS, 0.50, reason)
@@ -905,7 +876,7 @@ actor BrainCore {
       return "prompt_required"
     case "denied":
       return "denied"
-    case "unavailable", "disabled_by_policy":
+    case "unavailable", "disabled", "disabled_by_policy":
       return "unknown"
     default:
       return "unknown"
@@ -932,26 +903,16 @@ actor BrainCore {
     canceledQueuedActionCount: Int
   ) async throws -> BrainToolResponse {
       try await ensureConnected()
-      var context: [String: JSONValue] = [
+      var arguments: [String: JSONValue] = [
+        "kind": .string("interrupt"),
+        "text": .string(userText),
         "reason": .string(reason),
         "canceled_queued_action_count": .number(Double(canceledQueuedActionCount)),
       ]
       if let interruptedAction, !interruptedAction.isEmpty {
-        context["interrupted_action"] = .string(interruptedAction)
+        arguments["interrupted_action"] = .string(interruptedAction)
       }
-      let event = BrainEvent.hostEvent(
-        payload: .experience(BrainExperiencePayload(
-          kind: "user_interrupt_message",
-          modality: .text,
-          role: .other,
-          text: userText,
-          media: [],
-          context: .object(context)
-        )),
-        visibility: .public,
-        presentation: .chat
-      )
-      let envelope = try await dispatch(event: event, operation: "interrupt")
+      let envelope = try await dispatchOperation("stimulus_ingest", arguments: arguments)
       return BrainToolResponse(toolName: "interrupt", envelope: envelope, rawText: envelope.rawText)
   }
 
@@ -962,10 +923,15 @@ actor BrainCore {
     stimulusContext: StimulusContext? = nil
   ) async throws -> BrainTextResponse {
       try await ensureConnected()
-      let conversationText = Self.textByAppendingAttachmentMarkers(text, attachments: attachments)
+      coreSession.beginUserTextDispatchFromCurrentConversationGeneration()
       let envelope = try await dispatchOperation(
-        "user_text",
-        arguments: ["text": .string(conversationText)]
+        "stimulus_ingest",
+        arguments: Self.speechStimulusArguments(
+          text: text,
+          source: source,
+          attachments: attachments,
+          stimulusContext: stimulusContext
+        )
       )
       let events = envelope.resolvedEvents()
       let responseText = envelope.displayText
@@ -978,9 +944,9 @@ actor BrainCore {
         ? (envelope.awaitingHostSense ? "awaiting_host_sense" : "empty")
         : (envelope.displayTextFromEvents.isEmpty ? "result_value" : "event_envelope")
       metadata["display_text_length"] = "\(responseText.count)"
-      let shouldSpeak = !envelope.speechTexts.isEmpty || events.contains { $0.capability == "speak" }
+      let shouldSpeak = envelope.requiresHostSpeechPlayback
       return BrainTextResponse(
-        toolName: "user_text",
+        toolName: "stimulus_ingest",
         text: responseText,
         metadata: metadata,
         events: events,
@@ -988,54 +954,107 @@ actor BrainCore {
       )
   }
 
+  nonisolated static func speechStimulusArguments(
+    text: String,
+    source: LanguageInputSource = .typedText,
+    attachments: [[String: JSONValue]] = [],
+    stimulusContext: StimulusContext? = nil
+  ) -> [String: JSONValue] {
+      var arguments: [String: JSONValue] = [
+        "kind": .string("speech"),
+        "source": .string(source.rawValue),
+        "text": .string(textByAppendingAttachmentMarkers(text, attachments: attachments)),
+        "raw_magnitude": .number(attachments.isEmpty ? 0.85 : 0.90),
+      ]
+      if !attachments.isEmpty {
+        arguments["attachments"] = .array(attachments.map { .object($0) })
+      }
+      if let stimulusContext {
+        arguments["context"] = .object(stimulusContext.eventArguments)
+      }
+      return arguments
+  }
+
   func requestDreamTime(prompt: String? = nil) async throws -> BrainMailboxResponse {
-      let envelope = try await dispatchOperation(
-        "request_dream_time",
-        arguments: prompt.map { ["text": .string($0)] } ?? [:]
-      )
+      var arguments = prompt.map { ["prompt": JSONValue.string($0)] } ?? [:]
+      arguments["action"] = .string("request_dream_time")
+      let envelope = try await dispatchOperation("mailbox_update", arguments: arguments)
       return try BrainMailboxResponse(toolName: "request_dream_time", envelope: envelope)
   }
 
   func brainMode() async throws -> BrainModeResponse {
-      let envelope = try await dispatchOperation("brain_mode", arguments: [:])
+      let envelope = try await dispatchOperation("brain_read", arguments: ["query": .string("brain_mode")])
       return try BrainModeResponse(toolName: "brain_mode", envelope: envelope)
   }
 
-  func autonomyTick() async throws -> BrainToolResponse {
-      let envelope = try await dispatchOperation("autonomy_tick", arguments: [:])
+  func autonomyTick(stimulusContext: StimulusContext? = nil) async throws -> BrainToolResponse {
+      var arguments: [String: JSONValue] = [:]
+      if let stimulusContext {
+        arguments["context"] = .object(stimulusContext.eventArguments)
+      }
+      let envelope = try await dispatchOperation("brain_step", arguments: arguments)
       return BrainToolResponse(toolName: "autonomy_tick", envelope: envelope, rawText: envelope.rawText)
   }
 
+  func setEventSinkHandler(_ handler: BrainCoreEventSink.Handler?) {
+      eventSink.setHandler(handler)
+  }
+
+  private func submitQueueableOperation(
+    _ operation: String,
+    arguments: [String: JSONValue]
+  ) async throws -> BrainDispatchEnvelope {
+      let queueKey = Self.queueableDispatchKey(operation: operation, eventObject: arguments)
+      return try await messageBus.submitQueueable(key: queueKey) { [self] in
+        try await self.dispatchOperationBody(operation, arguments: arguments)
+      }
+  }
+
+  private func submitSerialOperation(
+    _ operation: String,
+    arguments: [String: JSONValue]
+  ) async throws -> BrainDispatchEnvelope {
+      try await messageBus.submitSerial { [self] in
+        try await self.dispatchOperationBody(operation, arguments: arguments)
+      }
+  }
+
   func readModelsSnapshot() async throws -> BrainReadModelsSnapshotResponse {
-      let envelope = try await dispatchOperation("read_models_snapshot", arguments: [:])
+      let envelope = try await dispatchOperation("brain_read", arguments: ["query": .string("models_snapshot")])
       return try BrainReadModelsSnapshotResponse(toolName: "read_models_snapshot", envelope: envelope)
   }
 
   func chatDryRunPrompt(text: String) async throws -> BrainChatDryRunPromptResponse {
       let envelope = try await dispatchOperation(
-        "chat_dry_run_prompt",
+        "debug_prompt",
         arguments: ["text": .string(text)]
       )
       return try BrainChatDryRunPromptResponse(toolName: "chat_dry_run_prompt", envelope: envelope)
   }
 
   func mailboxList() async throws -> BrainMailboxListResponse {
-      let envelope = try await dispatchOperation("mailbox_list", arguments: [:])
+      let envelope = try await dispatchOperation("mailbox_read", arguments: ["query": .string("list")])
       return try BrainMailboxListResponse(toolName: "mailbox_list", envelope: envelope)
   }
 
   func mailboxMarkRead(mailboxID: String) async throws -> BrainMailboxListResponse {
       let envelope = try await dispatchOperation(
-        "mailbox_mark_read",
-        arguments: ["mailbox_id": .string(mailboxID)]
+        "mailbox_update",
+        arguments: [
+          "action": .string("mark_read"),
+          "mailbox_id": .string(mailboxID),
+        ]
       )
       return try BrainMailboxListResponse(toolName: "mailbox_mark_read", envelope: envelope)
   }
 
   func exportBrain(to fileURL: URL) async throws -> BrainArchiveResponse {
       let envelope = try await dispatchOperation(
-        "export_brain",
-        arguments: ["brain_file_path": .string(fileURL.path)]
+        "brain_archive",
+        arguments: [
+          "action": .string("export"),
+          "brain_file_path": .string(fileURL.path),
+        ]
       )
       return try BrainArchiveResponse(toolName: "export_brain", envelope: envelope)
   }
@@ -1056,7 +1075,8 @@ actor BrainCore {
       if let hostID, !hostID.isEmpty {
         arguments["host_id"] = .string(hostID)
       }
-      let envelope = try await dispatchOperation("import_brain", arguments: arguments)
+      arguments["action"] = .string("import")
+      let envelope = try await dispatchOperation("brain_archive", arguments: arguments)
       return try BrainArchiveResponse(toolName: "import_brain", envelope: envelope)
   }
 
@@ -1090,9 +1110,7 @@ actor BrainCore {
 
   func drainEvents() async throws -> [BrainEvent] {
       try await ensureConnected()
-      let output = await coreSession.drainEventsJSON()
-      let text = try Self.checkedCopiedString(output, operation: "drain_events")
-      let envelope = try BrainDispatchEnvelope.decode(from: text)
+      let envelope = try await coreSession.drainEvents()
       guard envelope.ok else {
         let message = envelope.error?.message ?? "drain_events failed"
         throw BrainCoreError.unavailable(message)
@@ -1104,29 +1122,9 @@ actor BrainCore {
     brain: BrainDescriptor,
     providerCredentials: [ProviderCredentialKey: String]? = nil
   ) throws -> String {
-      try brain.validateForCoreConnection()
-      let storage = CoreConfigStorage(
-        brain: brain,
-        providerCredentials: providerCredentials,
-        textProviderPreference: .random
-      )
-      let explicitProviderCredentials = providerCredentials
-      let hostServices = EmbeddedHostServices(
-        credentialProvider: { explicitProviderCredentials ?? CoreConfigStorage.providerCredentials() },
-        textProviderPreference: .random
-      )
-      let result = storage.withConfig { config in
-        withUnsafePointer(to: config) { pointer in
-          hostServices.withHostServices { services in
-            withUnsafePointer(to: services) { servicesPointer in
-              Self.withCopiedResult(operation: "api_e2e") { data, errorMessage in
-                affective_core_embedded_api_e2e(pointer, servicesPointer, &data, &errorMessage)
-              }
-            }
-          }
-        }
-      }
-      return try checkedCopiedString(result, operation: "api_e2e")
+      _ = brain
+      _ = providerCredentials
+      throw BrainCoreError.unavailable("Generation provider E2E must run through the Brain Session Protocol harness.")
   }
 
     func ensureConnected() async throws {
@@ -1135,9 +1133,22 @@ actor BrainCore {
       }
     }
 
+    func syncConversationDispatchGeneration(_ generation: Int) async {
+      coreSession.syncConversationDispatchGeneration(generation)
+    }
+
+    func ingestStimulus(_ operation: String, arguments: [String: JSONValue]) async throws -> BrainDispatchEnvelope {
+      return try await submitQueueableOperation(operation, arguments: arguments)
+    }
+
     func dispatchOperation(_ operation: String, arguments: [String: JSONValue]) async throws -> BrainDispatchEnvelope {
-      await acquireDispatchTurn()
-      defer { releaseDispatchTurn() }
+      if BrainCoreQueueableOperation.contains(operation) {
+        return try await submitQueueableOperation(operation, arguments: arguments)
+      }
+      return try await submitSerialOperation(operation, arguments: arguments)
+    }
+
+    private func dispatchOperationBody(_ operation: String, arguments: [String: JSONValue]) async throws -> BrainDispatchEnvelope {
       try await ensureConnected()
       let requestID = UUID().uuidString
       var eventObject = arguments
@@ -1148,42 +1159,47 @@ actor BrainCore {
       ])
       let requestData = try request.encodedData()
       Self.brainCoreLogger.info("Dispatch operation start operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) requestBytes=\(requestData.count, privacy: .public)")
-      let output = await coreSession.dispatchJSON(requestData: requestData)
-      Self.brainCoreLogger.info("Dispatch operation result operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) status=\(output.status, privacy: .public) dataBytes=\(output.dataBytes, privacy: .public) errorBytes=\(output.errorBytes, privacy: .public)")
-      let text = try Self.checkedCopiedString(output, operation: operation)
-      let envelope = try BrainDispatchEnvelope.decode(from: text)
+      return try await dispatchPreparedRequest(operation: operation, requestData: requestData, requestID: requestID)
+    }
+
+    private static func identityJSONValue(_ identity: FaceRecognitionIdentityResult) -> JSONValue {
+      var object: [String: JSONValue] = [
+        "person_present": .bool(identity.personPresent),
+        "match_status": .string(identity.matchStatus),
+        "confidence": .number(Double(identity.confidence)),
+        "people_count": .number(Double(identity.peopleCount)),
+      ]
+      if let personID = identity.personID {
+        object["person_id"] = .string(personID)
+      }
+      if let candidateName = identity.candidateName {
+        object["candidate_name"] = .string(candidateName)
+      }
+      return .object(object)
+    }
+
+    private func dispatchPreparedRequest(
+      operation: String,
+      requestData: Data,
+      requestID: String
+    ) async throws -> BrainDispatchEnvelope {
+      try await ensureConnected()
+      Self.brainCoreLogger.info("Dispatch start operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) requestBytes=\(requestData.count, privacy: .public)")
+      let envelope = try await coreSession.dispatch(requestData: requestData)
+      Self.brainCoreLogger.info("Dispatch result operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) ok=\(envelope.ok, privacy: .public) eventCount=\(envelope.events.count, privacy: .public)")
       guard envelope.ok else {
         let message = envelope.error?.message ?? "\(operation) failed"
-        Self.brainCoreLogger.error("Dispatch operation envelope error operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) code=\(envelope.error?.code ?? "unknown", privacy: .public) message=\(message, privacy: .public)")
+        Self.brainCoreLogger.error("Dispatch envelope error operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) code=\(envelope.error?.code ?? "unknown", privacy: .public) message=\(message, privacy: .public)")
         throw BrainCoreError.unavailable(message)
       }
-      return try await mergeDrainedEvents(into: envelope)
-    }
-
-    private func acquireDispatchTurn() async {
-      while true {
-        if !dispatchInFlight {
-          dispatchInFlight = true
-          return
-        }
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-          dispatchWaiters.append(continuation)
-        }
+      if envelope.dispatchWasQueued {
+        return envelope
       }
-    }
-
-    private func releaseDispatchTurn() {
-      if dispatchWaiters.isEmpty {
-        dispatchInFlight = false
-        return
-      }
-      let next = dispatchWaiters.removeFirst()
-      next.resume()
+      return envelope
     }
 
     func dispatch(event: BrainEvent, operation: String) async throws -> BrainDispatchEnvelope {
-      await acquireDispatchTurn()
-      defer { releaseDispatchTurn() }
+      try await ensureConnected()
       let requestID = UUID().uuidString
       let encodedEventValue = try event.encodedJSONValue()
       let eventValue: JSONValue
@@ -1234,128 +1250,60 @@ actor BrainCore {
         "event": eventValue,
       ])
       let requestData = try request.encodedData()
-      Self.brainCoreLogger.info("Dispatch start operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) requestBytes=\(requestData.count, privacy: .public)")
-      let output = await coreSession.dispatchJSON(requestData: requestData)
-      Self.brainCoreLogger.info("Dispatch result operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) status=\(output.status, privacy: .public) dataBytes=\(output.dataBytes, privacy: .public) errorBytes=\(output.errorBytes, privacy: .public)")
-		      let text = try Self.checkedCopiedString(output, operation: operation)
-		      let envelope = try BrainDispatchEnvelope.decode(from: text)
-		      guard envelope.ok else {
-		        let message = envelope.error?.message ?? "\(operation) failed"
-		        Self.brainCoreLogger.error("Dispatch envelope error operation=\(operation, privacy: .public) requestID=\(requestID, privacy: .public) code=\(envelope.error?.code ?? "unknown", privacy: .public) message=\(message, privacy: .public)")
-		        throw BrainCoreError.unavailable(message)
-	      }
-      return try await mergeDrainedEvents(into: envelope)
-    }
-
-    private func mergeDrainedEvents(into envelope: BrainDispatchEnvelope) async throws -> BrainDispatchEnvelope {
-      let drained = try await drainAllEvents()
-      guard !drained.isEmpty else { return envelope }
-      return BrainDispatchEnvelope(
-        requestID: envelope.requestID,
-        ok: envelope.ok,
-        events: envelope.events + drained,
-        result: envelope.result,
-        error: envelope.error,
-        budget: envelope.budget,
-        timings: envelope.timings,
-        rawText: envelope.rawText
-      )
-    }
-
-    private func drainAllEvents() async throws -> [BrainEvent] {
-      var merged: [BrainEvent] = []
-      for _ in 0..<32 {
-        let batch = try await drainEvents()
-        if batch.isEmpty { break }
-        merged.append(contentsOf: batch)
+      let send: @Sendable () async throws -> BrainDispatchEnvelope = { [self] in
+        try await self.dispatchPreparedRequest(operation: operation, requestData: requestData, requestID: requestID)
       }
-      return merged
-    }
-
-		    static func checkedCopiedString(_ result: AffectiveCoreCopiedResult, operation: String)
-	      throws -> String
-	    {
-      guard result.status == 0 else {
-        let message = result.errorMessage
-        throw BrainCoreError.unavailable(message.isEmpty ? "\(operation) failed" : message)
-      }
-      return result.data
-    }
-
-	    static func withFFI<Result>(_ body: () -> Result) -> Result {
-	      ffiLock.lock()
-	      defer { ffiLock.unlock() }
-	      return body()
-	    }
-
-    static func createCore(
-      _ config: UnsafePointer<AffectiveCoreEmbeddedConfig>?,
-      hostServices: UnsafePointer<AffectiveCoreEmbeddedHostServices>?
-    ) -> (
-      status: Int32,
-      handle: AffectiveCoreHandle?,
-      errorMessage: String
-    ) {
-      withFFI {
-        var handle: AffectiveCoreHandle?
-        var errorMessage = AffectiveCoreEmbeddedString(ptr: nil, len: 0)
-        let status = affective_core_embedded_create(config, hostServices, &handle, &errorMessage)
-        defer { affective_core_embedded_free_global_string(errorMessage) }
-        return (status, handle, string(from: errorMessage))
-      }
-    }
-
-    static func dispatchJSON(
-      _ handle: AffectiveCoreHandle?,
-      requestJSON: UnsafePointer<UInt8>?,
-      requestJSONLength: Int
-    ) -> AffectiveCoreCopiedResult {
-      withCopiedResult(operation: "dispatch_json") { data, errorMessage in
-        affective_core_embedded_dispatch_json(
-          handle,
-          requestJSON,
-          requestJSONLength,
-          &data,
-          &errorMessage
+      if BrainCoreQueueableOperation.contains(operation) {
+        return try await messageBus.submitQueueable(
+          key: Self.queueableDispatchKey(operation: operation, eventValue: eventValue),
+          send
         )
       }
+      return try await messageBus.submitSerial(send)
     }
 
-    static func drainEventsJSON(_ handle: AffectiveCoreHandle?) -> AffectiveCoreCopiedResult {
-      withCopiedResult(operation: "drain_events") { data, errorMessage in
-        affective_core_embedded_drain_events_json(handle, &data, &errorMessage)
+    nonisolated static func queueableDispatchKey(
+      operation: String,
+      eventValue: JSONValue
+    ) -> String {
+      queueableDispatchKey(operation: operation, eventObject: eventValue.objectValue ?? [:])
+    }
+
+    nonisolated static func queueableDispatchKey(
+      operation: String,
+      eventObject: [String: JSONValue]
+    ) -> String {
+      if BrainCoreIngestEligibleOperation.contains(operation) {
+        let kind = firstNonEmptyString(in: eventObject, keys: ["kind"]) ?? "stimulus"
+        return "\(operation):\(kind):\(UUID().uuidString)"
       }
+      if let sense = firstNonEmptyString(in: eventObject, keys: ["sense", "sense_id"]) {
+        return "\(operation):sense:\(sense)"
+      }
+      if let capability = firstNonEmptyString(in: eventObject, keys: ["capability_id", "capability"]) {
+        return "\(operation):capability:\(capability)"
+      }
+      if let action = firstNonEmptyString(in: eventObject, keys: ["action", "action_id"]) {
+        return "\(operation):action:\(action)"
+      }
+      return operation
     }
 
-    static func withCopiedResult(
-      operation _: String,
-      _ body: (inout AffectiveCoreEmbeddedString, inout AffectiveCoreEmbeddedString) -> Int32
-    ) -> AffectiveCoreCopiedResult {
-      withFFI {
-        var data = AffectiveCoreEmbeddedString(ptr: nil, len: 0)
-        var errorMessage = AffectiveCoreEmbeddedString(ptr: nil, len: 0)
-        let status = body(&data, &errorMessage)
-        defer {
-          affective_core_embedded_free_global_string(data)
-          affective_core_embedded_free_global_string(errorMessage)
+    private nonisolated static func firstNonEmptyString(
+      in object: [String: JSONValue],
+      keys: [String]
+    ) -> String? {
+      for key in keys {
+        guard let value = object[key]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty
+        else {
+          continue
         }
-        return AffectiveCoreCopiedResult(
-          status: status,
-          data: string(from: data),
-          errorMessage: string(from: errorMessage),
-          dataBytes: data.len,
-          errorBytes: errorMessage.len
-        )
+        return value
       }
+      return nil
     }
 
-    static func string(from value: AffectiveCoreEmbeddedString) -> String {
-      guard let ptr = value.ptr, value.len > 0 else {
-        return ""
-      }
-      let buffer = UnsafeBufferPointer(start: ptr, count: value.len)
-      return String(decoding: buffer, as: UTF8.self)
-    }
 }
 
 extension BrainCore: BrainCoreClient {}

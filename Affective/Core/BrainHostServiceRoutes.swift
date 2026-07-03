@@ -4,6 +4,9 @@
 //
 
 import Foundation
+#if canImport(os)
+  import os
+#endif
 #if canImport(AVFoundation)
   import AVFoundation
 #endif
@@ -12,51 +15,22 @@ import Foundation
 #endif
 
 #if os(iOS) || os(macOS)
-  typealias AffectiveCoreHandle = OpaquePointer
-
-  nonisolated struct AffectiveCoreCopiedResult {
-    var status: Int32
-    var data: String
-    var errorMessage: String
-    var dataBytes: Int
-    var errorBytes: Int
-  }
-
-  nonisolated final class EmbeddedHostServices {
+  nonisolated final class BrainHostServiceRoutes {
     typealias CredentialProvider = HostProviderRouter.CredentialProvider
     typealias ProviderPicker = HostProviderRouter.ProviderPicker
     typealias JSONLoader = HostLLMCompletionClient.JSONLoader
     typealias TextRoutePicker = HostLLMCompletionClient.RoutePicker
 
+    nonisolated(unsafe) private static weak var currentInstance: BrainHostServiceRoutes?
+    nonisolated(unsafe) static var llmCompletionObserver: (@Sendable (HostLLMCompletionObservation) -> Void)?
+
+    static func clearLLMCompletionObserver() {
+      llmCompletionObserver = nil
+    }
+
     private struct Header: Decodable {
       let name: String
       let value: String
-    }
-
-    private struct HostLLMCompletionPayload: Decodable {
-      let systemPrompt: String
-      let userPrompt: String
-      let responseFormat: String
-      let maxTokens: Int?
-      let jsonSchema: String?
-
-      enum CodingKeys: String, CodingKey {
-        case systemPrompt = "system_prompt"
-        case userPrompt = "user_prompt"
-        case responseFormat = "response_format"
-        case maxTokens = "max_tokens"
-        case jsonSchema = "json_schema"
-      }
-
-      var promptPayload: HostLLMPromptPayload {
-        HostLLMPromptPayload(
-          systemPrompt: systemPrompt,
-          userPrompt: userPrompt,
-          responseFormat: responseFormat,
-          maxTokens: maxTokens,
-          jsonSchema: jsonSchema
-        )
-      }
     }
 
     private struct HostImageGenerationPayload: Decodable {
@@ -98,6 +72,7 @@ import Foundation
     }
 
     private static let hostLLMCompletionURL = "affective-host://llm/complete"
+    private static let hostHTTPLogger = Logger(subsystem: "com.zelda-built-this.AMBI", category: "EmbeddedHostHTTP")
     private static let hostImageGenerationURL = "affective-host://image/generate"
     private static let hostVisionCompletionURL = "affective-host://vision/complete"
     private static let hostRecognizeIdentifyURL = "affective-host://recognize/identify"
@@ -111,6 +86,12 @@ import Foundation
     private let textRoutePicker: TextRoutePicker
     private let jsonLoader: JSONLoader?
     private let faceRecognizer: FaceRecognizing
+    private let conversationDispatchLock = NSLock()
+    private var conversationDispatchGeneration = 0
+    private var activeUserTextDispatchGeneration = 0
+    private let identifyCacheLock = NSLock()
+    private var identifyCache: [String: (data: Data, storedAt: Date)] = [:]
+    private static let identifyCacheTTL: TimeInterval = 60
 
     init(
       credentialProvider: @escaping CredentialProvider = CoreConfigStorage.providerCredentials,
@@ -128,43 +109,31 @@ import Foundation
       self.textRoutePicker = textRoutePicker
       self.jsonLoader = jsonLoader
       self.faceRecognizer = faceRecognizer
+      Self.currentInstance = self
     }
 
-    func withHostServices<Result>(_ body: (AffectiveCoreEmbeddedHostServices) -> Result)
-      -> Result
-    {
-      body(
-        AffectiveCoreEmbeddedHostServices(
-          ctx: Unmanaged.passUnretained(self).toOpaque(),
-          http_post_json: Self.embeddedHostHttpPostJSON,
-          free_string: Self.embeddedHostFreeString
-        ))
+    func syncConversationDispatchGeneration(_ generation: Int) {
+      conversationDispatchLock.lock()
+      conversationDispatchGeneration = generation
+      conversationDispatchLock.unlock()
     }
 
-    func httpPostJSON(
-      url: AffectiveCoreEmbeddedString,
-      headersJSON: AffectiveCoreEmbeddedString,
-      body: AffectiveCoreEmbeddedString,
-      outData: UnsafeMutablePointer<AffectiveCoreEmbeddedString>?,
-      outError: UnsafeMutablePointer<AffectiveCoreEmbeddedString>?
-    ) -> Int32 {
-      do {
-        let response = try performPostJSON(
-          url: try Self.requiredString(url, label: "url"),
-          headersJSON: try Self.requiredString(headersJSON, label: "headers_json"),
-          body: Self.data(from: body)
-        )
-        Self.copy(response, to: outData)
-        Self.copy(Data(), to: outError)
-        return 0
-      } catch {
-        Self.copy(
-          Data(Self.httpErrorDescription(error, url: url, body: body).utf8),
-          to: outError
-        )
-        Self.copy(Data(), to: outData)
-        return 1
-      }
+    func beginUserTextDispatchFromCurrentConversationGeneration() {
+      conversationDispatchLock.lock()
+      activeUserTextDispatchGeneration = conversationDispatchGeneration
+      conversationDispatchLock.unlock()
+    }
+
+    func beginUserTextDispatch(generation: Int) {
+      conversationDispatchLock.lock()
+      activeUserTextDispatchGeneration = generation
+      conversationDispatchLock.unlock()
+    }
+
+    func isUserTextDispatchSuperseded() -> Bool {
+      conversationDispatchLock.lock()
+      defer { conversationDispatchLock.unlock() }
+      return activeUserTextDispatchGeneration != conversationDispatchGeneration
     }
 
     func postJSON(url urlString: String, headersJSON: String, body: Data) throws -> Data {
@@ -232,17 +201,18 @@ import Foundation
     }
 
     private func performHostLLMCompletion(body: Data) throws -> Data {
-      let payload = try JSONDecoder().decode(HostLLMCompletionPayload.self, from: body)
-      let prompt = HostPromptBuilder.combinedPrompt(for: payload.promptPayload)
+      let payload = try JSONDecoder().decode(HostLLMPromptPayload.self, from: body)
+      let prompt = HostPromptBuilder.combinedPrompt(for: payload)
       let client = HostLLMCompletionClient(
         providerRouter: providerRouter,
         textProviderPreference: textProviderPreference,
         routePicker: textRoutePicker,
         jsonLoader: jsonLoader
       )
+      let maxTokens = payload.maxTokens ?? 512
       let request = HostLLMCompletionRequest(
         prompt: prompt,
-        maxTokens: payload.maxTokens ?? 512,
+        maxTokens: maxTokens,
         responseFormat: HostResponseFormat(rawValue: payload.responseFormat) ?? .text,
         jsonSchema: payload.jsonSchema ?? "{}"
       )
@@ -256,18 +226,67 @@ import Foundation
           try await client.complete(request)
         }
       }
+      let observation = payload.completionObservation(
+        provider: completion.source,
+        maxTokens: maxTokens,
+        prompt: prompt,
+        response: completion.text
+      )
+      Self.logHostLLMCompletion(observation)
       return Data(completion.text.utf8)
+    }
+
+    private static func logHostLLMCompletion(_ observation: HostLLMCompletionObservation) {
+      hostHTTPLogger.info(
+        "Host LLM complete subsystem=\(observation.subsystem, privacy: .public) \(observation.eventLogBody, privacy: .public)"
+      )
+      llmCompletionObserver?(observation)
     }
 
     private func performHostRecognizeIdentify(body: Data) throws -> Data {
       let payload = try JSONDecoder().decode(FaceRecognitionIdentifyRequest.self, from: body)
+      if let cached = cachedIdentifyResponse(for: payload.imagePath) {
+        return cached
+      }
       let result = try faceRecognizer.identify(payload)
-      return try JSONEncoder().encode(result)
+      let encoded = try JSONEncoder().encode(result)
+      storeIdentifyResponse(encoded, for: payload.imagePath)
+      return encoded
+    }
+
+    private func cachedIdentifyResponse(for imagePath: String) -> Data? {
+      identifyCacheLock.lock()
+      defer { identifyCacheLock.unlock() }
+      guard let cached = identifyCache[imagePath] else { return nil }
+      guard Date().timeIntervalSince(cached.storedAt) <= Self.identifyCacheTTL else {
+        identifyCache.removeValue(forKey: imagePath)
+        return nil
+      }
+      return cached.data
+    }
+
+    private func storeIdentifyResponse(_ data: Data, for imagePath: String) {
+      identifyCacheLock.lock()
+      identifyCache[imagePath] = (data, Date())
+      identifyCacheLock.unlock()
+    }
+
+    private func removeCachedIdentifyResponse(for imagePath: String) {
+      identifyCacheLock.lock()
+      identifyCache.removeValue(forKey: imagePath)
+      identifyCacheLock.unlock()
+    }
+
+    static func primeIdentifyCache(imagePath: String, result: FaceRecognitionIdentityResult) {
+      guard let data = try? JSONEncoder().encode(result) else { return }
+      guard let currentInstance else { return }
+      currentInstance.storeIdentifyResponse(data, for: imagePath)
     }
 
     private func performHostRecognizeEnroll(body: Data) throws -> Data {
       let payload = try JSONDecoder().decode(FaceRecognitionEnrollRequest.self, from: body)
       let result = try faceRecognizer.enroll(payload)
+      removeCachedIdentifyResponse(for: payload.imagePath)
       return try JSONEncoder().encode(result)
     }
 
@@ -308,57 +327,7 @@ import Foundation
       return Data(completion.text.utf8)
     }
 
-    private static func requiredString(_ value: AffectiveCoreEmbeddedString, label: String)
-      throws -> String
-    {
-      guard let ptr = value.ptr, value.len > 0 else {
-        if value.len == 0 { return "" }
-        throw HostHTTPError.invalidString(label)
-      }
-      let buffer = UnsafeBufferPointer(start: ptr, count: value.len)
-      return String(decoding: buffer, as: UTF8.self)
-    }
-
-    private static func data(from value: AffectiveCoreEmbeddedString) -> Data {
-      guard let ptr = value.ptr, value.len > 0 else {
-        return Data()
-      }
-      return Data(bytes: ptr, count: value.len)
-    }
-
-    private static func httpErrorDescription(
-      _ error: Error,
-      url: AffectiveCoreEmbeddedString,
-      body: AffectiveCoreEmbeddedString
-    ) -> String {
-      let endpoint = (try? requiredString(url, label: "url")).flatMap { value in
-        value.isEmpty ? nil : value
-      } ?? "unknown endpoint"
-      let bodyBytes = body.len
-      let message = String(describing: error)
-      return "host HTTP POST JSON failed for \(endpoint) (\(bodyBytes) request bytes): \(message)"
-    }
-
-    static func copy(
-      _ data: Data,
-      to outString: UnsafeMutablePointer<AffectiveCoreEmbeddedString>?
-    ) {
-      guard let outString else { return }
-      guard !data.isEmpty else {
-        outString.pointee = AffectiveCoreEmbeddedString(ptr: nil, len: 0)
-        return
-      }
-      let pointer = UnsafeMutablePointer<UInt8>.allocate(capacity: data.count)
-      _ = data.copyBytes(to: UnsafeMutableBufferPointer(start: pointer, count: data.count))
-      outString.pointee = AffectiveCoreEmbeddedString(ptr: UnsafePointer(pointer), len: data.count)
-    }
-
-    func free(_ string: AffectiveCoreEmbeddedString) {
-      guard let ptr = string.ptr, string.len > 0 else { return }
-      UnsafeMutablePointer(mutating: ptr).deallocate()
-    }
-
-    /// Foundation Models must run on the main actor when invoked from the brain FFI worker thread.
+    /// Foundation Models must run on the main actor.
     private static func runBlockingOnMainActor<T>(
       timeoutSeconds: TimeInterval = 65,
       _ work: @escaping @Sendable @MainActor () async throws -> T
@@ -410,51 +379,24 @@ import Foundation
 
     private enum HostHTTPError: Error, CustomStringConvertible {
       case invalidURL(String)
-      case invalidString(String)
       case missingResponse
       case missingHTTPResponse
       case badStatus(Int, String)
       case timeout
+      case supersededByNewUserMessage
 
       var description: String {
         switch self {
         case .invalidURL(let url): return "invalid HTTP URL: \(url)"
-        case .invalidString(let label): return "invalid embedded HTTP string: \(label)"
         case .missingResponse: return "host HTTP request produced no response"
         case .missingHTTPResponse: return "host HTTP request produced a non-HTTP response"
         case .badStatus(let status, let body): return "host HTTP request failed with HTTP \(status): \(body)"
         case .timeout: return "host HTTP request timed out"
+        case .supersededByNewUserMessage: return "superseded by new user message"
         }
       }
     }
 
-    nonisolated static let embeddedHostHttpPostJSON: AffectiveCoreEmbeddedHttpPostJsonFn = {
-      ctx,
-      url,
-      headersJSON,
-      body,
-      outData,
-      outError in
-      guard let ctx else {
-        EmbeddedHostServices.copy(Data("missing embedded host services context".utf8), to: outError)
-        EmbeddedHostServices.copy(Data(), to: outData)
-        return 1
-      }
-      let services = Unmanaged<EmbeddedHostServices>.fromOpaque(ctx).takeUnretainedValue()
-      return services.httpPostJSON(
-        url: url,
-        headersJSON: headersJSON,
-        body: body,
-        outData: outData,
-        outError: outError
-      )
-    }
-
-    nonisolated static let embeddedHostFreeString: AffectiveCoreEmbeddedFreeHostStringFn = { ctx, string in
-      guard let ctx else { return }
-      let services = Unmanaged<EmbeddedHostServices>.fromOpaque(ctx).takeUnretainedValue()
-      services.free(string)
-    }
   }
 #endif
 
@@ -501,59 +443,11 @@ import Foundation
         providerCredentials: providerCredentials,
         appleFoundationModelsStatus: appleFoundationModelsStatus,
         textProviderPreference: resolvedTextProviderPreference,
-        cameraStatus: Self.currentCameraCapabilityStatus(),
+        cameraStatus: Self.currentCameraCapabilityStatus(brain: brain),
         orientationStatus: Self.currentOrientationCapabilityStatus(),
         motionGestureStatus: Self.currentMotionGestureCapabilityStatus(brain: brain),
         biometricPolicy: BiometricDataPolicy.load(for: brain)
       ).jsonString().utf8)
-    }
-
-    func withConfig<Result>(_ body: (AffectiveCoreEmbeddedConfig) -> Result) -> Result {
-      brainID.withUnsafeBufferPointer { brainID in
-        brainRoot.withUnsafeBufferPointer { brainRoot in
-          conversationModels.withUnsafeBufferPointer { conversationModels in
-            conversationReasoningEffort.withUnsafeBufferPointer { conversationReasoningEffort in
-              imageGenerationModel.withUnsafeBufferPointer { imageGenerationModel in
-                imageGenerationOutputDir.withUnsafeBufferPointer { imageGenerationOutputDir in
-                  memoryPath.withUnsafeBufferPointer { memoryPath in
-                    graphPath.withUnsafeBufferPointer { graphPath in
-                      schedulePath.withUnsafeBufferPointer { schedulePath in
-                        maintenanceStatePath.withUnsafeBufferPointer { maintenanceStatePath in
-                          faceEmbeddingsDir.withUnsafeBufferPointer { faceEmbeddingsDir in
-                            hostManifestJSON.withUnsafeBufferPointer { hostManifestJSON in
-                              body(
-                                AffectiveCoreEmbeddedConfig(
-                                  brain_id: Self.string(brainID),
-                                  brain_root: Self.string(brainRoot),
-                                  conversation_models: Self.string(conversationModels),
-                                  conversation_reasoning_effort: Self.string(
-                                    conversationReasoningEffort),
-                                  image_generation_model: Self.string(imageGenerationModel),
-                                  image_generation_output_dir: Self.string(
-                                    imageGenerationOutputDir),
-                                  memory_path: Self.string(memoryPath),
-                                  graph_path: Self.string(graphPath),
-                                  schedule_path: Self.string(schedulePath),
-                                  maintenance_state_path: Self.string(maintenanceStatePath),
-                                  face_embeddings_dir: Self.string(faceEmbeddingsDir),
-                                  host_manifest_json: Self.string(hostManifestJSON)
-                                ))
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    static func string(_ buffer: UnsafeBufferPointer<UInt8>) -> AffectiveCoreEmbeddedString {
-      AffectiveCoreEmbeddedString(ptr: buffer.baseAddress, len: buffer.count)
     }
 
     static func providerCredentials() -> [ProviderCredentialKey: String] {
@@ -633,7 +527,15 @@ import Foundation
       orientationStatus == "available" || orientationStatus == "prompt_required"
     }
 
-    static func currentCameraCapabilityStatus() -> String {
+    static func currentCameraCapabilityStatus(brain: BrainDescriptor? = nil) -> String {
+      if let brain,
+         let data = try? Data(contentsOf: brain.runtimeOptionsURL),
+         !data.isEmpty,
+         let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+         let rawValue = object[AffectiveViewModel.cameraCaptureEnabledOptionKey] as? String,
+         rawValue == "off" {
+        return "disabled"
+      }
       #if canImport(AVFoundation)
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -741,11 +643,38 @@ import Foundation
     }
 
     var hasTextRouting: Bool {
-      !selectedTextProviderNames.isEmpty
+      Self.hasRoutableTextCompletion(
+        configuredProviders: configuredProviders,
+        appleFoundationModelsStatus: appleFoundationModelsStatus,
+        textProviderPreference: textProviderPreference
+      )
     }
 
     var hasNetworkProviderRouting: Bool {
       !configuredProviders.isEmpty
+    }
+
+    static func hasRoutableTextCompletion(
+      configuredProviders: Set<ProviderCredentialKey>,
+      appleFoundationModelsStatus: AppleFoundationModelsAvailability,
+      textProviderPreference: HostTextProviderPreference
+    ) -> Bool {
+      let router = HostProviderRouter(
+        credentialProvider: {
+          ProviderCredentialKey.allCases.reduce(into: [ProviderCredentialKey: String]()) { credentials, key in
+            guard configuredProviders.contains(key) else { return }
+            credentials[key] = "manifest-placeholder"
+          }
+        }
+      )
+      let client = HostLLMCompletionClient(
+        providerRouter: router,
+        appleFoundationModelsClient: AppleFoundationModelsTextClient(
+          availabilityProvider: { appleFoundationModelsStatus }
+        ),
+        textProviderPreference: textProviderPreference.resolvedForHostRouting()
+      )
+      return (try? client.primaryRoute()) != nil
     }
 
     var sortedConfiguredProviderNames: [String] {
@@ -805,6 +734,22 @@ import Foundation
       }
     }
 
+    var cameraIsEnabled: Bool {
+      cameraStatus != "disabled"
+    }
+
+    var cameraCaptureStatus: String {
+      cameraIsEnabled ? cameraStatus : "disabled"
+    }
+
+    var cameraDependentStatus: String {
+      cameraIsEnabled ? "available" : "disabled"
+    }
+
+    func cameraDependentStatusWhenAvailable(_ fallback: String) -> String {
+      cameraIsEnabled ? fallback : "disabled"
+    }
+
     var senseCatalog: [PullSenseDescriptor] {
       [
         PullSenseDescriptor(
@@ -842,22 +787,29 @@ import Foundation
       let recognitionModelsAvailable = FaceRecognitionService.bundledModelsAvailable
       let identityRecognitionStatus = !biometricPolicy.canRecognize
         ? "disabled_by_policy"
-        : (recognitionModelsAvailable ? "available" : "unavailable")
+        : cameraDependentStatusWhenAvailable(recognitionModelsAvailable ? "available" : "unavailable")
       let facePictureUpdateStatus = !biometricPolicy.canEnroll
         ? "disabled_by_policy"
-        : (recognitionModelsAvailable ? "available" : "unavailable")
+        : cameraDependentStatusWhenAvailable(recognitionModelsAvailable ? "available" : "unavailable")
+      let providerVisionStatus = hasNetworkProviderRouting
+        ? cameraDependentStatus
+        : "unavailable"
       let manifest: JSONValue = .object([
         "platform": .string(platform),
         "storage_provider": .string("file_backed_migration"),
         "capabilities": .array(capabilities.map(JSONValue.string)),
         "capability_status": .object([
           "camera": .string(cameraStatus),
+          "camera_capture": .string(cameraCaptureStatus),
           "orientation": .string(orientationStatus),
           "motion_gesture": .string(motionGestureStatus),
           "time": .string(CoreConfigStorage.currentDateTimeCapabilityStatus()),
           "face_identification": .string(identityRecognitionStatus),
+          "identity_recognition": .string(identityRecognitionStatus),
           "face_enrollment": .string(facePictureUpdateStatus),
+          "face_picture_update": .string(facePictureUpdateStatus),
           "provider_routing": .string(hasTextRouting ? "available" : "unavailable"),
+          "provider_vision_completion": .string(providerVisionStatus),
           "apple_foundation_models": .string(appleFoundationModelsStatus.rawValue),
         ]),
         "biometric_policy": .object([
@@ -879,7 +831,7 @@ import Foundation
           "streaming_events": .bool(true),
           "logical_store": .bool(false),
         ]),
-        "max_envelope_bytes": .number(16 * 1024),
+        "max_envelope_bytes": .number(64 * 1024),
         "max_event_count": .number(12),
         "max_event_text_bytes": .number(768),
         "raw_ref_ttl_seconds": .number(24 * 60 * 60),

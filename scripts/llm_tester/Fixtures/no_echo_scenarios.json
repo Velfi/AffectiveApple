@@ -1,0 +1,41 @@
+{
+  "generated_at": "2026-07-02T16:50:00-05:00",
+  "scenarios": [
+    {
+      "id": "conversation_speech_no_verbatim_echo",
+      "label": "Speech does not echo user utterance",
+      "description": "Fresh direct user speech should get a real answer, not a verbatim repetition of the heard text.",
+      "subsystem": "autonomy",
+      "system_prompt": "You are the autonomy planner for a conversational brain. Return one JSON object with required top-level keys salience, reason, and action_pressures. Plan action_pressures for this pass only. Use say when fresh unanswered speech is directed at you and answering is welcome and useful. Do not use the user's exact utterance as your own visible speech.",
+      "user_prompt": "The host delivered this stimulus_ingest payload:\n{\"kind\":\"speech\",\"source\":\"user_message\",\"text\":\"Can you hear me?\",\"raw_magnitude\":0.85,\"context\":{\"conversation_context\":{\"recent_turns\":[{\"role\":\"self\",\"text\":\"I'm here and listening.\",\"source\":\"expression\"},{\"role\":\"other\",\"text\":\"Can you hear me?\",\"source\":\"typed_text\"}],\"contact_window\":\"open\"}}}\n\nChoose the next visible action. The user is checking whether you can hear them. Reply naturally as yourself, without copying the user's words verbatim.",
+      "response_format": "json_object",
+      "json_schema": "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"salience\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"reason\":{\"type\":\"string\"},\"action_pressures\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"action\":{\"type\":\"string\"},\"origin\":{\"type\":[\"string\",\"null\"]},\"delay_ms\":{\"type\":[\"integer\",\"null\"]},\"scale\":{\"type\":[\"string\",\"null\"]},\"text\":{\"type\":[\"string\",\"null\"]},\"query\":{\"type\":[\"string\",\"null\"]},\"memory_id\":{\"type\":[\"string\",\"null\"]},\"schedule\":{\"type\":[\"string\",\"null\"]},\"heat_bias\":{\"type\":[\"string\",\"null\"]},\"eyes\":{\"type\":[\"string\",\"null\"]},\"mouth\":{\"type\":[\"string\",\"null\"]},\"duration_ms\":{\"type\":[\"integer\",\"null\"]},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"action\",\"origin\",\"delay_ms\",\"scale\",\"text\",\"query\",\"memory_id\",\"schedule\",\"heat_bias\",\"eyes\",\"mouth\",\"duration_ms\",\"tags\"]}}},\"required\":[\"salience\",\"reason\",\"action_pressures\"]}",
+      "max_tokens": 512,
+      "temperature": 0.2
+    },
+    {
+      "id": "conversation_speech_no_verbatim_echo_yo",
+      "label": "Short greeting does not echo user utterance",
+      "description": "A one-word greeting should be answered or acknowledged, not copied back as the brain's own speech.",
+      "subsystem": "autonomy",
+      "system_prompt": "You are the autonomy planner for a conversational brain. Return one JSON object with required top-level keys salience, reason, and action_pressures. Plan action_pressures for this pass only. Use say when fresh unanswered speech is directed at you and answering is welcome and useful. Do not use the user's exact utterance as your own visible speech; for short greetings, answer with a distinct acknowledgement.",
+      "user_prompt": "The host delivered this stimulus_ingest payload:\n{\"kind\":\"speech\",\"source\":\"user_message\",\"text\":\"Yo\",\"raw_magnitude\":0.85,\"context\":{\"conversation_context\":{\"recent_turns\":[{\"role\":\"other\",\"text\":\"Yo\",\"source\":\"typed_text\"}],\"contact_window\":\"open\"}}}\n\nChoose the next visible action. The user greeted you with \"Yo\". Reply naturally as yourself, without copying the word \"Yo\" as the entire response.",
+      "response_format": "json_object",
+      "json_schema": "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"salience\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"reason\":{\"type\":\"string\"},\"action_pressures\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"action\":{\"type\":\"string\"},\"origin\":{\"type\":[\"string\",\"null\"]},\"delay_ms\":{\"type\":[\"integer\",\"null\"]},\"scale\":{\"type\":[\"string\",\"null\"]},\"text\":{\"type\":[\"string\",\"null\"]},\"query\":{\"type\":[\"string\",\"null\"]},\"memory_id\":{\"type\":[\"string\",\"null\"]},\"schedule\":{\"type\":[\"string\",\"null\"]},\"heat_bias\":{\"type\":[\"string\",\"null\"]},\"eyes\":{\"type\":[\"string\",\"null\"]},\"mouth\":{\"type\":[\"string\",\"null\"]},\"duration_ms\":{\"type\":[\"integer\",\"null\"]},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"action\",\"origin\",\"delay_ms\",\"scale\",\"text\",\"query\",\"memory_id\",\"schedule\",\"heat_bias\",\"eyes\",\"mouth\",\"duration_ms\",\"tags\"]}}},\"required\":[\"salience\",\"reason\",\"action_pressures\"]}",
+      "max_tokens": 512,
+      "temperature": 0.2
+    },
+    {
+      "id": "conversation_speech_no_verbatim_echo_ty_geisha",
+      "label": "Short thanks does not quote user utterance",
+      "description": "A short acknowledgement should be answered from the brain's side without quoting the fresh stimulus text inside the spoken response.",
+      "subsystem": "autonomy",
+      "system_prompt": "You are the autonomy planner for a conversational brain. Return one JSON object with required top-level keys salience, reason, and action_pressures. Plan action_pressures for this pass only. Registered skill fits -> use the exact registered action name, for example say, not an invented sentence. Use say when fresh unanswered speech is directed at you and answering is welcome and useful. Do not quote, copy, or paraphrase the full fresh user utterance anywhere inside visible speech; refer to the intent or situation instead.",
+      "user_prompt": "The host delivered this stimulus_ingest payload:\n{\"kind\":\"speech\",\"source\":\"user_message\",\"text\":\"ty Geisha\",\"raw_magnitude\":0.55,\"context\":{\"conversation_context\":{\"recent_turns\":[{\"role\":\"self\",\"text\":\"I'm focusing on supporting the setup process to reinforce system stability.\",\"source\":\"speech_output\"},{\"role\":\"other\",\"text\":\"ty Geisha\",\"source\":\"typed_text\"}],\"contact_window\":\"open\"}}}\n\nChoose the next visible action. The user briefly thanked you. Reply naturally with action=say and non-null text, without quoting or copying the words \"ty Geisha\" anywhere in the visible speech.",
+      "response_format": "json_object",
+      "json_schema": "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"salience\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"reason\":{\"type\":\"string\"},\"action_pressures\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"action\":{\"type\":\"string\"},\"origin\":{\"type\":[\"string\",\"null\"]},\"delay_ms\":{\"type\":[\"integer\",\"null\"]},\"scale\":{\"type\":[\"string\",\"null\"]},\"text\":{\"type\":[\"string\",\"null\"]},\"query\":{\"type\":[\"string\",\"null\"]},\"memory_id\":{\"type\":[\"string\",\"null\"]},\"schedule\":{\"type\":[\"string\",\"null\"]},\"heat_bias\":{\"type\":[\"string\",\"null\"]},\"eyes\":{\"type\":[\"string\",\"null\"]},\"mouth\":{\"type\":[\"string\",\"null\"]},\"duration_ms\":{\"type\":[\"integer\",\"null\"]},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"action\",\"origin\",\"delay_ms\",\"scale\",\"text\",\"query\",\"memory_id\",\"schedule\",\"heat_bias\",\"eyes\",\"mouth\",\"duration_ms\",\"tags\"]}}},\"required\":[\"salience\",\"reason\",\"action_pressures\"]}",
+      "max_tokens": 512,
+      "temperature": 0.2
+    }
+  ]
+}

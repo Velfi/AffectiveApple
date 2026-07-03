@@ -120,10 +120,10 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 34384E952FEBEC9900868E97 /* Build configuration list for PBXNativeTarget "Affective" */;
 			buildPhases = (
-				C0D3F0012FF0000000000001 /* Build AffectiveCore Core */,
 				34384E6E2FEBEC9900868E97 /* Sources */,
 				34384E6F2FEBEC9900868E97 /* Frameworks */,
 				34384E702FEBEC9900868E97 /* Resources */,
+				C0D3F0032FF0000000000003 /* Build AffectiveCore BSP Session */,
 				C0D3F0022FF0000000000002 /* Stamp Build Metadata */,
 			);
 			buildRules = (
@@ -263,26 +263,6 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		C0D3F0012FF0000000000001 /* Build AffectiveCore Core */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Build AffectiveCore Core";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-				"$(DERIVED_FILE_DIR)/AffectiveCore/include/affective_core_embedded.h",
-				"$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)/libaffective-core-embedded.a",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "sh \"$SRCROOT/scripts/build_affective_core.sh\"\n";
-		};
 		C0D3F0022FF0000000000002 /* Stamp Build Metadata */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
@@ -302,6 +282,30 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "set -eu\nINFO_PLIST=\"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}\"\n[ -f \"${INFO_PLIST}\" ] || exit 0\nHASH=\"\"\nif command -v git >/dev/null 2>&1 && git -C \"${SRCROOT}\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n    HASH=\"$(git -C \"${SRCROOT}\" rev-parse --short=12 HEAD 2>/dev/null || true)\"\n    if [ -n \"${HASH}\" ] && ! git -C \"${SRCROOT}\" diff --quiet --ignore-submodules HEAD -- 2>/dev/null; then\n        HASH=\"${HASH}-dirty\"\n    fi\nfi\nTIMESTAMP=\"$(/bin/date -u +\"%Y-%m-%dT%H:%M:%SZ\")\"\n/usr/libexec/PlistBuddy -c \"Set :AffectiveBuildTimestamp ${TIMESTAMP}\" \"${INFO_PLIST}\" 2>/dev/null || /usr/libexec/PlistBuddy -c \"Add :AffectiveBuildTimestamp string ${TIMESTAMP}\" \"${INFO_PLIST}\"\nif [ -n \"${HASH}\" ]; then\n    /usr/libexec/PlistBuddy -c \"Set :AffectiveBuildHash ${HASH}\" \"${INFO_PLIST}\" 2>/dev/null || /usr/libexec/PlistBuddy -c \"Add :AffectiveBuildHash string ${HASH}\" \"${INFO_PLIST}\"\nfi\n/usr/bin/touch \"${DERIVED_FILE_DIR}/affective-build-metadata.stamp\"\n";
+		};
+			C0D3F0032FF0000000000003 /* Build AffectiveCore BSP Session */ = {
+				isa = PBXShellScriptBuildPhase;
+				basedOnDependencyAnalysis = 0;
+				buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/../AffectiveCore/src/main_session.zig",
+				"$(SRCROOT)/scripts/build_affective_core.sh",
+			);
+			name = "Build AffectiveCore BSP Session";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)/libaffective-core-session.a",
+				"$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)/affective-core-session",
+				"$(DERIVED_FILE_DIR)/AffectiveCore/include/affective_core_session.h",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${SRCROOT}/scripts/build_affective_core.sh\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -487,10 +491,6 @@
 					"$(SRCROOT)/Affective/ThirdParty",
 				);
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/../AffectiveCore/include",
-					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
-				);
 				INFOPLIST_FILE = Affective/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Affective;
 				"INFOPLIST_KEY_CFBundleIconName[sdk=iphoneos*]" = AppIcon;
@@ -511,25 +511,19 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = "$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)";
-				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = "$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)";
-				"LIBRARY_SEARCH_PATHS[sdk=macosx*]" = "$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)";
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
 				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
-					"-laffective-core-embedded",
 					"-lsqlite3",
 					"-framework",
 					Accelerate,
 				);
 				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
-					"-laffective-core-embedded",
 					"-lsqlite3",
 					"-framework",
 					Accelerate,
 				);
 				"OTHER_LDFLAGS[sdk=macosx*]" = (
-					"-laffective-core-embedded",
 					"-lsqlite3",
 					"-framework",
 					Accelerate,
@@ -577,10 +571,6 @@
 					"$(SRCROOT)/Affective/ThirdParty",
 				);
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/../AffectiveCore/include",
-					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
-				);
 				INFOPLIST_FILE = Affective/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Affective;
 				"INFOPLIST_KEY_CFBundleIconName[sdk=iphoneos*]" = AppIcon;
@@ -601,25 +591,19 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = "$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)";
-				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = "$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)";
-				"LIBRARY_SEARCH_PATHS[sdk=macosx*]" = "$(DERIVED_FILE_DIR)/AffectiveCore/$(PLATFORM_NAME)";
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
 				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
-					"-laffective-core-embedded",
 					"-lsqlite3",
 					"-framework",
 					Accelerate,
 				);
 				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
-					"-laffective-core-embedded",
 					"-lsqlite3",
 					"-framework",
 					Accelerate,
 				);
 				"OTHER_LDFLAGS[sdk=macosx*]" = (
-					"-laffective-core-embedded",
 					"-lsqlite3",
 					"-framework",
 					Accelerate,
@@ -652,10 +636,6 @@
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = 2XFBA46B9D;
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/../AffectiveCore/include",
-					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
-				);
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
@@ -683,10 +663,6 @@
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = 2XFBA46B9D;
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/../AffectiveCore/include",
-					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
-				);
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
@@ -713,10 +689,6 @@
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = 2XFBA46B9D;
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/../AffectiveCore/include",
-					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
-				);
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
@@ -743,10 +715,6 @@
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = 2XFBA46B9D;
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/../AffectiveCore/include",
-					"$(DERIVED_FILE_DIR)/AffectiveCore/include",
-				);
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;

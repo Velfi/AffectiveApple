@@ -185,10 +185,19 @@ private struct AffectiveShellView: View {
                 CoreConnectingScreen(model: model)
                     .transition(.opacity)
             }
+
+            if model.showsHostPipelineDeadlockOverlay, let deadlock = model.hostPipelineDeadlock {
+                HostPipelineDeadlockOverlay(deadlock: deadlock) {
+                    model.dismissHostPipelineDeadlockOverlay()
+                }
+                .transition(.opacity)
+                .zIndex(2)
+            }
         }
         .background(AppTheme.background)
         .foregroundStyle(AppTheme.primaryText)
         .animation(.smooth(duration: 0.2), value: model.showsCoreConnectingScreen)
+        .animation(.smooth(duration: 0.2), value: model.showsHostPipelineDeadlockOverlay)
         .onChange(of: brain) { _, updated in
             AppTheme.applyTheme(for: updated)
             model.reloadBrain(updated)

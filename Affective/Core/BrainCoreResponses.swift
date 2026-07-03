@@ -258,6 +258,7 @@ nonisolated struct BrainToolResponse: Equatable {
   let metadata: [String: String]
   let shouldSpeak: Bool
   let events: [BrainEvent]
+  let envelope: BrainDispatchEnvelope
 
   init(
     toolName: String,
@@ -265,7 +266,14 @@ nonisolated struct BrainToolResponse: Equatable {
     metadata: [String: String],
     shouldSpeak: Bool = false,
     events: [BrainEvent],
-    rawText: String = ""
+    rawText: String = "",
+    envelope: BrainDispatchEnvelope = BrainDispatchEnvelope(
+      requestID: "",
+      ok: true,
+      events: [],
+      result: nil,
+      error: nil
+    )
   ) {
     self.toolName = toolName
     self.text = text
@@ -273,10 +281,12 @@ nonisolated struct BrainToolResponse: Equatable {
     self.shouldSpeak = shouldSpeak
     self.events = events
     self.rawText = rawText
+    self.envelope = envelope
   }
 
   init(toolName: String, envelope: BrainDispatchEnvelope, rawText: String) {
     self.toolName = toolName
+    self.envelope = envelope
     self.rawText = rawText
     events = envelope.events
 
@@ -289,7 +299,7 @@ nonisolated struct BrainToolResponse: Equatable {
       : (envelope.displayTextFromEvents.isEmpty ? "result_value" : "event_envelope")
     mergedMetadata["display_text_length"] = "\(text.count)"
     metadata = mergedMetadata
-    shouldSpeak = !envelope.speechTexts.isEmpty
+    shouldSpeak = envelope.requiresHostSpeechPlayback
   }
 }
 
@@ -397,6 +407,25 @@ nonisolated enum BrainLoopPhase: String, Codable, Equatable, Sendable {
   case expressing
   case sleeping
   case error
+}
+
+extension BrainLoopPhase {
+  var displayLabel: String {
+    switch self {
+    case .idle: "Idle"
+    case .receivingExperience: "Taking in context"
+    case .appraising: "Appraising"
+    case .recalling: "Recalling memories"
+    case .thinking: "Thinking"
+    case .planning: "Planning"
+    case .awaitingHostAction: "Waiting for host"
+    case .integratingResult: "Integrating"
+    case .remembering: "Remembering"
+    case .expressing: "Composing response"
+    case .sleeping: "Sleeping"
+    case .error: "Error"
+    }
+  }
 }
 
 nonisolated struct BrainMediaRef: Codable, Equatable, Sendable {
@@ -989,7 +1018,7 @@ nonisolated struct PullSenseDescriptor: Equatable {
 	  }
 	}
 
-nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
+nonisolated struct BrainDispatchEnvelope: Codable, Equatable, Sendable {
   let requestID: String
   let ok: Bool
   let events: [BrainEvent]
@@ -1074,6 +1103,42 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
       timings: shell.timings,
       rawText: text
     )
+  }
+
+  /// True when the core accepted this message into its busy-time queue.
+  var dispatchWasQueued: Bool {
+    guard ok, let result else { return false }
+    let queuedKinds: Set<String> = ["stimulus_queued", "autonomy_queued", "status_queued"]
+    if case .object(let object) = result {
+      if let kind = object["kind"]?.stringValue, queuedKinds.contains(kind) { return true }
+      if let kind = object["value"]?.objectValue?["kind"]?.stringValue, queuedKinds.contains(kind) {
+        return true
+      }
+    }
+    return false
+  }
+
+  /// True when the core accepted this ingest-eligible message into its stimulus inbox
+  /// while another dispatch was in progress (`result.value.kind == "stimulus_queued"`).
+  var stimulusWasQueued: Bool {
+    queuedKind == "stimulus_queued"
+  }
+
+  var autonomyWasQueued: Bool {
+    queuedKind == "autonomy_queued"
+  }
+
+  var statusWasQueued: Bool {
+    queuedKind == "status_queued"
+  }
+
+  private var queuedKind: String? {
+    guard ok, let result else { return nil }
+    if case .object(let object) = result {
+      if let kind = object["kind"]?.stringValue { return kind }
+      return object["value"]?.objectValue?["kind"]?.stringValue
+    }
+    return nil
   }
 
   /// Host-visible events from the envelope, or a chat/speech batch synthesized from `spoken_text` in the result.
@@ -1216,11 +1281,20 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
   }
 
   var awaitingHostSense: Bool {
-    userTextOutcomePayload?["awaiting_host_sense"]?.boolValue ?? false
+    if userTextOutcomePayload?["awaiting_host_sense"]?.boolValue == true {
+      return true
+    }
+    return events.contains { event in
+      event.type == "sense_request" && event.awaitResponse == true
+    }
   }
 
   var awaitedHostSenseLabel: String? {
-    Self.trimmedOutcomeString(userTextOutcomePayload?["awaited_host_sense"]?.stringValue)
+    if let sense = Self.trimmedOutcomeString(userTextOutcomePayload?["awaited_host_sense"]?.stringValue) {
+      return sense
+    }
+    return events.last(where: { $0.type == "sense_request" })?.sense
+      ?? events.last(where: { $0.type == "sense_request" })?.senseID
   }
 
   var awaitedHostPurposeLabel: String? {
@@ -1228,15 +1302,17 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
   }
 
   var awaitedHostTimeoutMS: Int? {
-    guard let value = userTextOutcomePayload?["awaited_host_timeout_ms"] else { return nil }
-    switch value {
-    case .number(let number):
-      return Int(number)
-    case .string(let text):
-      return Int(text.trimmingCharacters(in: .whitespacesAndNewlines))
-    default:
-      return nil
+    if let value = userTextOutcomePayload?["awaited_host_timeout_ms"] {
+      switch value {
+      case .number(let number):
+        return Int(number)
+      case .string(let text):
+        return Int(text.trimmingCharacters(in: .whitespacesAndNewlines))
+      default:
+        break
+      }
     }
+    return events.last(where: { $0.type == "sense_request" })?.timeoutMS
   }
 
   private static func hostSenseTimeoutSuffix(timeoutMS: Int?) -> String {
@@ -1276,6 +1352,23 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
   var spokenTextFromResult: String {
     userTextOutcomePayload?["spoken_text"]?.stringValue?
       .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+  }
+
+  /// True when the core already played speech through the host `speech_output` adapter.
+  var hostSpeechDelivered: Bool {
+    if userTextOutcomePayload?["ended_with_speech"]?.boolValue == true {
+      return true
+    }
+    return !spokenTextFromResult.isEmpty
+  }
+
+  /// True when Swift should still drive Apple speech for a turn the core did not speak.
+  var requiresHostSpeechPlayback: Bool {
+    guard !hostSpeechDelivered else { return false }
+    if !speechTexts.isEmpty { return true }
+    return events.contains { event in
+      event.capabilityRequestPayload?.action == "speak"
+    }
   }
 
   var displayText: String {
@@ -1355,7 +1448,9 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
     if let brainSummary = userTextOutcomePayload?["brain_summary"]?.stringValue {
       values["brain_summary_present"] = brainSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "false" : "true"
     }
-    if let ignoredBecauseValue = result?.objectValue?["ignored_because"]?.stringValue {
+    let ignoredBecauseValue = structuredResultValue?.objectValue?["ignored_because"]?.stringValue
+      ?? result?.objectValue?["ignored_because"]?.stringValue
+    if let ignoredBecauseValue {
       let ignoredBecause = ignoredBecauseValue.trimmingCharacters(in: .whitespacesAndNewlines)
       if !ignoredBecause.isEmpty {
         values["ignored_because"] = ignoredBecause
@@ -1370,7 +1465,7 @@ nonisolated struct BrainDispatchEnvelope: Codable, Equatable {
   }
 }
 
-extension BrainEvent {
+nonisolated extension BrainEvent {
   nonisolated var capabilityRequestPayload: BrainActionRequestPayload? {
     switch payload {
     case .capabilityRequest(let value):
@@ -1408,7 +1503,7 @@ extension BrainEvent {
     }
   }
 
-  var capability: String? {
+  nonisolated var capability: String? {
     switch payload {
     case .capabilityStatus(let value): value.capabilityID
     default: capabilityRequestPayload?.action
@@ -1628,7 +1723,7 @@ extension BrainEvent {
   var awaitResponse: Bool? {
     switch payload {
     case .capabilityRequest(let value): value.awaitResponse
-    case .senseRequest(let value): value.timeoutMS != nil
+    case .senseRequest(let value): value.direction == .pull
     default: nil
     }
   }
@@ -1638,13 +1733,13 @@ extension BrainEvent {
   }
 }
 
-nonisolated struct BrainDispatchError: Codable, Equatable {
+nonisolated struct BrainDispatchError: Codable, Equatable, Sendable {
   let code: String
   let message: String
   let recoverable: Bool?
 }
 
-nonisolated struct BrainDispatchBudget: Codable, Equatable {
+nonisolated struct BrainDispatchBudget: Codable, Equatable, Sendable {
   let maxBytes: Int
   let usedBytes: Int
   let compacted: Bool

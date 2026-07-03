@@ -4,6 +4,7 @@
 //
 
 import Combine
+import Compression
 import CryptoKit
 import Foundation
 
@@ -431,24 +432,12 @@ final class BrainSyncManager: ObservableObject {
             includeBiometricData: includeBiometricData,
             fileManager: fileManager
         )
-        let exportBrain = BrainDescriptor(
-            id: brain.id,
-            displayName: brain.displayName,
-            rootURL: exportRoot,
-            avatarURL: nil,
-            avatarManifest: nil,
-            modifiedAt: brain.modifiedAt,
-            isRecent: brain.isRecent
+        _ = try BrainCloudArchive.createArchive(
+            from: exportRoot,
+            brainID: brain.id,
+            to: archiveURL,
+            fileManager: fileManager
         )
-
-        let core = BrainCore(brain: exportBrain, tracksLiveFileSession: false)
-        do {
-            _ = try await core.exportBrain(to: archiveURL)
-            await core.disconnect()
-        } catch {
-            await core.disconnect()
-            throw error
-        }
 
         let archiveHash = try BrainCloudArchive.archiveHash(at: archiveURL)
         let modifiedAt = brain.modifiedAt ?? Date()
@@ -649,6 +638,17 @@ nonisolated enum BrainCloudArchive {
         var manifest: BrainCloudManifest
     }
 
+    private static let magic = Data([0x41, 0x46, 0x46, 0x45, 0x43, 0x54, 0x49, 0x56, 0x45, 0x5F, 0x42, 0x52, 0x41, 0x49, 0x4E, 0x00, 0x01])
+    private static let excludedComponentNames: Set<String> = [
+        "provider_credentials.json",
+        "secrets.json",
+        "pairing_secrets.json",
+        "host_permissions.json",
+        "host_permission_grants.json",
+        "host_pairing.json",
+        "pairing_secret",
+    ]
+
     static func archiveFileName(for brainID: String) -> String {
         "\(brainID).brain"
     }
@@ -662,9 +662,180 @@ nonisolated enum BrainCloudArchive {
     }
 
     static func validateArchiveData(_ data: Data) throws {
-        guard data.starts(with: Data([0x41, 0x46, 0x46, 0x45, 0x43, 0x54, 0x49, 0x56, 0x45, 0x5F, 0x42, 0x52, 0x41, 0x49, 0x4E, 0x00, 0x01])) else {
+        guard data.starts(with: magic) else {
             throw BrainSyncError.invalidArchive
         }
+    }
+
+    static func createArchive(
+        from rootURL: URL,
+        brainID: String,
+        to archiveURL: URL,
+        fileManager: FileManager = .default
+    ) throws -> JSONValue {
+        var components: [[String: Any]] = []
+        var totalBytes = 0
+        guard let enumerator = fileManager.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            throw BrainSyncError.invalidArchive
+        }
+
+        for case let fileURL as URL in enumerator {
+            let relativePath = String(fileURL.standardizedFileURL.path.dropFirst(rootURL.standardizedFileURL.path.count + 1))
+            if shouldExclude(relativePath) {
+                if (try? fileURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
+            let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey])
+            guard values.isRegularFile == true else { continue }
+            let data = try Data(contentsOf: fileURL)
+            totalBytes += data.count
+            components.append([
+                "path": relativePath,
+                "bytes": data.count,
+                "sha256": sha256Hex(data),
+                "data_base64": data.base64EncodedString(),
+            ])
+        }
+
+        components.sort { ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "") }
+        let archive: [String: Any] = [
+            "format_version": 1,
+            "compression": "zlib",
+            "brain_id": brainID,
+            "brain_settings": ["brain_id": brainID],
+            "component_count": components.count,
+            "total_bytes": totalBytes,
+            "components": components,
+        ]
+        let json = try JSONSerialization.data(withJSONObject: archive, options: [.sortedKeys])
+        var output = magic
+        output.append(try zlibCompress(json))
+        try output.write(to: archiveURL, options: .atomic)
+        return try manifestValue(brainID: brainID, components: components)
+    }
+
+    static func extractArchive(
+        from archiveURL: URL,
+        to destinationRoot: URL,
+        expectedBrainID: String? = nil,
+        fileManager: FileManager = .default
+    ) throws -> (brainID: String, manifest: JSONValue) {
+        let data = try Data(contentsOf: archiveURL)
+        try validateArchiveData(data)
+        let jsonData = try zlibDecompress(data.dropFirst(magic.count))
+        guard let archive = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let brainID = archive["brain_id"] as? String,
+              let components = archive["components"] as? [[String: Any]]
+        else {
+            throw BrainSyncError.invalidArchive
+        }
+        if let expectedBrainID, expectedBrainID != brainID {
+            throw BrainSyncError.invalidArchive
+        }
+        guard !fileManager.fileExists(atPath: destinationRoot.path) else {
+            throw CocoaError(.fileWriteFileExists)
+        }
+        try fileManager.createDirectory(at: destinationRoot, withIntermediateDirectories: true)
+        for component in components {
+            guard let relativePath = component["path"] as? String,
+                  isSafeRelativePath(relativePath),
+                  let encoded = component["data_base64"] as? String,
+                  let bytes = Data(base64Encoded: encoded)
+            else {
+                throw BrainSyncError.invalidArchive
+            }
+            if let expectedBytes = component["bytes"] as? Int, expectedBytes != bytes.count {
+                throw BrainSyncError.invalidArchive
+            }
+            if let expectedHash = component["sha256"] as? String, expectedHash != sha256Hex(bytes) {
+                throw BrainSyncError.invalidArchive
+            }
+            let destination = destinationRoot.appendingPathComponent(relativePath)
+            try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try bytes.write(to: destination, options: .atomic)
+        }
+        return (brainID, try manifestValue(brainID: brainID, components: components))
+    }
+
+    private static func shouldExclude(_ relativePath: String) -> Bool {
+        relativePath.split(separator: "/").contains { excludedComponentNames.contains(String($0)) }
+    }
+
+    private static func isSafeRelativePath(_ path: String) -> Bool {
+        !path.isEmpty && !path.hasPrefix("/") && !path.split(separator: "/").contains("..")
+    }
+
+    private static func manifestValue(brainID: String, components: [[String: Any]]) throws -> JSONValue {
+        let infos = components.map { component -> [String: Any] in
+            [
+                "path": component["path"] as? String ?? "",
+                "bytes": component["bytes"] as? Int ?? 0,
+                "sha256": component["sha256"] as? String ?? "",
+            ]
+        }
+        let totalBytes = infos.reduce(0) { $0 + ($1["bytes"] as? Int ?? 0) }
+        let manifest: [String: Any] = [
+            "format_version": 1,
+            "compression": "zlib",
+            "brain_id": brainID,
+            "component_count": infos.count,
+            "total_bytes": totalBytes,
+            "components": infos,
+        ]
+        return try .object(JSONValue.decodedObject(from: try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])))
+    }
+
+    private static func zlibCompress(_ data: Data) throws -> Data {
+        let outputCapacity = max(8192, data.count + data.count / 8 + data.count / 16 + 4096)
+        var output = Data(count: outputCapacity)
+        let written = data.withUnsafeBytes { source in
+            output.withUnsafeMutableBytes { destination in
+                compression_encode_buffer(
+                    destination.bindMemory(to: UInt8.self).baseAddress!,
+                    outputCapacity,
+                    source.bindMemory(to: UInt8.self).baseAddress!,
+                    data.count,
+                    nil,
+                    COMPRESSION_ZLIB
+                )
+            }
+        }
+        guard written > 0 else { throw BrainSyncError.invalidArchive }
+        output.count = written
+        return output
+    }
+
+    private static func zlibDecompress(_ data: Data.SubSequence) throws -> Data {
+        let input = Data(data)
+        var capacity = max(8192, input.count * 4)
+        while capacity <= 1024 * 1024 * 1024 {
+            let outputCapacity = capacity
+            var output = Data(count: capacity)
+            let written = input.withUnsafeBytes { source in
+                output.withUnsafeMutableBytes { destination in
+                    compression_decode_buffer(
+                        destination.bindMemory(to: UInt8.self).baseAddress!,
+                        outputCapacity,
+                        source.bindMemory(to: UInt8.self).baseAddress!,
+                        input.count,
+                        nil,
+                        COMPRESSION_ZLIB
+                    )
+                }
+            }
+            if written > 0 && written < outputCapacity {
+                output.count = written
+                return output
+            }
+            capacity *= 2
+        }
+        throw BrainSyncError.invalidArchive
     }
 }
 

@@ -109,6 +109,20 @@ nonisolated struct LogEntry: Identifiable, Equatable {
     }
 }
 
+enum DeveloperEventSort: String, CaseIterable, Identifiable {
+    case newestFirst = "Newest first"
+    case oldestFirst = "Oldest first"
+
+    var id: String { rawValue }
+
+    var systemImage: String {
+        switch self {
+        case .newestFirst: "arrow.down"
+        case .oldestFirst: "arrow.up"
+        }
+    }
+}
+
 enum CredentialTestStatus: Equatable {
     case testing
     case valid
@@ -236,31 +250,18 @@ struct RuntimeOptionGroup: Identifiable, Equatable {
             .number(key: "uncertain_threshold", label: "Uncertain face threshold", value: "0.60"),
             .select(key: "make_up_lost_dream_time", label: "Make up for lost dream time", value: "off", choices: ["off", "on"]),
         ]),
-        .init(title: "Autonomy", note: "Self-directed action budget, replenishment, and scheduling.", isExpanded: true, options: [
-            .select(
-                key: "autonomy_mode",
-                label: "Autonomy mode",
-                value: "off",
-                choices: [
-                    RuntimeOptionChoice(value: "off", label: "Off"),
-                    RuntimeOptionChoice(value: "limited", label: "Limited"),
-                    RuntimeOptionChoice(value: "full", label: "Full"),
-                ]
-            ),
-            .number(key: "autonomy_interval_seconds", label: "Autonomy tick interval", value: "300", unit: "sec"),
-            .select(key: "autonomy_sleep", label: "Start asleep", value: "off", choices: ["off", "on"]),
+        .init(title: "Attention", note: "Background attention, rest, social appetite, and agency.", isExpanded: true, options: [
+            .number(key: "autonomy_interval_seconds", label: "Attention tick interval", value: "300", unit: "sec"),
+            .number(key: "autonomy_engaged_interval_seconds", label: "Engaged tick interval", value: "60", unit: "sec"),
+            .number(key: "autonomy_engagement_decay_seconds", label: "Engagement decay", value: "600", unit: "sec"),
+            .select(key: "autonomy_sleep", label: "Start resting", value: "off", choices: ["off", "on"]),
             .timeRange(key: "autonomy_quiet_hours", label: "Quiet hours", value: "22:00-08:00"),
-            .number(key: "autonomy_limited_max_capacity", label: "Limited max capacity", value: "25", unit: "points"),
-            .number(key: "autonomy_full_max_capacity", label: "Full max capacity", value: "50", unit: "points"),
-            .number(key: "autonomy_limited_replenish_actions_per_minute", label: "Limited replenish rate", value: "2.0", unit: "points/min"),
-            .number(key: "autonomy_full_replenish_actions_per_minute", label: "Full replenish rate", value: "8.0", unit: "points/min"),
-            .number(key: "autonomy_social_engagement_boost", label: "User-turn engagement boost", value: "3", unit: "points"),
-            .number(key: "autonomy_limited_threshold_bias", label: "Limited threshold bias", value: "0.20"),
-            .number(key: "autonomy_full_threshold_bias", label: "Full threshold bias", value: "0.00"),
-            .number(key: "autonomy_social_reserve", label: "Social reserve", value: "0.12"),
+            .number(key: "autonomy_social_engagement_boost", label: "Mutual contact reward", value: "3", unit: "points"),
+            .number(key: "autonomy_limited_threshold_bias", label: "Quiet threshold bias", value: "0.20"),
+            .number(key: "autonomy_full_threshold_bias", label: "Background threshold bias", value: "0.00"),
+            .number(key: "autonomy_social_reserve", label: "Social appetite reserve", value: "0.12"),
             .number(key: "autonomy_safety_reserve", label: "Safety reserve", value: "0.20"),
-            .number(key: "autonomy_opportunity_reserve", label: "Opportunity reserve", value: "0.15"),
-            .number(key: AffectiveViewModel.autonomyBudgetOptionKey, label: "Extra action budget", value: "0", unit: "points"),
+            .number(key: "autonomy_opportunity_reserve", label: "Curiosity reserve", value: "0.15"),
         ]),
         .init(title: "Biometric Privacy", note: "Local face-template controls for this brain. Owner-managed consent is required before use.", isExpanded: true, options: [
             .select(
@@ -334,6 +335,12 @@ struct RuntimeOptionGroup: Identifiable, Equatable {
             .text(key: "deepseek_api_key", label: "DeepSeek API key", value: ""),
         ]),
         .init(title: "Host Senses", note: "Local devices used when the brain asks the host for sensory input.", scope: .host, isExpanded: true, options: [
+            .select(
+                key: AffectiveViewModel.cameraCaptureEnabledOptionKey,
+                label: "Camera capture",
+                value: "on",
+                choices: ["on", "off"]
+            ),
             .select(key: "camera_device_id", label: "Camera input", value: "automatic", choices: ["automatic"]),
             .select(
                 key: AffectiveViewModel.motionGestureEnabledOptionKey,
@@ -350,10 +357,7 @@ struct RuntimeOptionGroup: Identifiable, Equatable {
     }
 
     static var defaultSpeechVoiceName: String {
-        let choices = speechVoiceChoices
-        return choices.first { $0.localizedCaseInsensitiveCompare("Fred") == .orderedSame }
-            ?? choices.first
-            ?? "System Voice"
+        AppleSpeechVoiceCatalog.defaultVoiceName
     }
 }
 
@@ -467,5 +471,350 @@ private extension Sequence where Element: Hashable {
     func uniqued() -> [Element] {
         var seen = Set<Element>()
         return filter { seen.insert($0).inserted }
+    }
+}
+
+// MARK: - Host pipeline deadlock detection
+
+nonisolated enum HostPipelineDeadlockKind: String, Equatable, Sendable {
+    case coreAwaitingSenseWithoutHostWork
+    case pipelineActionTimedOut
+    case queuedConversationNotDraining
+    case pullSenseFulfillmentTimedOut
+}
+
+nonisolated struct CoreAwaitingHostSenseMarker: Equatable, Sendable {
+    let since: Date
+    let sense: String?
+    let purpose: String?
+    let timeoutMS: Int?
+    let requestID: String?
+}
+
+nonisolated struct HostPipelineDeadlock: Equatable, Identifiable, Sendable {
+    let id: UUID
+    let kind: HostPipelineDeadlockKind
+    let title: String
+    let detail: String
+    let detectedAt: Date
+    let diagnostics: [String: String]
+
+    init(
+        id: UUID = UUID(),
+        kind: HostPipelineDeadlockKind,
+        title: String,
+        detail: String,
+        detectedAt: Date,
+        diagnostics: [String: String]
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.detail = detail
+        self.detectedAt = detectedAt
+        self.diagnostics = diagnostics
+    }
+
+    var stalledSeconds: TimeInterval {
+        Date().timeIntervalSince(detectedAt)
+    }
+
+    var sortedDiagnostics: [(key: String, value: String)] {
+        diagnostics
+            .map { (key: $0.key, value: $0.value) }
+            .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
+    }
+}
+
+nonisolated struct HostPipelineHealthInput: Equatable, Sendable {
+    let now: Date
+    let isBrainConnected: Bool
+    let coreAwaitingHostSense: CoreAwaitingHostSenseMarker?
+    let isHostPipelineRunning: Bool
+    let hostPipelineActionStartedAt: Date?
+    let hostPipelineActionKind: String?
+    let hostPipelineHold: HostPipelineHold
+    let queuedConversationActionCount: Int
+    let lastHostPipelineProgressAt: Date
+    let activePullSenseFulfillmentCount: Int
+    let pullSenseFulfillmentStartedAt: Date?
+    let pendingCameraRequestID: String?
+    let pendingOrientationRequestID: String?
+    let hasPullSenseInQueue: Bool
+    let isToolRunning: Bool
+}
+
+nonisolated enum CoreEventApplicationContext: Equatable, Sendable {
+    case dispatchResponse(operation: String, requestID: String?)
+    case eventSink
+    case senseObservation(requestID: String?)
+    case diagnosticStatus
+
+    var sourceLane: String {
+        switch self {
+        case .dispatchResponse:
+            return "conversation"
+        case .eventSink:
+            return "event_sink"
+        case .senseObservation:
+            return "sense"
+        case .diagnosticStatus:
+            return "diagnostic"
+        }
+    }
+
+    var allowsHostRequests: Bool {
+        switch self {
+        case .dispatchResponse, .eventSink:
+            return true
+        case .senseObservation, .diagnosticStatus:
+            return false
+        }
+    }
+
+    var allowsHostStatusRequests: Bool {
+        switch self {
+        case .dispatchResponse, .diagnosticStatus:
+            return true
+        case .eventSink, .senseObservation:
+            return false
+        }
+    }
+
+    var operationName: String {
+        switch self {
+        case .dispatchResponse(let operation, _):
+            return operation
+        case .eventSink:
+            return "event_sink"
+        case .senseObservation:
+            return "sense_observation"
+        case .diagnosticStatus:
+            return "diagnostic_status"
+        }
+    }
+
+    var requestID: String? {
+        switch self {
+        case .dispatchResponse(_, let requestID), .senseObservation(let requestID):
+            return requestID
+        case .eventSink, .diagnosticStatus:
+            return nil
+        }
+    }
+}
+
+enum HostPipelineHealthEvaluator {
+    static let queuedConversationGraceSeconds: TimeInterval = 10
+    static let defaultPipelineActionTimeoutSeconds: TimeInterval = 90
+    static let conversationPipelineActionTimeoutSeconds: TimeInterval = 180
+    static let coreTouchPipelineActionTimeoutSeconds: TimeInterval = 120
+    static let pullSenseExtraGraceSeconds: TimeInterval = 12
+    static let minimumPullSenseTimeoutSeconds: TimeInterval = 30
+
+    static func evaluate(_ input: HostPipelineHealthInput) -> HostPipelineDeadlock? {
+        guard input.isBrainConnected else { return nil }
+
+        if let deadlock = coreAwaitingSenseDeadlock(input) {
+            return deadlock
+        }
+        if let deadlock = pipelineActionDeadlock(input) {
+            return deadlock
+        }
+        if let deadlock = queuedConversationDeadlock(input) {
+            return deadlock
+        }
+        if let deadlock = pullSenseFulfillmentDeadlock(input) {
+            return deadlock
+        }
+        return nil
+    }
+
+    static func coreAwaitingSenseDeadlock(_ input: HostPipelineHealthInput) -> HostPipelineDeadlock? {
+        guard let marker = input.coreAwaitingHostSense else { return nil }
+        let timeoutSeconds = max(8, Double(marker.timeoutMS ?? 8_000) / 1_000)
+        let grace = timeoutSeconds + 5
+        let elapsed = input.now.timeIntervalSince(marker.since)
+        guard elapsed > grace else { return nil }
+        guard !hostIsWorkingOnSense(marker.sense, input: input) else { return nil }
+
+        var diagnostics: [String: String] = [
+            "stalled_seconds": String(format: "%.0f", elapsed),
+            "awaited_sense": marker.sense ?? "unknown",
+            "host_pipeline_running": String(input.isHostPipelineRunning),
+            "queued_conversation_actions": "\(input.queuedConversationActionCount)",
+            "active_pull_sense_fulfillments": "\(input.activePullSenseFulfillmentCount)",
+            "pending_camera_request_id": input.pendingCameraRequestID ?? "none",
+            "host_pipeline_hold": String(describing: input.hostPipelineHold),
+        ]
+        if let purpose = marker.purpose, !purpose.isEmpty {
+            diagnostics["awaited_purpose"] = purpose
+        }
+        if let requestID = marker.requestID, !requestID.isEmpty {
+            diagnostics["request_id"] = requestID
+        }
+        if let actionKind = input.hostPipelineActionKind, !actionKind.isEmpty {
+            diagnostics["current_pipeline_action"] = actionKind
+        }
+
+        let senseLabel = marker.sense ?? "host sense"
+        let purposeSuffix = marker.purpose.map { " (\($0))" } ?? ""
+        return HostPipelineDeadlock(
+            kind: .coreAwaitingSenseWithoutHostWork,
+            title: "Brain is waiting for \(senseLabel)\(purposeSuffix)",
+            detail: "The core paused for \(senseLabel), but the host is not fulfilling that sense request.",
+            detectedAt: input.now,
+            diagnostics: diagnostics
+        )
+    }
+
+    static func pipelineActionDeadlock(_ input: HostPipelineHealthInput) -> HostPipelineDeadlock? {
+        guard input.isHostPipelineRunning,
+              let startedAt = input.hostPipelineActionStartedAt else {
+            return nil
+        }
+        let limit = pipelineActionTimeoutSeconds(for: input.hostPipelineActionKind)
+        let elapsed = input.now.timeIntervalSince(startedAt)
+        guard elapsed > limit else { return nil }
+
+        let actionLabel = input.hostPipelineActionKind ?? "unknown"
+        return HostPipelineDeadlock(
+            kind: .pipelineActionTimedOut,
+            title: "Host pipeline action timed out",
+            detail: "The host has been running \(actionLabel) for \(Int(elapsed))s without finishing.",
+            detectedAt: input.now,
+            diagnostics: [
+                "stalled_seconds": String(format: "%.0f", elapsed),
+                "timeout_seconds": String(format: "%.0f", limit),
+                "current_pipeline_action": actionLabel,
+                "host_pipeline_hold": String(describing: input.hostPipelineHold),
+                "queued_conversation_actions": "\(input.queuedConversationActionCount)",
+                "is_tool_running": String(input.isToolRunning),
+            ]
+        )
+    }
+
+    static func queuedConversationDeadlock(_ input: HostPipelineHealthInput) -> HostPipelineDeadlock? {
+        guard input.queuedConversationActionCount > 0,
+              !input.isHostPipelineRunning,
+              input.hostPipelineHold == .none,
+              !input.isToolRunning else {
+            return nil
+        }
+        let elapsed = input.now.timeIntervalSince(input.lastHostPipelineProgressAt)
+        guard elapsed > queuedConversationGraceSeconds else { return nil }
+
+        return HostPipelineDeadlock(
+            kind: .queuedConversationNotDraining,
+            title: "Queued messages are not sending",
+            detail: "\(input.queuedConversationActionCount) conversation action(s) are queued, but the host pipeline is idle.",
+            detectedAt: input.now,
+            diagnostics: [
+                "stalled_seconds": String(format: "%.0f", elapsed),
+                "queued_conversation_actions": "\(input.queuedConversationActionCount)",
+                "host_pipeline_running": String(input.isHostPipelineRunning),
+                "host_pipeline_hold": String(describing: input.hostPipelineHold),
+                "is_tool_running": String(input.isToolRunning),
+                "active_pull_sense_fulfillments": "\(input.activePullSenseFulfillmentCount)",
+            ]
+        )
+    }
+
+    static func pullSenseFulfillmentDeadlock(_ input: HostPipelineHealthInput) -> HostPipelineDeadlock? {
+        guard input.activePullSenseFulfillmentCount > 0,
+              let startedAt = input.pullSenseFulfillmentStartedAt else {
+            return nil
+        }
+        guard hasConcretePullSenseWork(input) else {
+            return nil
+        }
+        let senseTimeout = Double(input.coreAwaitingHostSense?.timeoutMS ?? 8_000) / 1_000
+        let limit = max(minimumPullSenseTimeoutSeconds, senseTimeout + pullSenseExtraGraceSeconds)
+        let elapsed = input.now.timeIntervalSince(startedAt)
+        guard elapsed > limit else { return nil }
+
+        return HostPipelineDeadlock(
+            kind: .pullSenseFulfillmentTimedOut,
+            title: "Pull sense fulfillment timed out",
+            detail: "A host sense request has been in flight for \(Int(elapsed))s without completing.",
+            detectedAt: input.now,
+            diagnostics: [
+                "stalled_seconds": String(format: "%.0f", elapsed),
+                "timeout_seconds": String(format: "%.0f", limit),
+                "pending_camera_request_id": input.pendingCameraRequestID ?? "none",
+                "pending_orientation_request_id": input.pendingOrientationRequestID ?? "none",
+                "host_pipeline_hold": String(describing: input.hostPipelineHold),
+                "awaited_sense": input.coreAwaitingHostSense?.sense ?? "unknown",
+            ]
+        )
+    }
+
+    static func hasConcretePullSenseWork(_ input: HostPipelineHealthInput) -> Bool {
+        if let sense = input.coreAwaitingHostSense?.sense?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !sense.isEmpty,
+           sense != "unknown" {
+            return true
+        }
+        if input.pendingCameraRequestID != nil || input.pendingOrientationRequestID != nil {
+            return true
+        }
+        if input.hasPullSenseInQueue {
+            return true
+        }
+        if let actionKind = input.hostPipelineActionKind,
+           actionKind.hasPrefix("pull_sense:"),
+           actionKind != "pull_sense:unknown" {
+            return true
+        }
+        switch input.hostPipelineHold {
+        case .cameraPermission, .orientationPermission, .cameraCapture:
+            return true
+        case .none, .speechOutput:
+            return false
+        }
+    }
+
+    static func hostIsWorkingOnSense(_ sense: String?, input: HostPipelineHealthInput) -> Bool {
+        if input.activePullSenseFulfillmentCount > 0 { return true }
+        if input.hasPullSenseInQueue { return true }
+        if input.isHostPipelineRunning,
+           let actionKind = input.hostPipelineActionKind,
+           actionKind.hasPrefix("pull_sense:") {
+            return true
+        }
+
+        switch input.hostPipelineHold {
+        case .cameraPermission:
+            if sense == nil || sense == "camera" { return true }
+        case .orientationPermission:
+            if sense == nil || sense == "orientation" { return true }
+        case .none, .cameraCapture, .speechOutput:
+            break
+        }
+
+        if sense == nil || sense == "camera", input.pendingCameraRequestID != nil {
+            return true
+        }
+        if sense == nil || sense == "orientation", input.pendingOrientationRequestID != nil {
+            return true
+        }
+        return false
+    }
+
+    static func pipelineActionTimeoutSeconds(for actionKind: String?) -> TimeInterval {
+        guard let actionKind, !actionKind.isEmpty else {
+            return defaultPipelineActionTimeoutSeconds
+        }
+        if actionKind.hasPrefix("pull_sense:") {
+            return minimumPullSenseTimeoutSeconds + pullSenseExtraGraceSeconds
+        }
+        switch actionKind {
+        case "experience:counterpart_speech", "image_text", "experience:interrupt":
+            return conversationPipelineActionTimeoutSeconds
+        case "short_touch", "long_touch", "experience:poke_sequence":
+            return coreTouchPipelineActionTimeoutSeconds
+        default:
+            return defaultPipelineActionTimeoutSeconds
+        }
     }
 }

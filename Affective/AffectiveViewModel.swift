@@ -10,21 +10,24 @@ import Combine
 
 @MainActor
 final class AffectiveViewModel: ObservableObject {
-    static let autonomyBudgetOptionKey = "autonomy_daily_energy"
-    static let autonomyLimitedMaxCapacityOptionKey = "autonomy_limited_max_capacity"
-    static let autonomyFullMaxCapacityOptionKey = "autonomy_full_max_capacity"
     static let boredomIntervalOptionKey = "boredom_interval_seconds"
     static let boredomIntervalMinSeconds = 60
     static let makeUpLostDreamTimeOptionKey = "make_up_lost_dream_time"
     static let llmQualityOptionKey = "llm_quality"
     static let speechVoiceOptionKey = "speech_voice"
     static let cameraDeviceIDOptionKey = "camera_device_id"
+    nonisolated static let cameraCaptureEnabledOptionKey = "camera_capture_enabled"
     nonisolated static let textProviderPreferenceOptionKey = "text_provider_preference"
     nonisolated static let motionGestureEnabledOptionKey = "motion_gesture_enabled"
     static let automaticCameraDeviceID = "automatic"
     static let recentStimulusLimit = 10
     static let recentStimulusRetentionSeconds: TimeInterval = 90
+    static let sensePacketWindowSeconds: TimeInterval = 12
+    static let sensePacketDigestItemLimit = 6
+    static let visibleLogEntryLimit = 600
+    static let logSearchIndexCacheLimit = 4_000
     static let socialTurnResponseWindowSeconds: TimeInterval = 8
+    static let autonomySensePollSeconds = 5
     static let counterpartActivityWindowSeconds: TimeInterval = 12
     static let conversationRecentTurnLimit = 16
     static let conversationStopWords: Set<String> = [
@@ -45,9 +48,7 @@ final class AffectiveViewModel: ObservableObject {
     var pokeStartedAt: Date?
     var lastPokeEndedAt: Date?
     var pendingPokePulses: [PokePulse] = []
-    var recentStimuli: [RecentStimulus] = []
-    var stimulusInventory: [String: StimulusInventoryRecord] = [:]
-    var nextStimulusSequence = 1
+    var stimulusInbox = StimulusInbox()
     var conversationWorkingState = ConversationWorkingState()
     var pokeFlushTask: Task<Void, Never>?
     var boredomSenseTask: Task<Void, Never>?
@@ -55,6 +56,8 @@ final class AffectiveViewModel: ObservableObject {
     var autonomySenseTask: Task<Void, Never>?
     var autonomySenseGeneration = 0
     var lastHostStimulusAt = Date()
+    var lastSocialSenseInputAt: Date?
+    var lastAutonomyTickAt = Date()
     var awaitingSocialResponseUntil: Date?
     var counterpartActiveUntil: Date?
     @Published private(set) var brain: BrainDescriptor
@@ -62,21 +65,25 @@ final class AffectiveViewModel: ObservableObject {
     @Published var isBrainConnected = false
     @Published private(set) var hasAttemptedInitialCoreLoad = false
     @Published var isToolRunning = false
+    @Published var isDreamTimeInFlight = false
     @Published var isBrainConnectionInFlight = false
     var hostPipelineQueue: [HostPipelineAction] = []
     var isHostPipelineRunning = false
     var currentHostPipelineAction: HostPipelineAction?
     var currentHostPipelineActionIsAwaitingChatResponse = false
     var pendingChatResponseCount = 0
-    var immediateUserMessageInFlight = false
     var conversationDispatchGeneration = 0
     @Published var hostPipelineHold: HostPipelineHold = .none
 
     @Published var selectedSection: WorkspaceSection = .chat
     @Published var eventSearchText = ""
     @Published var selectedEventKind: LogKind?
+    @Published var developerEventSort: DeveloperEventSort = .newestFirst
+    @Published var selectedEventEntryID: LogEntry.ID?
     @Published var knowledgeSearchText = ""
+    @Published var selectedKnowledgeEntryID: LogEntry.ID?
     @Published var selectedSettingsScope: SettingsScope = .brain
+    @Published var focusedSettingsGroupTitle: String?
     @Published var messageText = ""
     @Published var statusText = "Ready"
     @Published var coreLoadProgressLabel = ""
@@ -85,9 +92,15 @@ final class AffectiveViewModel: ObservableObject {
     @Published var isPoking = false
     @Published var canSend = true
     @Published var brainMode = "waking"
+    var stimulusInboxPendingCount = 0
     @Published var innerStateSummary = ""
+    @Published var innerStateSummaryCore = ""
     @Published var brainVoiceEnabled = true
     @Published var isAwaitingChatResponse = false
+    @Published var brainLoopPhase: BrainLoopPhase?
+    @Published var activeProcessGoal: String?
+    @Published var activeProcessState: String?
+    @Published var activeProcessStepName: String?
     @Published var droppedImageName: String?
     @Published var eventEntries: [LogEntry] = []
     @Published var chatEntries: [LogEntry] = []
@@ -106,7 +119,7 @@ final class AffectiveViewModel: ObservableObject {
     @Published var brainTraitsText = ""
     @Published var brainGoalsText = ""
     @Published var brainRecentMemoriesText = ""
-    @Published var autonomyMode = "off"
+    @Published var autonomyMode = "pause"
     @Published var optionGroups: [RuntimeOptionGroup]
     @Published var credentialTestResults: [ProviderCredentialKey: CredentialTestStatus] = [:]
     private var canWriteBrainStats = true
@@ -114,12 +127,29 @@ final class AffectiveViewModel: ObservableObject {
     var cameraPermissionRequestTask: Task<HostCameraPermissionStatus, Never>?
     var pendingCameraRequestID: String?
     var didLogCoalescedCameraRequest = false
+    var coalescedPullSenseLoggedForActiveRequest: [String: String] = [:]
     var pendingOrientationRequestID: String?
+    var inFlightPullSenseRequestIDs: [String: String] = [:]
+    var activePullSenseFulfillmentCount = 0
     var cameraPhotoCaptureOverride: (() async throws -> Data)?
+    var activeCameraCaptureCancel: (() -> Void)?
+    var speechSpeakOverride: ((String, String?, @escaping () -> Void) -> Void)?
     var orientationObservationOverride: (() async throws -> OrientationObservation)?
     var hostCapabilityPendingSince: [String: Date] = [:]
     var closedPullSenseRequestIDs: Set<String> = []
     var terminalPullSenseRequestIDs: Set<String> = []
+    var recentVisibleCoreEventSignatures: [String: Date] = [:]
+    var logSearchTextCache: [LogEntry.ID: String] = [:]
+    var coreAwaitingHostSenseMarker: CoreAwaitingHostSenseMarker?
+    var hostPipelineActionStartedAt: Date?
+    var lastHostPipelineProgressAt = Date()
+    var pullSenseFulfillmentStartedAt: Date?
+    var readModelsRefreshTask: Task<Void, Never>?
+    var hostPipelineHealthTask: Task<Void, Never>?
+    var hostPipelineHealthGeneration = 0
+    var lastReportedDeadlockKind: HostPipelineDeadlockKind?
+    var hostPipelineDeadlockDismissedID: UUID?
+    @Published var hostPipelineDeadlock: HostPipelineDeadlock?
     var orientationPermissionStatusOverride: HostOrientationPermissionStatus?
     var orientationCapabilityStatusOverride: HostOrientationPermissionStatus?
     var orientationPermissionContinuation: CheckedContinuation<HostOrientationPermissionStatus, Never>?
@@ -130,10 +160,7 @@ final class AffectiveViewModel: ObservableObject {
     var facialExpressionRevertTask: Task<Void, Never>?
     var queuedFacialExpressions: [QueuedFacialExpression] = []
     var applyingQueuedFacialExpression = false
-    @Published var autonomyControlCapacity: Double = 1.0
-    @Published var autonomyMaxCapacity: Double = 1.0
-    @Published var autonomyReplenishPointsPerMinute: Double = 0
-    @Published var autonomyLastCapacityReplenishAt: Date?
+    @Published var autonomyControlBlockedReason = "none"
     @Published var appIsForeground = true
     var scenePhaseIsActive = true
     #if os(macOS)
@@ -150,7 +177,7 @@ final class AffectiveViewModel: ObservableObject {
         self.brainSpeechNotifications = brainSpeechNotifications ?? SystemBrainSpeechNotificationService.shared
         let storedValues = Self.storedValuesForLaunch(brain: brain)
         brainVoiceEnabled = UserDefaults.standard.object(forKey: Self.brainVoiceEnabledKey) as? Bool ?? true
-        autonomyMode = Self.normalizeAutonomyMode(storedValues["autonomy_mode"] ?? "off")
+        autonomyMode = Self.normalizeAutonomyMode(storedValues["autonomy_mode"] ?? "play")
         optionGroups = Self.loadOptionGroups(storedValues: storedValues, brain: brain)
         UserDefaults.standard.set(brain.id, forKey: Self.lastOpenedBrainIDKey)
         statusText = "Opening \(brain.displayName)"
@@ -194,6 +221,7 @@ final class AffectiveViewModel: ObservableObject {
     deinit {
         boredomSenseTask?.cancel()
         autonomySenseTask?.cancel()
+        hostPipelineHealthTask?.cancel()
         motionGestureMonitor?.stop()
         #if os(macOS)
         for observer in macForegroundObservers {
@@ -233,7 +261,9 @@ final class AffectiveViewModel: ObservableObject {
     }
 
     var showsCoreConnectingScreen: Bool {
+        if isDreamTimeInFlight { return true }
         guard !isBrainConnected else { return false }
+        if hasAttemptedInitialCoreLoad { return false }
         return isBrainConnectionInFlight || !hasAttemptedInitialCoreLoad
     }
 
@@ -282,7 +312,28 @@ final class AffectiveViewModel: ObservableObject {
     }
 
     var filteredEventEntries: [LogEntry] {
-        filtered(entries: eventEntries, query: eventSearchText, kind: selectedEventKind)
+        let filteredEntries = filtered(entries: eventEntries, query: eventSearchText, kind: selectedEventKind)
+        switch developerEventSort {
+        case .newestFirst:
+            return filteredEntries.sorted { lhs, rhs in
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
+                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+            }
+        case .oldestFirst:
+            return filteredEntries.sorted { lhs, rhs in
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+            }
+        }
+    }
+
+    var inspectedEventEntry: LogEntry? {
+        let entries = filteredEventEntries
+        if let selectedEventEntryID,
+           let selected = entries.first(where: { $0.id == selectedEventEntryID }) {
+            return selected
+        }
+        return entries.first
     }
 
     var filteredKnowledgeEntries: [LogEntry] {
@@ -291,11 +342,25 @@ final class AffectiveViewModel: ObservableObject {
         return filtered(entries: combined, query: knowledgeSearchText, kind: nil)
     }
 
+    var inspectedKnowledgeEntry: LogEntry? {
+        let entries = filteredKnowledgeEntries
+        if let selectedKnowledgeEntryID,
+           let selected = entries.first(where: { $0.id == selectedKnowledgeEntryID }) {
+            return selected
+        }
+        return entries.first
+    }
+
     func refreshKnowledgeEntries() {
         do {
             storedKnowledgeEntries = try BrainKnowledgeReader.loadEntries(from: brain)
         } catch {
-            appendEventLog(kind: .error, title: "knowledge_load failed", body: error.localizedDescription)
+            appendEventLog(
+                kind: .error,
+                title: "knowledge_load failed",
+                body: error.localizedDescription,
+                metadata: ["brain": brain.id, "memory_path": brain.memoryDatabaseURL.path]
+            )
         }
     }
 
@@ -313,6 +378,12 @@ final class AffectiveViewModel: ObservableObject {
 
     var selectedSettingsGroups: [RuntimeOptionGroup] {
         optionGroups.filter { $0.scope == selectedSettingsScope }
+    }
+
+    func showAttentionSettings() {
+        selectedSection = .settings
+        selectedSettingsScope = .brain
+        focusedSettingsGroupTitle = "Attention"
     }
 
     var visibleMailboxItems: [MailboxItem] {
@@ -361,75 +432,108 @@ final class AffectiveViewModel: ObservableObject {
         }
     }
 
-    var autonomyActionBudget: Int {
-        max(runtimeOptionIntValue(for: Self.autonomyBudgetOptionKey) ?? 0, 0)
-    }
-
     var normalizedAutonomyMode: String {
         Self.normalizeAutonomyMode(autonomyMode)
     }
 
     var autonomyIsEnabled: Bool {
-        normalizedAutonomyMode != "off"
+        normalizedAutonomyMode == "play"
     }
 
-    var autonomyCapacityFraction: Double {
-        autonomyCapacityFraction(at: Date())
+    var backgroundAgencyIsEnabled: Bool {
+        autonomyIsEnabled
     }
 
-    func autonomyCapacityFraction(at date: Date) -> Double {
-        guard autonomyMaxCapacity > 0 else { return 0 }
-        let capacity = interpolatedAutonomyControlCapacity(at: date)
-        return min(max(capacity / autonomyMaxCapacity, 0), 1)
+    var attentionIsPaused: Bool {
+        runtimeOptionStringValue(for: "autonomy_sleep") == "on"
     }
 
-    var autonomyCapacityPercentText: String {
-        autonomyCapacityPercentText(at: Date())
+    var attentionIsInSleepHours: Bool {
+        autonomyControlBlockedReason == "sleep" && !attentionIsPaused && isInConfiguredQuietHours()
     }
 
-    func autonomyCapacityPercentText(at date: Date) -> String {
-        "\(Int((autonomyCapacityFraction(at: date) * 100).rounded()))%"
+    func isInConfiguredQuietHours(now: Date = Date()) -> Bool {
+        guard let range = runtimeOptionStringValue(for: "autonomy_quiet_hours") else { return false }
+        let components = Calendar.current.dateComponents([.hour, .minute], from: now)
+        let minuteOfDay = (components.hour ?? 0) * 60 + (components.minute ?? 0)
+        return Self.quietHoursRangeContains(range, minuteOfDay: minuteOfDay)
     }
 
-    func interpolatedAutonomyControlCapacity(at date: Date = Date()) -> Double {
-        guard autonomyIsEnabled else { return autonomyControlCapacity }
-        let replenishRate = effectiveAutonomyReplenishPointsPerMinute
-        guard replenishRate > 0 else { return autonomyControlCapacity }
+    nonisolated static func quietHoursRangeContains(_ range: String, minuteOfDay: Int) -> Bool {
+        let parts = range.split(separator: "-")
+        guard parts.count == 2,
+              let start = clockMinute(String(parts[0])),
+              let end = clockMinute(String(parts[1])) else {
+            return false
+        }
+        if start == end { return false }
+        if start < end { return minuteOfDay >= start && minuteOfDay < end }
+        return minuteOfDay >= start || minuteOfDay < end
+    }
 
-        let elapsed: TimeInterval
-        if let anchor = autonomyLastCapacityReplenishAt {
-            elapsed = max(0, date.timeIntervalSince(anchor))
-        } else {
-            return autonomyControlCapacity
+    nonisolated static func clockMinute(_ text: String) -> Int? {
+        let pieces = text.trimmingCharacters(in: .whitespaces).split(separator: ":")
+        guard pieces.count == 2,
+              let hour = Int(pieces[0]),
+              let minute = Int(pieces[1]),
+              (0...23).contains(hour),
+              (0...59).contains(minute) else {
+            return nil
+        }
+        return hour * 60 + minute
+    }
+
+    var cameraCaptureIsEnabled: Bool {
+        runtimeOptionStringValue(for: Self.cameraCaptureEnabledOptionKey) != "off"
+    }
+
+    var attentionStatusTitle: String {
+        if attentionIsInSleepHours { return "Sleep hours" }
+        if attentionIsPaused || autonomyControlBlockedReason == "sleep" { return "Resting" }
+        if autonomyControlBlockedReason == "quiet_hours_bias" { return "Quiet" }
+        if brainLoopPhase != nil || isAwaitingChatResponse { return "Thinking" }
+        if hostPipelineHold != .none { return "Waiting" }
+        if stimulusInboxPendingCount > 0 { return "Curious" }
+        return "Active"
+    }
+
+    func autonomyStatusLine(at _: Date = Date()) -> String {
+        if attentionIsInSleepHours {
+            return "Sleep hours are active."
         }
 
-        let ratePerSecond = replenishRate / 60
-        let projected = autonomyControlCapacity + ratePerSecond * elapsed
-        return min(projected, autonomyMaxCapacity)
+        if attentionIsPaused || autonomyControlBlockedReason == "sleep" {
+            return "Attention is resting."
+        }
+
+        if autonomyControlBlockedReason == "quiet_hours_bias" {
+            return "Attention is quiet."
+        }
+        return "Attention is \(attentionStatusTitle.lowercased())."
     }
 
-    var effectiveAutonomyReplenishPointsPerMinute: Double {
-        if autonomyReplenishPointsPerMinute > 0 {
-            return autonomyReplenishPointsPerMinute
-        }
-        let key = normalizedAutonomyMode == "limited"
-            ? "autonomy_limited_replenish_actions_per_minute"
-            : "autonomy_full_replenish_actions_per_minute"
-        guard let rawValue = runtimeOptionStringValue(for: key),
-              let value = Double(rawValue) else {
-            return 0
-        }
-        return max(0, value)
+    func innerStateSummary(at date: Date = Date()) -> String {
+        composedInnerStateSummary(at: date)
+    }
+
+    func composedInnerStateSummary(at date: Date = Date()) -> String {
+        let autonomy = autonomyStatusLine(at: date)
+        let parts = [autonomy, innerStateSummaryCore].filter { !$0.isEmpty }
+        return parts.joined(separator: " ")
+    }
+
+    func syncInnerStateSummary(at date: Date = Date()) {
+        innerStateSummary = composedInnerStateSummary(at: date)
     }
 
     static func normalizeAutonomyMode(_ rawMode: String) -> String {
-        switch rawMode {
-        case "full", "limited", "off":
-            return rawMode
-        case "on":
-            return "full"
+        switch rawMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "pause", "paused", "off", "false", "0":
+            return "pause"
+        case "play", "playing", "full", "limited", "on", "true", "1":
+            return "play"
         default:
-            return "off"
+            return "play"
         }
     }
 
@@ -511,7 +615,10 @@ final class AffectiveViewModel: ObservableObject {
         enqueueHostPipelineAction(.collectMailbox)
     }
 
-    func enterDreamOnLoadIfNeeded(now: Date = Date()) async {
+    func enterDreamOnLoadIfNeeded(
+        now: Date = Date(),
+        loadSession: CoreLoadPerformanceSession? = nil
+    ) async {
         guard runtimeOptionStringValue(for: Self.makeUpLostDreamTimeOptionKey) == "on" else { return }
         guard !didCheckDreamOnLoad else { return }
         didCheckDreamOnLoad = true
@@ -521,13 +628,46 @@ final class AffectiveViewModel: ObservableObject {
         }
 
         appendEventLog(kind: .sent, title: "dream load check", body: "No mailbox dream found in the past 24 hours; requesting Dream Time.")
+        isDreamTimeInFlight = true
+        defer {
+            isDreamTimeInFlight = false
+            coreLoadProgressLabel = ""
+            coreLoadProgressDetail = ""
+            refreshUserSendAvailability()
+        }
+
         brainMode = "dreaming"
         canSend = false
         statusText = brainModeStatusText
         do {
-            _ = try await brainCore.requestDreamTime(prompt: nil)
+            let response: BrainMailboxResponse
+            if let loadSession {
+                response = try await loadSession.measure(
+                    id: "request_dream_time",
+                    label: "Running Dream Time",
+                    detail: "Synthesizing mailbox dream"
+                ) {
+                    try await brainCore.requestDreamTime(prompt: nil)
+                }
+            } else {
+                coreLoadProgressLabel = "Running Dream Time"
+                coreLoadProgressDetail = "Synthesizing mailbox dream"
+                response = try await brainCore.requestDreamTime(prompt: nil)
+            }
+            appendEventLog(
+                kind: .result,
+                title: "request_dream_time",
+                body: response.item.title,
+                metadata: response.metadata
+            )
             await refreshBrainMode()
             await collectMailboxItems()
+            refreshKnowledgeEntries()
+            if !isBrainUnavailableForConversation {
+                statusText = "Ready"
+            } else {
+                statusText = brainModeStatusText
+            }
         } catch {
             statusText = "Dream Time failed: \(error.localizedDescription)"
             appendEventLog(kind: .error, title: "request_dream_time failed", body: error.localizedDescription)
@@ -628,7 +768,7 @@ final class AffectiveViewModel: ObservableObject {
 
 }
 
-enum HostPipelineHold: Equatable {
+nonisolated enum HostPipelineHold: Equatable {
     case none
     case cameraPermission
     case orientationPermission
@@ -651,9 +791,23 @@ enum HostPipelineHold: Equatable {
     }
 }
 
+enum HostStimulusDelivery: Equatable {
+    case hostNarration
+    case counterpartSpeech(name: String?, source: LanguageInputSource = .typedText)
+
+    var languageInputSource: LanguageInputSource {
+        switch self {
+        case .hostNarration:
+            return .typedText
+        case .counterpartSpeech(_, let source):
+            return source
+        }
+    }
+}
+
 enum HostPipelineAction {
     case interrupt(userText: String, reason: String, interruptedAction: String?, canceledQueuedActionCount: Int)
-    case typedText(text: String, stimulusContext: StimulusContext)
+    case typedText(text: String, stimulusContext: StimulusContext, delivery: HostStimulusDelivery = .counterpartSpeech(name: nil, source: .typedText))
     case imageText(prompt: String, attachment: [String: JSONValue], mediaPayload: String, stimulusContext: StimulusContext)
     case pullSenseRequest(BrainEvent, BrainEventPresentation)
     case coreTouch(name: String, title: String)
@@ -665,14 +819,38 @@ enum HostPipelineAction {
     case mailboxMarkRead(String)
 }
 
-nonisolated struct RecentStimulus: Equatable {
+nonisolated enum StimulusContextPurpose: Equatable {
+    case directUserStimulus
+    case autonomyTick
+}
+
+nonisolated enum StimulusDeliveryState: String, Equatable {
+    case pending
+    case delivered
+}
+
+nonisolated struct StimulusRecord: Equatable {
     let id: Int
     let kind: String
+    let sense: String?
+    let source: String?
     let occurredAt: Date
     let summary: String
     let salience: Double
     let metadata: [String: String]
+    let features: [String]
+    let digestKey: String?
+    let rawPayloadReference: String?
+    let rawPayloadAvailable: Bool
+    let processingState: String
+    let receivedDuring: String
+    let activeProcessGoal: String?
+    let activeProcessState: String?
+    let activeProcessStepName: String?
+    var deliveryState: StimulusDeliveryState
 }
+
+typealias RecentStimulus = StimulusRecord
 
 nonisolated struct RecentStimulusSnapshot: Equatable {
     let id: Int
@@ -691,6 +869,460 @@ nonisolated struct RecentStimulusSnapshot: Equatable {
             "salience": .number(salience),
             "metadata": .object(metadata.mapValues { .string($0) }),
         ]
+    }
+}
+
+nonisolated struct SensePacketDigestItemSnapshot: Equatable {
+    let sequenceIDs: [Int]
+    let kind: String
+    let count: Int
+    let firstAgeSeconds: Double
+    let lastAgeSeconds: Double
+    let latestSummary: String
+    let salience: Double
+    let processingState: String
+    let rawPayloadAvailable: Bool
+    let rawPayloadReference: String?
+    let metadata: [String: String]
+    let features: [String]
+
+    var eventArguments: [String: JSONValue] {
+        var arguments: [String: JSONValue] = [
+            "sequence_ids": .array(sequenceIDs.map { .number(Double($0)) }),
+            "kind": .string(kind),
+            "count": .number(Double(count)),
+            "first_age_seconds": .number(firstAgeSeconds),
+            "last_age_seconds": .number(lastAgeSeconds),
+            "latest_summary": .string(latestSummary),
+            "salience": .number(salience),
+            "processing_state": .string(processingState),
+            "raw_payload_available": .bool(rawPayloadAvailable),
+            "metadata": .object(metadata.mapValues { .string($0) }),
+            "features": .array(features.map { .string($0) }),
+        ]
+        if let rawPayloadReference {
+            arguments["raw_payload_reference"] = .string(rawPayloadReference)
+        }
+        return arguments
+    }
+}
+
+nonisolated struct SensePacketDigestSnapshot: Equatable {
+    let windowSeconds: Double
+    let totalItemCount: Int
+    let coalescedItemCount: Int
+    let highestSalience: Double
+    let items: [SensePacketDigestItemSnapshot]
+
+    var eventArguments: [String: JSONValue] {
+        [
+            "window_seconds": .number(windowSeconds),
+            "total_item_count": .number(Double(totalItemCount)),
+            "coalesced_item_count": .number(Double(coalescedItemCount)),
+            "highest_salience": .number(highestSalience),
+            "processing_policy": .string("capture_all_digest_selectively_promote"),
+            "items": .array(items.map { .object($0.eventArguments) }),
+        ]
+    }
+}
+
+nonisolated struct SensePacketSnapshot: Equatable {
+    let packetID: String
+    let triggerKind: String
+    let windowSeconds: Double
+    let openedAt: Date
+    let closedAt: Date
+    let records: [RecentStimulusSnapshot]
+    let digest: SensePacketDigestSnapshot?
+    let inventory: [StimulusInventorySnapshot]
+
+    var sequenceIDs: [Int] {
+        records.map(\.id)
+    }
+
+    var eventArguments: [String: JSONValue] {
+        var arguments: [String: JSONValue] = [
+            "packet_id": .string(packetID),
+            "trigger_kind": .string(triggerKind),
+            "window_seconds": .number(windowSeconds),
+            "opened_at_unix_ms": .number((openedAt.timeIntervalSince1970 * 1000).rounded()),
+            "closed_at_unix_ms": .number((closedAt.timeIntervalSince1970 * 1000).rounded()),
+            "record_count": .number(Double(records.count)),
+            "records": .array(records.map { .object($0.eventArguments) }),
+        ]
+        if let digest {
+            arguments["digest"] = .object(digest.eventArguments)
+        }
+        if !inventory.isEmpty {
+            arguments["sense_inventory"] = .array(inventory.map { .object($0.eventArguments) })
+        }
+        return arguments
+    }
+}
+
+struct StimulusInbox: Equatable {
+    var records: [StimulusRecord] = []
+    var inventory: [String: StimulusInventoryRecord] = [:]
+    var nextSequence = 1
+    var lastDeliveredAutonomySequence = 0
+
+    var pendingCount: Int {
+        records.filter { $0.deliveryState == .pending }.count
+    }
+
+    mutating func record(
+        kind: String,
+        summary: String,
+        metadata: [String: String],
+        context: StimulusRecordContext,
+        now: Date = Date()
+    ) -> StimulusRecord {
+        pruneContinuityTail(now: now)
+        let salience = Self.salience(from: metadata)
+        let id = nextSequence
+        nextSequence += 1
+        let rawReference = Self.rawPayloadReference(from: metadata)
+        let features = Self.features(kind: kind, metadata: metadata, rawPayloadReference: rawReference)
+        let record = StimulusRecord(
+            id: id,
+            kind: kind,
+            sense: metadata["sense"] ?? metadata["sense_kind"],
+            source: metadata["source"],
+            occurredAt: now,
+            summary: summary,
+            salience: salience,
+            metadata: metadata,
+            features: features,
+            digestKey: Self.digestKey(kind: kind, metadata: metadata),
+            rawPayloadReference: rawReference,
+            rawPayloadAvailable: rawReference != nil || metadata["raw_payload_available"] == "true",
+            processingState: Self.processingState(from: metadata, salience: salience),
+            receivedDuring: context.receivedDuring,
+            activeProcessGoal: context.activeProcessGoal,
+            activeProcessState: context.activeProcessState,
+            activeProcessStepName: context.activeProcessStepName,
+            deliveryState: .pending
+        )
+        inventory[kind] = StimulusInventoryRecord(
+            kind: kind,
+            totalCount: (inventory[kind]?.totalCount ?? 0) + 1,
+            lastOccurredAt: now,
+            lastSummary: summary,
+            lastMetadata: metadata
+        )
+        records.append(record)
+        if records.count > AffectiveViewModel.recentStimulusLimit * 4 {
+            records.removeFirst(records.count - AffectiveViewModel.recentStimulusLimit * 4)
+        }
+        return record
+    }
+
+    mutating func recentSnapshots(now: Date = Date()) -> [RecentStimulusSnapshot] {
+        pruneContinuityTail(now: now)
+        return recentRecords(now: now)
+            .sorted { lhs, rhs in
+                if lhs.salience == rhs.salience {
+                    return lhs.occurredAt > rhs.occurredAt
+                }
+                return lhs.salience > rhs.salience
+            }
+            .map { stimulus in
+                RecentStimulusSnapshot(
+                    id: stimulus.id,
+                    kind: stimulus.kind,
+                    ageSeconds: max(0, now.timeIntervalSince(stimulus.occurredAt)),
+                    summary: stimulus.summary,
+                    salience: stimulus.salience,
+                    metadata: stimulus.metadata
+                )
+            }
+    }
+
+    func inventorySummary(now: Date = Date()) -> [StimulusInventorySnapshot] {
+        let recentCounts = Dictionary(grouping: recentRecords(now: now), by: \.kind).mapValues(\.count)
+        return inventory.values
+            .sorted { lhs, rhs in
+                if lhs.lastOccurredAt == rhs.lastOccurredAt {
+                    return lhs.kind < rhs.kind
+                }
+                return lhs.lastOccurredAt > rhs.lastOccurredAt
+            }
+            .map { record in
+                StimulusInventorySnapshot(
+                    kind: record.kind,
+                    totalCount: record.totalCount,
+                    recentCount: recentCounts[record.kind] ?? 0,
+                    lastAgeSeconds: max(0, now.timeIntervalSince(record.lastOccurredAt)),
+                    lastSummary: record.lastSummary,
+                    lastMetadata: record.lastMetadata
+                )
+            }
+    }
+
+    func fullContext(now: Date = Date()) -> (
+        recent: [RecentStimulusSnapshot],
+        packet: SensePacketSnapshot?,
+        inventory: [StimulusInventorySnapshot]
+    ) {
+        var copy = self
+        return (
+            recent: copy.recentSnapshots(now: now),
+            packet: sensePacket(for: .directUserStimulus, triggerKind: "direct_user_stimulus", now: now),
+            inventory: inventorySummary(now: now)
+        )
+    }
+
+    func sensePacket(
+        for purpose: StimulusContextPurpose,
+        triggerKind: String,
+        now: Date = Date()
+    ) -> SensePacketSnapshot? {
+        let packetRecords = recordsForPacket(purpose: purpose, now: now)
+        guard !packetRecords.isEmpty else { return nil }
+        let windowSeconds = packetWindowSeconds(for: purpose, records: packetRecords, now: now)
+        let oldest = packetRecords.map(\.occurredAt).min() ?? now
+        let recordSnapshots = packetRecords
+            .sorted { lhs, rhs in
+                if lhs.occurredAt == rhs.occurredAt {
+                    return lhs.id < rhs.id
+                }
+                return lhs.occurredAt < rhs.occurredAt
+            }
+            .map { stimulus in
+                RecentStimulusSnapshot(
+                    id: stimulus.id,
+                    kind: stimulus.kind,
+                    ageSeconds: max(0, now.timeIntervalSince(stimulus.occurredAt)),
+                    summary: stimulus.summary,
+                    salience: stimulus.salience,
+                    metadata: stimulus.metadata
+                )
+            }
+        return SensePacketSnapshot(
+            packetID: "\(triggerKind)-\(packetRecords.map(\.id).min() ?? 0)-\(packetRecords.map(\.id).max() ?? 0)",
+            triggerKind: triggerKind,
+            windowSeconds: windowSeconds,
+            openedAt: oldest,
+            closedAt: now,
+            records: recordSnapshots,
+            digest: digest(for: purpose, now: now),
+            inventory: purpose == .autonomyTick ? [] : inventorySummary(now: now)
+        )
+    }
+
+    mutating func markDelivered(sequenceIDs: [Int]) {
+        guard !sequenceIDs.isEmpty else { return }
+        let delivered = Set(sequenceIDs)
+        for index in records.indices where delivered.contains(records[index].id) {
+            records[index].deliveryState = .delivered
+        }
+        if let maxID = sequenceIDs.max() {
+            lastDeliveredAutonomySequence = max(lastDeliveredAutonomySequence, maxID)
+        }
+    }
+
+    private func digest(for purpose: StimulusContextPurpose, now: Date) -> SensePacketDigestSnapshot? {
+        let candidates = recordsForPacket(purpose: purpose, now: now)
+        let windowSeconds = packetWindowSeconds(for: purpose, records: candidates, now: now)
+        guard !candidates.isEmpty else { return nil }
+
+        let groups = Dictionary(grouping: candidates) { stimulus in
+            stimulus.digestKey ?? stimulus.kind
+        }
+        let items = groups.values.map { group -> SensePacketDigestItemSnapshot in
+            let sorted = group.sorted { $0.occurredAt < $1.occurredAt }
+            let first = sorted.first!
+            let latest = sorted.last!
+            let maxSalience = sorted.map(\.salience).max() ?? latest.salience
+            let rawReference = sorted.reversed().compactMap(\.rawPayloadReference).first
+            let mergedMetadata = sorted.reduce(into: [String: String]()) { result, stimulus in
+                result.merge(stimulus.metadata) { _, new in new }
+            }
+            let features = sorted.flatMap(\.features).uniqued()
+            return SensePacketDigestItemSnapshot(
+                sequenceIDs: sorted.map(\.id),
+                kind: latest.kind,
+                count: sorted.count,
+                firstAgeSeconds: max(0, now.timeIntervalSince(first.occurredAt)),
+                lastAgeSeconds: max(0, now.timeIntervalSince(latest.occurredAt)),
+                latestSummary: Self.digestSummary(for: sorted),
+                salience: maxSalience,
+                processingState: Self.digestProcessingState(for: sorted, salience: maxSalience),
+                rawPayloadAvailable: sorted.contains { $0.rawPayloadAvailable },
+                rawPayloadReference: rawReference,
+                metadata: mergedMetadata,
+                features: features
+            )
+        }
+        .sorted { lhs, rhs in
+            if lhs.salience == rhs.salience {
+                return lhs.lastAgeSeconds < rhs.lastAgeSeconds
+            }
+            return lhs.salience > rhs.salience
+        }
+        .prefix(AffectiveViewModel.sensePacketDigestItemLimit)
+
+        let digestItems = Array(items)
+        return SensePacketDigestSnapshot(
+            windowSeconds: windowSeconds,
+            totalItemCount: candidates.count,
+            coalescedItemCount: groups.count,
+            highestSalience: digestItems.map(\.salience).max() ?? 0,
+            items: digestItems
+        )
+    }
+
+    private func recentRecords(now: Date) -> [StimulusRecord] {
+        records.filter { now.timeIntervalSince($0.occurredAt) <= AffectiveViewModel.recentStimulusRetentionSeconds }
+    }
+
+    private func recordsForPacket(purpose: StimulusContextPurpose, now: Date) -> [StimulusRecord] {
+        switch purpose {
+        case .directUserStimulus:
+            let windowStart = now.addingTimeInterval(-AffectiveViewModel.sensePacketWindowSeconds)
+            return records.filter { $0.occurredAt >= windowStart }
+        case .autonomyTick:
+            let pending = records.filter { $0.deliveryState == .pending || $0.id > lastDeliveredAutonomySequence }
+            let continuityTail = records
+                .filter { $0.deliveryState == .delivered }
+                .sorted { $0.id > $1.id }
+                .prefix(3)
+            return Array((pending + continuityTail).uniquedByID())
+        }
+    }
+
+    private func packetWindowSeconds(
+        for purpose: StimulusContextPurpose,
+        records: [StimulusRecord],
+        now: Date
+    ) -> Double {
+        switch purpose {
+        case .directUserStimulus:
+            return AffectiveViewModel.sensePacketWindowSeconds
+        case .autonomyTick:
+            guard let oldest = records.map(\.occurredAt).min() else { return 0 }
+            return max(0, now.timeIntervalSince(oldest))
+        }
+    }
+
+    private mutating func pruneContinuityTail(now: Date) {
+        let retained = records.filter {
+            $0.deliveryState == .pending
+                || now.timeIntervalSince($0.occurredAt) <= AffectiveViewModel.recentStimulusRetentionSeconds
+        }
+        records = retained
+    }
+
+    static func salience(from metadata: [String: String]) -> Double {
+        guard let rawValue = metadata["salience"], let value = Double(rawValue) else {
+            return 0.5
+        }
+        return min(max(value, 0), 1)
+    }
+
+    static func digestKey(kind: String, metadata: [String: String]) -> String {
+        switch kind {
+        case "short_touch", "long_touch":
+            return "touch:\(kind)"
+        case "poke_sequence":
+            return "touch:poke_sequence"
+        case "camera_observation":
+            return "camera:\(metadata["source"] ?? "unknown")"
+        case "orientation_observation":
+            return "orientation:\(metadata["posture"] ?? metadata["source"] ?? "unknown")"
+        case "motion_gesture":
+            return "motion:\(metadata["gesture"] ?? "unknown")"
+        default:
+            return kind
+        }
+    }
+
+    static func rawPayloadReference(from metadata: [String: String]) -> String? {
+        metadata["image_path"]
+            ?? metadata["media_path"]
+            ?? metadata["file_path"]
+            ?? metadata["raw_payload_ref"]
+    }
+
+    static func processingState(from metadata: [String: String], salience: Double) -> String {
+        if let explicit = metadata["processing_state"], !explicit.isEmpty {
+            return explicit
+        }
+        if salience >= 0.8 { return "promoted" }
+        if salience >= 0.5 { return "summarized" }
+        return "indexed"
+    }
+
+    static func digestProcessingState(for stimuli: [StimulusRecord], salience: Double) -> String {
+        if stimuli.contains(where: { $0.processingState == "promoted" }) || salience >= 0.8 {
+            return "promoted"
+        }
+        if stimuli.contains(where: { $0.processingState == "summarized" }) || stimuli.count > 1 {
+            return "summarized"
+        }
+        return stimuli.last?.processingState ?? "indexed"
+    }
+
+    static func digestSummary(for stimuli: [StimulusRecord]) -> String {
+        guard let latest = stimuli.last else { return "" }
+        guard stimuli.count > 1 else { return latest.summary }
+        return "\(stimuli.count)x \(latest.kind): \(latest.summary)"
+    }
+
+    static func features(kind: String, metadata: [String: String], rawPayloadReference: String?) -> [String] {
+        var features = Set<String>()
+        features.insert(kind)
+        if rawPayloadReference != nil {
+            features.insert("raw_payload_available")
+        }
+        if metadata["sense_direction"] == "push" {
+            features.insert("pushed_sense_update")
+        }
+        switch kind {
+        case "short_touch":
+            features.formUnion(["physical_contact", "duration_short"])
+        case "long_touch":
+            features.formUnion(["physical_contact", "duration_long"])
+        case "poke_sequence":
+            features.formUnion(["physical_contact", "repeated_pattern"])
+        case "camera_observation":
+            features.formUnion(["visual_observation"])
+        case "orientation_observation":
+            features.formUnion(["orientation_observation"])
+        case "motion_gesture":
+            features.formUnion(["motion_observation"])
+        case "boredom":
+            features.formUnion(["idle_context", "scheduled_stimulus"])
+        case "user_message", "user_interrupt_message", "user_media_message":
+            features.formUnion(["user_language"])
+        default:
+            features.insert("context_update")
+        }
+        if metadata["active_process_goal"] != nil {
+            features.insert("during_active_process")
+        }
+        return features.sorted()
+    }
+}
+
+nonisolated struct StimulusRecordContext: Equatable {
+    let receivedDuring: String
+    let activeProcessGoal: String?
+    let activeProcessState: String?
+    let activeProcessStepName: String?
+}
+
+private extension Array where Element == StimulusRecord {
+    func uniquedByID() -> [StimulusRecord] {
+        var seen = Set<Int>()
+        return filter { seen.insert($0.id).inserted }
+    }
+}
+
+private extension Sequence where Element == String {
+    func uniqued() -> [String] {
+        var seen = Set<String>()
+        return filter { seen.insert($0).inserted }
     }
 }
 
@@ -792,12 +1424,17 @@ nonisolated struct StimulusContext: Equatable {
     let ongoingAction: String?
     let hostHold: String?
     let queuedActionCount: Int
+    let inboxPendingCount: Int
     let speechOutputActive: Bool
     let awaitingSocialResponse: Bool
     let socialTurnResponseWindowRemainingSeconds: Double
     let counterpartActive: Bool
     let counterpartActivityWindowRemainingSeconds: Double
+    let activeProcessGoal: String?
+    let activeProcessState: String?
+    let activeProcessStepName: String?
     let recentStimuli: [RecentStimulusSnapshot]
+    let sensePacket: SensePacketSnapshot?
     let senseInventory: [StimulusInventorySnapshot]
     let localTime: Date
     let conversationContext: ConversationContextSnapshot
@@ -807,6 +1444,7 @@ nonisolated struct StimulusContext: Equatable {
             "kind": .string(kind),
             "received_during": .string(receivedDuring),
             "queued_action_count": .number(Double(queuedActionCount)),
+            "inbox_pending_count": .number(Double(inboxPendingCount)),
             "speech_output_active": .bool(speechOutputActive),
             "awaiting_social_response": .bool(awaitingSocialResponse),
             "social_turn_response_window_remaining_seconds": .number(socialTurnResponseWindowRemainingSeconds),
@@ -819,6 +1457,9 @@ nonisolated struct StimulusContext: Equatable {
         if !recentStimuli.isEmpty {
             arguments["recent_stimuli"] = .array(recentStimuli.map { .object($0.eventArguments) })
         }
+        if let sensePacket {
+            arguments["sense_packet"] = .object(sensePacket.eventArguments)
+        }
         if !senseInventory.isEmpty {
             arguments["sense_inventory"] = .array(senseInventory.map { .object($0.eventArguments) })
         }
@@ -827,6 +1468,15 @@ nonisolated struct StimulusContext: Equatable {
         }
         if let hostHold {
             arguments["host_hold"] = .string(hostHold)
+        }
+        if let activeProcessGoal {
+            arguments["active_process_goal"] = .string(activeProcessGoal)
+        }
+        if let activeProcessState {
+            arguments["active_process_state"] = .string(activeProcessState)
+        }
+        if let activeProcessStepName {
+            arguments["active_process_step"] = .string(activeProcessStepName)
         }
         return arguments
     }

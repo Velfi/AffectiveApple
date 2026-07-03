@@ -1,0 +1,58 @@
+{
+  "generated_at": "2026-07-01T12:00:00Z",
+  "suite_name": "Brain Quality Live E2E",
+  "baseline_name": "brain-quality-live-v1",
+  "total": 1,
+  "succeeded": 0,
+  "failed": 1,
+  "scenarios": [
+    {
+      "id": "continuity_remembers_what_happened",
+      "label": "Continuity",
+      "description": "It remembers what happened.",
+      "qualities": ["continuity"],
+      "status": "failed",
+      "duration_ms": 42,
+      "steps": [
+        {
+          "id": "seed_episode",
+          "label": "Seed distinctive episode",
+          "kind": "send_experience_event",
+          "status": "ok",
+          "summary": "Dispatch completed.",
+          "detail": null,
+          "assertions": [],
+          "artifacts": [
+            {
+              "id": "response",
+              "label": "response",
+              "kind": "json",
+              "body": "{\"ok\":true}",
+              "language": "json"
+            }
+          ]
+        },
+        {
+          "id": "continuity_evidence",
+          "label": "North Star continuity evidence",
+          "kind": "assert",
+          "status": "failed",
+          "summary": "Evidence gate did not find the required traces.",
+          "detail": "The run should preserve and/or recall the distinctive episode.",
+          "assertions": [
+            {
+              "id": "continuity_evidence",
+              "label": "North Star continuity evidence",
+              "status": "failed",
+              "message": "The run should preserve and/or recall the distinctive episode.",
+              "expected": "North Star, porch light",
+              "actual": "porch light only"
+            }
+          ],
+          "artifacts": []
+        }
+      ],
+      "artifacts": []
+    }
+  ]
+}

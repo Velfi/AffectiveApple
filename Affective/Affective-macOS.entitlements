@@ -26,6 +26,8 @@
 	<string>$(TeamIdentifierPrefix)com.zelda-built-this.AMBI.store</string>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<key>com.apple.security.network.server</key>
+	<true/>
 	<key>com.apple.security.exception.mach-lookup.global-name</key>
 	<array>
 		<string>com.apple.audioanalyticsd</string>

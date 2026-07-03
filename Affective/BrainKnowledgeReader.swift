@@ -268,29 +268,127 @@ nonisolated enum BrainKnowledgeReader {
         guard FileManager.default.fileExists(atPath: databaseURL.path) else { return nil }
 
         var database: OpaquePointer?
-        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
-            throw BrainKnowledgeReaderError.sqlite("could not open memory database: \(databaseURL.path)")
+        let openCode = sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READONLY, nil)
+        guard openCode == SQLITE_OK, let database else {
+            if let database {
+                let detail = sqliteDiagnostic(database: database, operation: "open memory database", code: openCode, fileURL: databaseURL)
+                sqlite3_close(database)
+                throw BrainKnowledgeReaderError.sqlite(detail)
+            }
+            throw BrainKnowledgeReaderError.sqlite(
+                "open memory database failed (SQLite \(openCode)) at \(databaseURL.path) (\(fileSummary(for: databaseURL)))"
+            )
         }
         defer { sqlite3_close(database) }
         sqlite3_busy_timeout(database, 5_000)
 
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(database, "SELECT data_json FROM cognitive_memory WHERE id = 1", -1, &statement, nil) == SQLITE_OK else {
-            throw BrainKnowledgeReaderError.sqlite("could not read cognitive memory: \(databaseURL.path)")
+        let prepareCode = sqlite3_prepare_v2(
+            database,
+            "SELECT data_json FROM cognitive_memory WHERE id = 1",
+            -1,
+            &statement,
+            nil
+        )
+        guard prepareCode == SQLITE_OK else {
+            throw BrainKnowledgeReaderError.sqlite(
+                sqliteDiagnostic(database: database, operation: "prepare cognitive_memory query", code: prepareCode, fileURL: databaseURL)
+            )
         }
         defer { sqlite3_finalize(statement) }
 
-        guard sqlite3_step(statement) == SQLITE_ROW,
-              let textPointer = sqlite3_column_text(statement, 0) else {
+        let stepCode = sqlite3_step(statement)
+        switch stepCode {
+        case SQLITE_ROW:
+            break
+        case SQLITE_DONE:
             return nil
+        default:
+            throw BrainKnowledgeReaderError.sqlite(
+                sqliteDiagnostic(database: database, operation: "read cognitive_memory row", code: stepCode, fileURL: databaseURL)
+            )
         }
 
-        let data = Data(String(cString: textPointer).utf8)
-        let object = try JSONSerialization.jsonObject(with: data)
+        guard let textPointer = sqlite3_column_text(statement, 0) else {
+            throw BrainKnowledgeReaderError.invalidData(
+                "cognitive_memory row id=1 has no data_json column at \(databaseURL.path) (\(fileSummary(for: databaseURL)))"
+            )
+        }
+
+        let jsonText = String(cString: textPointer)
+        let data = Data(jsonText.utf8)
+        let object: Any
+        do {
+            object = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw BrainKnowledgeReaderError.invalidData(
+                "cognitive memory JSON is invalid at \(databaseURL.path) (\(data.count) bytes): \(error.localizedDescription)"
+            )
+        }
         guard let dictionary = object as? [String: Any] else {
-            throw BrainKnowledgeReaderError.invalidData("cognitive memory must be a JSON object: \(databaseURL.path)")
+            throw BrainKnowledgeReaderError.invalidData(
+                "cognitive memory must be a JSON object at \(databaseURL.path), got \(String(describing: type(of: object)))"
+            )
         }
         return dictionary
+    }
+
+    private static func sqliteDiagnostic(
+        database: OpaquePointer?,
+        operation: String,
+        code: Int32,
+        fileURL: URL
+    ) -> String {
+        let label = sqliteResultLabel(code)
+        let path = fileURL.path
+        let fileInfo = fileSummary(for: fileURL)
+        if let database, let message = sqliteErrorMessage(database), !message.isEmpty {
+            return "\(operation) failed for \(path) (\(fileInfo)): \(label) (SQLite \(code)) — \(message)"
+        }
+        return "\(operation) failed for \(path) (\(fileInfo)): \(label) (SQLite \(code))"
+    }
+
+    private static func sqliteErrorMessage(_ database: OpaquePointer) -> String? {
+        guard let cString = sqlite3_errmsg(database) else { return nil }
+        let message = String(cString: cString).trimmingCharacters(in: .whitespacesAndNewlines)
+        return message.isEmpty ? nil : message
+    }
+
+    private static func sqliteResultLabel(_ code: Int32) -> String {
+        switch code {
+        case SQLITE_BUSY:
+            return "database busy (another process may be writing memory)"
+        case SQLITE_LOCKED:
+            return "database locked"
+        case SQLITE_CORRUPT:
+            return "database corrupt"
+        case SQLITE_NOTADB:
+            return "file is not a SQLite database"
+        case SQLITE_IOERR:
+            return "database I/O error"
+        case SQLITE_CANTOPEN:
+            return "cannot open database file"
+        case SQLITE_PERM:
+            return "database access denied"
+        case SQLITE_NOMEM:
+            return "out of memory while reading database"
+        case SQLITE_READONLY:
+            return "database is read-only"
+        case SQLITE_ERROR:
+            return "SQL error"
+        default:
+            return "SQLite error"
+        }
+    }
+
+    private static func fileSummary(for url: URL) -> String {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+            return "size unknown"
+        }
+        let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
+        let walPath = url.path + "-wal"
+        let walSuffix = FileManager.default.fileExists(atPath: walPath) ? ", WAL present" : ""
+        return "size \(size) bytes\(walSuffix)"
     }
 
     private static func stringValue(_ value: Any?) -> String? {

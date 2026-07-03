@@ -28,7 +28,7 @@ Affective SwiftUI app
      -> macOS: local core process or native library bridge
      -> iOS: network relay or embedded portable core
   -> Core Brain
-     -> memory, graph, appraisals, needs, autonomy, command execution
+     -> memory, graph, appraisals, needs, attention/agency, command execution
 ```
 
 The user-facing app should not call provider SDKs or OS sensors directly from views. Views talk to observable models; models talk to AffectiveKit services; services expose capability status and structured observations to the brain.
@@ -122,7 +122,7 @@ Use this for:
 
 - Streaming conversation events.
 - Passing image/audio files by secure local URLs.
-- Long-lived background autonomy.
+- Long-lived background attention and agency.
 - Cleaner crash/restart handling.
 
 ### Phase 3: iOS bridge
@@ -133,7 +133,7 @@ iOS cannot launch the Zig stdio server, and Affective must not require an Affect
 - Shared Swift core: port the portable brain model into AffectiveKit.
 - Optional Mac peer: sync or hand off with the user's Mac over local network/iCloud/Bonjour after local iOS operation works.
 
-Recommended path: build the typed contract now, then make iOS local-first. The Mac can remain a trusted peer for richer autonomy, backup, and sync, but the iPhone must be able to open a local brain, converse, remember, recall, and inspect state without the Mac or an Affective-hosted service.
+Recommended path: build the typed contract now, then make iOS local-first. The Mac can remain a trusted peer for richer background agency, backup, and sync, but the iPhone must be able to open a local brain, converse, remember, recall, and inspect state without the Mac or an Affective-hosted service.
 
 ## Provider Sign-In And Tokens
 
@@ -180,7 +180,7 @@ Capabilities:
 - Speech recognition or local transcription: Apple Speech framework, local Whisper, or provider audio.
 - Battery/power: `ProcessInfo`, IOKit on macOS if needed, `UIDevice` on iOS.
 - Storage: file system capacity and brain database size.
-- Notifications: reminders and autonomy nudges.
+- Notifications: reminders and attention nudges.
 - Background execution: limited on iOS, richer on macOS.
 - Local network: only if optional Mac peer sync is enabled.
 
@@ -266,7 +266,7 @@ The existing Xcode project uses a file-system synchronized group for `Affective/
 - Should the durable core remain Zig long-term, or should part of it move into Swift for tighter Apple integration?
 - Should the local iOS core be embedded Zig, a Swift port, or a smaller Swift subset that syncs with the Zig core?
 - Should provider calls happen inside the core, or should the Swift host act as the provider broker and return model responses to the core?
-- How much autonomy should be allowed on iOS given background execution limits?
+- How much background agency should be allowed on iOS given background execution limits?
 - Which data should be end-to-end encrypted when syncing or relaying between devices?
 
 ## Recommendation

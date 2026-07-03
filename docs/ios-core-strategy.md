@@ -138,7 +138,7 @@ Pros:
 
 - Satisfies the no Affective remote server requirement.
 - Lets iPhone open, converse, remember, recall, and inspect a brain when the Mac is absent.
-- Mac can still help with long-running autonomy, larger models, and backup when present.
+- Mac can still help with long-running background agency, larger models, and backup when present.
 - Keeps user memory local-first.
 
 Cons:
@@ -237,7 +237,7 @@ iOS can provide:
 
 iOS cannot provide:
 
-- arbitrary long-running background autonomy
+- arbitrary long-running background agency
 - launching and supervising a bundled stdio helper process like macOS
 - unrestricted filesystem access
 - shelling out to tools like `ffmpeg`, `pmset`, or `whisper-cli`

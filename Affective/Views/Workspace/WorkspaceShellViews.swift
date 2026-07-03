@@ -191,18 +191,12 @@ struct ChatWorkspace: View {
 
     var portraitBody: some View {
         VStack(spacing: 0) {
-            if horizontalSizeClass == .compact {
-                if !composerFocused.wrappedValue {
-                    WorkspaceHeader(
-                        title: model.workspaceBrainTitle,
-                        subtitle: "Chat with the selected brain and choose how much autonomy it has.",
-                        model: model
-                    )
-                    .padding(.horizontal, 14)
-                    .padding(.top, 12)
-                    .padding(.bottom, 10)
+            if horizontalSizeClass != .compact || !composerFocused.wrappedValue {
+                ChatConversationHeader(model: model, isCompact: horizontalSizeClass == .compact)
+                    .padding(.horizontal, horizontalSizeClass == .compact ? 14 : 24)
+                    .padding(.top, horizontalSizeClass == .compact ? 12 : 18)
+                    .padding(.bottom, horizontalSizeClass == .compact ? 10 : 14)
                     .transition(.move(edge: .top).combined(with: .opacity))
-                }
 
                 Divider()
                     .overlay(AppTheme.softSeparator)
@@ -213,6 +207,7 @@ struct ChatWorkspace: View {
                     entries: model.chatEntries,
                     brainRootURL: model.brain.rootURL,
                     isResponding: model.isAwaitingChatResponse,
+                    statusText: model.chatWorkingStatusText,
                     onReactToBrainUtterance: { entryID, emoji in
                         Task { await model.reactToBrainUtterance(entryID: entryID, emoji: emoji) }
                     }
@@ -227,6 +222,7 @@ struct ChatWorkspace: View {
                     entries: model.chatEntries,
                     brainRootURL: model.brain.rootURL,
                     isResponding: model.isAwaitingChatResponse,
+                    statusText: model.chatWorkingStatusText,
                     onReactToBrainUtterance: { entryID, emoji in
                         Task { await model.reactToBrainUtterance(entryID: entryID, emoji: emoji) }
                     }
@@ -266,6 +262,7 @@ struct ChatWorkspace: View {
                     entries: model.chatEntries,
                     brainRootURL: model.brain.rootURL,
                     isResponding: model.isAwaitingChatResponse,
+                    statusText: model.chatWorkingStatusText,
                     onReactToBrainUtterance: { entryID, emoji in
                         Task { await model.reactToBrainUtterance(entryID: entryID, emoji: emoji) }
                     }
@@ -280,12 +277,42 @@ struct ChatWorkspace: View {
                 VStack(alignment: .leading, spacing: 12) {
                     HeaderStrip(model: model)
                         .panelStyle()
+                    ChatConversationControlStrip(model: model)
                     ComposerPanel(model: model, composerFocused: composerFocused)
                 }
                 .padding(12)
             }
             .frame(width: 320)
             .background(AppTheme.sidebarBackground.opacity(0.55))
+        }
+    }
+}
+
+struct ChatConversationHeader: View {
+    @ObservedObject var model: AffectiveViewModel
+    var isCompact = false
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            headerRow
+            compactHeaderStack
+        }
+    }
+
+    var headerRow: some View {
+        HStack(spacing: isCompact ? 8 : 12) {
+            ChatConversationControlStrip(model: model, isCompact: isCompact)
+                .layoutPriority(2)
+
+            HeaderStrip(model: model)
+                .layoutPriority(1)
+        }
+    }
+
+    var compactHeaderStack: some View {
+        VStack(alignment: .leading, spacing: isCompact ? 8 : 10) {
+            HeaderStrip(model: model)
+            ChatConversationControlStrip(model: model, isCompact: true)
         }
     }
 }
@@ -777,135 +804,86 @@ private enum MailboxItemPreviewData {
     )
 }
 
-#Preview("Mailbox Empty") {
-    EmptyStateCard(title: "New mailbox items will appear here.", systemImage: "tray.full")
-        .padding(24)
+private struct MailboxEmptyPreview: PreviewProvider {
+    static var previews: some View {
+        EmptyStateCard(title: "New mailbox items will appear here.", systemImage: "tray.full")
+            .padding(24)
+            .frame(width: 390)
+            .background(AppTheme.background)
+            .previewDisplayName("Mailbox Empty")
+    }
+}
+
+private struct MailboxUnreadItemPreview: PreviewProvider {
+    static var previews: some View {
+        MailboxItemRow(
+            item: MailboxItemPreviewData.unread,
+            brainRootURL: MailboxItemPreviewData.rootURL,
+            isSelected: true
+        ) {}
+        .padding(18)
         .frame(width: 390)
         .background(AppTheme.background)
-}
-
-#Preview("Mailbox Unread Item") {
-    MailboxItemRow(
-        item: MailboxItemPreviewData.unread,
-        brainRootURL: MailboxItemPreviewData.rootURL,
-        isSelected: true
-    ) {}
-    .padding(18)
-    .frame(width: 390)
-    .background(AppTheme.background)
-}
-
-#Preview("Mailbox Opened Item") {
-    ScrollView {
-        MailboxItemDetailContent(
-            item: MailboxItemPreviewData.read,
-            brainRootURL: MailboxItemPreviewData.rootURL
-        ) {} toggleArchived: {}
-        .padding(24)
+        .previewDisplayName("Mailbox Unread Item")
     }
-    .frame(width: 760, height: 720)
-    .background(AppTheme.background)
 }
 
-#Preview("Mailbox Archived Item") {
-    MailboxItemRow(
-        item: MailboxItemPreviewData.archived,
-        brainRootURL: MailboxItemPreviewData.rootURL,
-        isSelected: false
-    ) {}
-    .padding(18)
-    .frame(width: 390)
-    .background(AppTheme.background)
+private struct MailboxOpenedItemPreview: PreviewProvider {
+    static var previews: some View {
+        ScrollView {
+            MailboxItemDetailContent(
+                item: MailboxItemPreviewData.read,
+                brainRootURL: MailboxItemPreviewData.rootURL
+            ) {} toggleArchived: {}
+            .padding(24)
+        }
+        .frame(width: 760, height: 720)
+        .background(AppTheme.background)
+        .previewDisplayName("Mailbox Opened Item")
+    }
+}
+
+private struct MailboxArchivedItemPreview: PreviewProvider {
+    static var previews: some View {
+        MailboxItemRow(
+            item: MailboxItemPreviewData.archived,
+            brainRootURL: MailboxItemPreviewData.rootURL,
+            isSelected: false
+        ) {}
+        .padding(18)
+        .frame(width: 390)
+        .background(AppTheme.background)
+        .previewDisplayName("Mailbox Archived Item")
+    }
 }
 #endif
+
+private func inspectedLogEntry(in entries: [LogEntry], selectedID: LogEntry.ID?) -> LogEntry? {
+    if let selectedID,
+       let selected = entries.first(where: { $0.id == selectedID }) {
+        return selected
+    }
+    return entries.first
+}
 
 struct DeveloperWorkspace: View {
     @ObservedObject var model: AffectiveViewModel
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @State private var showsCompactEventInspector = false
 
     var body: some View {
         if horizontalSizeClass == .compact {
-            GeometryReader { proxy in
-                VStack(spacing: 0) {
-                    compactDeveloperMain(horizontalPadding: 14, topPadding: 14)
-                        .frame(maxHeight: .infinity)
-                        .layoutPriority(1)
-
-                    Divider()
-                        .overlay(AppTheme.softSeparator)
-
-                    compactDeveloperTools(maxHeight: compactToolsHeight(for: proxy.size.height))
-                }
-            }
-        } else if verticalSizeClass == .compact {
-            HStack(spacing: 0) {
-                compactDeveloperMain(horizontalPadding: 16, topPadding: 12)
-
-                Divider()
-                    .overlay(AppTheme.softSeparator)
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HeaderStrip(model: model)
-                            .panelStyle()
-                        ReminderToolsPanel(model: model)
-                    }
-                    .padding(12)
-                }
-                .frame(width: 300)
-                .background(AppTheme.sidebarBackground.opacity(0.6))
-            }
+            compactDeveloperMain(horizontalPadding: 14, topPadding: 14)
         } else {
-            HStack(spacing: 0) {
-                developerMain(horizontalPadding: 32, topPadding: 28)
-
-                Divider()
-                    .overlay(AppTheme.softSeparator)
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        HeaderStrip(model: model)
-                        ReminderToolsPanel(model: model)
-                    }
-                    .padding(24)
-                }
-                .frame(width: 360)
-                .background(AppTheme.sidebarBackground.opacity(0.6))
-            }
+            developerMain(horizontalPadding: 32, topPadding: 28)
         }
-    }
-
-    func compactToolsHeight(for availableHeight: CGFloat) -> CGFloat {
-        min(240, max(168, availableHeight * 0.26))
-    }
-
-    func compactDeveloperTools(maxHeight: CGFloat) -> some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(alignment: .top, spacing: 12) {
-                compactToolPanel(maxHeight: maxHeight) {
-                    ReminderToolsPanel(model: model)
-                }
-            }
-            .padding(14)
-        }
-        .frame(height: maxHeight)
-        .background(AppTheme.sidebarBackground.opacity(0.6))
-    }
-
-    func compactToolPanel<Content: View>(
-        maxHeight: CGFloat,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            content()
-                .frame(width: 340)
-        }
-        .frame(width: 340, height: max(maxHeight - 28, 1), alignment: .top)
     }
 
     func compactDeveloperMain(horizontalPadding: CGFloat, topPadding: CGFloat) -> some View {
-        VStack(spacing: 0) {
+        let entries = model.filteredEventEntries
+        let inspectedEntry = inspectedLogEntry(in: entries, selectedID: model.selectedEventEntryID)
+
+        return VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 12) {
                 HeaderStrip(model: model)
                     .panelStyle()
@@ -917,8 +895,8 @@ struct DeveloperWorkspace: View {
 
                     Spacer(minLength: 8)
 
-                    CompactStatusPill(text: "\(model.filteredEventEntries.count)")
-                        .accessibilityLabel("\(model.filteredEventEntries.count) event entries")
+                    CompactStatusPill(text: "\(entries.count)")
+                        .accessibilityLabel("\(entries.count) event entries")
                 }
 
                 EventFilterBar(model: model)
@@ -931,14 +909,42 @@ struct DeveloperWorkspace: View {
                 .overlay(AppTheme.softSeparator)
 
             DeveloperConsoleList(
-                entries: model.filteredEventEntries,
-                emptyTitle: "Brain events and capability results will appear here."
+                entries: entries,
+                emptyTitle: "Brain events and capability results will appear here.",
+                selectedEntryID: inspectedEntry?.id,
+                onSelect: { entry in
+                    model.selectedEventEntryID = entry.id
+                    showsCompactEventInspector = true
+                }
             )
+        }
+        .sheet(isPresented: $showsCompactEventInspector) {
+            NavigationStack {
+                LogEntryInspector(
+                    entry: inspectedEntry,
+                    brainRootURL: model.brain.rootURL,
+                    emptyTitle: "Select an event to inspect it."
+                )
+                    .navigationTitle("Event")
+                    #if os(iOS)
+                    .navigationBarTitleDisplayMode(.inline)
+                    #endif
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") {
+                                showsCompactEventInspector = false
+                            }
+                        }
+                    }
+            }
         }
     }
 
     func developerMain(horizontalPadding: CGFloat, topPadding: CGFloat) -> some View {
-        VStack(spacing: 0) {
+        let entries = model.filteredEventEntries
+        let inspectedEntry = inspectedLogEntry(in: entries, selectedID: model.selectedEventEntryID)
+
+        return VStack(spacing: 0) {
             WorkspaceHeader(
                 title: "Developer",
                 subtitle: "Inspect Brain events, filter by kind, and observe capability results.",
@@ -955,12 +961,48 @@ struct DeveloperWorkspace: View {
             Divider()
                 .overlay(AppTheme.softSeparator)
 
-            EntriesList(
-                entries: model.filteredEventEntries,
+            LogEntryBrowser(
+                entries: entries,
                 emptyTitle: "Brain events and capability results will appear here.",
+                selectedEntry: inspectedEntry,
                 brainRootURL: model.brain.rootURL,
-                showsCopyButton: true
+                onSelect: { entry in
+                    model.selectedEventEntryID = entry.id
+                }
             )
+        }
+    }
+}
+
+struct LogEntryBrowser: View {
+    let entries: [LogEntry]
+    let emptyTitle: String
+    let selectedEntry: LogEntry?
+    let brainRootURL: URL
+    var inspectorEmptyTitle = "Select an entry to inspect it."
+    var onSelect: (LogEntry) -> Void
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    var body: some View {
+        HStack(spacing: 0) {
+            DeveloperConsoleList(
+                entries: entries,
+                emptyTitle: emptyTitle,
+                selectedEntryID: selectedEntry?.id,
+                onSelect: onSelect
+            )
+            .frame(minWidth: 300, idealWidth: 430, maxWidth: 520)
+            .background(AppTheme.sidebarBackground.opacity(0.34))
+
+            Divider()
+                .overlay(AppTheme.softSeparator)
+
+            LogEntryInspector(
+                entry: selectedEntry,
+                brainRootURL: brainRootURL,
+                emptyTitle: inspectorEmptyTitle
+            )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 }
@@ -968,93 +1010,21 @@ struct DeveloperWorkspace: View {
 struct KnowledgeWorkspace: View {
     @ObservedObject var model: AffectiveViewModel
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @State private var showsCompactKnowledgeInspector = false
 
     var body: some View {
         if horizontalSizeClass == .compact {
-            GeometryReader { proxy in
-                VStack(spacing: 0) {
-                    compactKnowledgeMain(horizontalPadding: 14, topPadding: 14)
-                        .frame(maxHeight: .infinity)
-                        .layoutPriority(1)
-
-                    Divider()
-                        .overlay(AppTheme.softSeparator)
-
-                    compactKnowledgeTools(maxHeight: compactToolsHeight(for: proxy.size.height))
-                }
-            }
-        } else if verticalSizeClass == .compact {
-            HStack(spacing: 0) {
-                compactKnowledgeMain(horizontalPadding: 16, topPadding: 12)
-
-                Divider()
-                    .overlay(AppTheme.softSeparator)
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        MemoryToolsPanel(model: model)
-                        ReminderToolsPanel(model: model)
-                    }
-                    .padding(12)
-                }
-                .frame(width: 300)
-                .background(AppTheme.sidebarBackground.opacity(0.6))
-            }
+            compactKnowledgeMain(horizontalPadding: 14, topPadding: 14)
         } else {
-            HStack(spacing: 0) {
-                knowledgeMain(horizontalPadding: 32, topPadding: 28)
-
-                Divider()
-                    .overlay(AppTheme.softSeparator)
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        MemoryToolsPanel(model: model)
-                        ReminderToolsPanel(model: model)
-                    }
-                    .padding(24)
-                }
-                .frame(width: 380)
-                .background(AppTheme.sidebarBackground.opacity(0.6))
-            }
+            knowledgeMain(horizontalPadding: 32, topPadding: 28)
         }
-    }
-
-    func compactToolsHeight(for availableHeight: CGFloat) -> CGFloat {
-        min(240, max(168, availableHeight * 0.26))
-    }
-
-    func compactKnowledgeTools(maxHeight: CGFloat) -> some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(alignment: .top, spacing: 12) {
-                compactToolPanel(maxHeight: maxHeight) {
-                    MemoryToolsPanel(model: model)
-                }
-                compactToolPanel(maxHeight: maxHeight) {
-                    ReminderToolsPanel(model: model)
-                }
-            }
-            .padding(14)
-        }
-        .frame(height: maxHeight)
-        .background(AppTheme.sidebarBackground.opacity(0.6))
-    }
-
-    func compactToolPanel<Content: View>(
-        maxHeight: CGFloat,
-        width: CGFloat = 340,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            content()
-                .frame(width: width)
-        }
-        .frame(width: width, height: max(maxHeight - 28, 1), alignment: .top)
     }
 
     func compactKnowledgeMain(horizontalPadding: CGFloat, topPadding: CGFloat) -> some View {
-        VStack(spacing: 0) {
+        let entries = model.filteredKnowledgeEntries
+        let inspectedEntry = inspectedLogEntry(in: entries, selectedID: model.selectedKnowledgeEntryID)
+
+        return VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 12) {
                 HeaderStrip(model: model)
                     .panelStyle()
@@ -1066,11 +1036,11 @@ struct KnowledgeWorkspace: View {
 
                     Spacer(minLength: 8)
 
-                    CompactStatusPill(text: "\(model.filteredKnowledgeEntries.count)")
-                        .accessibilityLabel("\(model.filteredKnowledgeEntries.count) knowledge entries")
+                    CompactStatusPill(text: "\(entries.count)")
+                        .accessibilityLabel("\(entries.count) knowledge entries")
                 }
 
-                KnowledgeFilterBar(model: model)
+                KnowledgeFilterBar(model: model, filteredCount: entries.count)
             }
             .padding(.horizontal, horizontalPadding)
             .padding(.top, topPadding)
@@ -1080,15 +1050,43 @@ struct KnowledgeWorkspace: View {
                 .overlay(AppTheme.softSeparator)
 
             CompactActivityList(
-                entries: model.filteredKnowledgeEntries,
+                entries: entries,
                 emptyTitle: "Memory and knowledge activity will appear here.",
-                emptySystemImage: "tray.full"
+                emptySystemImage: "tray.full",
+                selectedEntryID: inspectedEntry?.id,
+                onSelect: { entry in
+                    model.selectedKnowledgeEntryID = entry.id
+                    showsCompactKnowledgeInspector = true
+                }
             )
+        }
+        .sheet(isPresented: $showsCompactKnowledgeInspector) {
+            NavigationStack {
+                LogEntryInspector(
+                    entry: inspectedEntry,
+                    brainRootURL: model.brain.rootURL,
+                    emptyTitle: "Select a knowledge entry to inspect it."
+                )
+                    .navigationTitle("Knowledge")
+                    #if os(iOS)
+                    .navigationBarTitleDisplayMode(.inline)
+                    #endif
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") {
+                                showsCompactKnowledgeInspector = false
+                            }
+                        }
+                    }
+            }
         }
     }
 
     func knowledgeMain(horizontalPadding: CGFloat, topPadding: CGFloat) -> some View {
-        VStack(spacing: 0) {
+        let entries = model.filteredKnowledgeEntries
+        let inspectedEntry = inspectedLogEntry(in: entries, selectedID: model.selectedKnowledgeEntryID)
+
+        return VStack(spacing: 0) {
             WorkspaceHeader(
                 title: "Knowledge",
                 subtitle: "Search and group memory, reminders, dreams, and attention-related output.",
@@ -1098,18 +1096,22 @@ struct KnowledgeWorkspace: View {
             .padding(.top, topPadding)
             .padding(.bottom, 16)
 
-            KnowledgeFilterBar(model: model)
+            KnowledgeFilterBar(model: model, filteredCount: entries.count)
                 .padding(.horizontal, horizontalPadding)
                 .padding(.bottom, 16)
 
             Divider()
                 .overlay(AppTheme.softSeparator)
 
-            EntriesList(
-                entries: model.filteredKnowledgeEntries,
+            LogEntryBrowser(
+                entries: entries,
                 emptyTitle: "Memory and knowledge activity will appear here.",
+                selectedEntry: inspectedEntry,
                 brainRootURL: model.brain.rootURL,
-                showsCopyButton: true
+                inspectorEmptyTitle: "Select a knowledge entry to inspect it.",
+                onSelect: { entry in
+                    model.selectedKnowledgeEntryID = entry.id
+                }
             )
         }
     }
@@ -1547,19 +1549,9 @@ struct SidebarBrainPanel: View {
                     .lineLimit(2)
                     .minimumScaleFactor(0.8)
 
-                Text("Chat with the selected brain and choose how much autonomy it has.")
+                Text("Selected brain")
                     .font(.caption)
                     .foregroundStyle(AppTheme.secondaryText)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            HeaderStrip(model: model)
-
-            if !model.innerStateSummary.isEmpty {
-                Text(model.innerStateSummary)
-                    .font(.caption2)
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .lineLimit(6)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }

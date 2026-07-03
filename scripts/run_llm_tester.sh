@@ -66,10 +66,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-(
-  cd "$CORE_ROOT"
-  zig build llm-tester-manifest -- --output "$MANIFEST_PATH"
-)
+if [[ "$GENERATED_MANIFEST" -eq 1 ]]; then
+  (
+    cd "$CORE_ROOT"
+    zig build llm-tester-manifest -- --output "$MANIFEST_PATH"
+  )
+fi
 
 ARGS=(--manifest "$MANIFEST_PATH" --output "$OUTPUT_PATH" --provider "$PROVIDER")
 (

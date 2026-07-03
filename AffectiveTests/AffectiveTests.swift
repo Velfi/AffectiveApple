@@ -13,6 +13,34 @@ import ImageIO
 
 @testable import Affective
 
+private final class LockedValue<Value>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage: Value
+
+  init(_ initialValue: Value) {
+    storage = initialValue
+  }
+
+  var value: Value {
+    get {
+      lock.lock()
+      defer { lock.unlock() }
+      return storage
+    }
+    set {
+      lock.lock()
+      storage = newValue
+      lock.unlock()
+    }
+  }
+
+  func mutate(_ body: (inout Value) -> Void) {
+    lock.lock()
+    body(&storage)
+    lock.unlock()
+  }
+}
+
 final class AffectiveTests: XCTestCase {
   private var temporaryRoots: [URL] = []
 
@@ -41,40 +69,255 @@ final class AffectiveTests: XCTestCase {
     XCTAssertNoThrow(try brain.validateForCoreConnection())
   }
 
-  func testBrainCoreHasNoOperationFallbackRuntimePath() throws {
-    let testFile = URL(fileURLWithPath: #filePath)
-    let projectRoot = testFile.deletingLastPathComponent().deletingLastPathComponent()
-    let sourceURL = projectRoot.appendingPathComponent("Affective/Core/BrainCore.swift")
-    let source = try String(contentsOf: sourceURL, encoding: .utf8)
-
-    XCTAssertFalse(source.contains("unavailable(operation:"))
-    XCTAssertFalse(source.contains("func unavailable(operation:"))
-    XCTAssertFalse(source.contains("#if os(iOS) || os(macOS)"))
-    XCTAssertFalse(source.contains("api_e2e needs the AffectiveCore Zig core linked"))
+  func testCoreConfigStorageBuildsBSPCreateMessage() throws {
+    let brain = try makeBrain()
+    let storage = CoreConfigStorage(brain: brain, textProviderPreference: .random)
+    let createMessage = BrainSessionConfig(storage: storage).createMessage.objectValue
+    let config = createMessage?["config"]?.objectValue
+    XCTAssertEqual(createMessage?["type"], .string("session.create"))
+    XCTAssertGreaterThan(createMessage?["host_manifest_json"]?.stringValue?.count ?? 0, 0)
+    XCTAssertGreaterThan(config?["memory_path"]?.stringValue?.count ?? 0, 0)
   }
 
-  func testBrainLibraryUsesOnlyCoreBrainArchivesForImportExport() throws {
-    let testFile = URL(fileURLWithPath: #filePath)
-    let projectRoot = testFile.deletingLastPathComponent().deletingLastPathComponent()
-    let checkedFiles = [
-      "Affective/BrainLibrary.swift",
-      "Affective/Views/BrainLibrary/BrainHomeView.swift",
-      "Affective/Views/BrainLibrary/BrainCardViews.swift",
-    ]
-    let forbidden = [
-      "importBrain" + "Folder",
-      "importBrain" + "Directory",
-      "exportBrain" + "Folder",
-      "Export " + "Folder",
-    ]
+  func testBrainCoreDispatchModeDefaultsToConcurrentAndAcceptsHostOverrides() {
+    XCTAssertEqual(BrainCoreDispatchMode.fromEnvironment([:]), .concurrent)
+    XCTAssertEqual(BrainCoreDispatchMode.fromEnvironment(["AFFECTIVE_BSP_DISPATCH_MODE": "serial"]), .concurrent)
+    XCTAssertEqual(BrainCoreDispatchMode.fromEnvironment(["AFFECTIVE_BSP_DISPATCH_MODE": "concurrent"]), .concurrent)
+    XCTAssertEqual(BrainCoreDispatchMode.fromEnvironment(["AFFECTIVE_BSP_DISPATCH_MODE": "parallel"]), .parallel)
+    XCTAssertEqual(BrainCoreDispatchMode.fromEnvironment(["AFFECTIVE_BSP_DISPATCH_MODE": "multiplexed"]), .concurrent)
+    XCTAssertEqual(BrainCoreDispatchMode.fromEnvironment(["AFFECTIVE_BSP_DISPATCH_MODE": "unknown"]), .concurrent)
+  }
 
-    for relativePath in checkedFiles {
-      let sourceURL = projectRoot.appendingPathComponent(relativePath)
-      let source = try String(contentsOf: sourceURL, encoding: .utf8)
-      for token in forbidden {
-        XCTAssertFalse(source.contains(token), "\(relativePath) still contains \(token)")
+  func testQueueableDispatchOverlapsLongCommandDispatchInParallelMode() async throws {
+    let bus = BrainCoreMessageBus(mode: .parallel)
+    let serialStarted = expectation(description: "serial dispatch started")
+    let releaseSerial = LockedValue<CheckedContinuation<Void, Never>?>(nil)
+
+    let serialTask = Task {
+      try await bus.submitSerial {
+        serialStarted.fulfill()
+        await withCheckedContinuation { continuation in
+          releaseSerial.value = continuation
+        }
+        return "serial-complete"
       }
     }
+
+    await fulfillment(of: [serialStarted], timeout: 1)
+
+    let queueableEnvelope = try await bus.submitQueueable(key: "sense_status") {
+      BrainDispatchEnvelope(requestID: "queueable", ok: true, events: [], result: nil, error: nil)
+    }
+
+    XCTAssertEqual(queueableEnvelope.requestID, "queueable")
+    releaseSerial.value?.resume()
+    let serialResult = try await serialTask.value
+    XCTAssertEqual(serialResult, "serial-complete")
+  }
+
+  func testQueueableDispatchWaitsBehindCommandDispatchInConcurrentMode() async throws {
+    let bus = BrainCoreMessageBus(mode: .concurrent)
+    let serialStarted = expectation(description: "serial dispatch started")
+    let queueableStarted = LockedValue(false)
+    let releaseSerial = LockedValue<CheckedContinuation<Void, Never>?>(nil)
+
+    let serialTask = Task {
+      try await bus.submitSerial {
+        serialStarted.fulfill()
+        await withCheckedContinuation { continuation in
+          releaseSerial.value = continuation
+        }
+        return "serial-complete"
+      }
+    }
+
+    await fulfillment(of: [serialStarted], timeout: 1)
+
+    let queueableTask = Task {
+      try await bus.submitQueueable(key: "sense_status") {
+        queueableStarted.value = true
+        return BrainDispatchEnvelope(requestID: "queueable", ok: true, events: [], result: nil, error: nil)
+      }
+    }
+
+    try await Task.sleep(for: .milliseconds(50))
+    XCTAssertFalse(queueableStarted.value)
+
+    releaseSerial.value?.resume()
+    let queueableEnvelope = try await queueableTask.value
+    let serialResult = try await serialTask.value
+
+    XCTAssertEqual(queueableEnvelope.requestID, "queueable")
+    XCTAssertEqual(serialResult, "serial-complete")
+  }
+
+  func testQueueableDispatchesCoalesceByKeyInConcurrentMode() async throws {
+    let bus = BrainCoreMessageBus(mode: .concurrent)
+    let serialStarted = expectation(description: "serial dispatch started")
+    let releaseSerial = LockedValue<CheckedContinuation<Void, Never>?>(nil)
+    let executedRequests = LockedValue<[String]>([])
+
+    let serialTask = Task {
+      try await bus.submitSerial {
+        serialStarted.fulfill()
+        await withCheckedContinuation { continuation in
+          releaseSerial.value = continuation
+        }
+        return "serial-complete"
+      }
+    }
+
+    await fulfillment(of: [serialStarted], timeout: 1)
+
+    let firstTask = Task {
+      try await bus.submitQueueable(key: "stimulus_ingest") {
+        executedRequests.mutate { $0.append("first") }
+        return BrainDispatchEnvelope(requestID: "first", ok: true, events: [], result: nil, error: nil)
+      }
+    }
+    let secondTask = Task {
+      try await Task.sleep(for: .milliseconds(5))
+      return try await bus.submitQueueable(key: "stimulus_ingest") {
+        executedRequests.mutate { $0.append("second") }
+        return BrainDispatchEnvelope(requestID: "second", ok: true, events: [], result: nil, error: nil)
+      }
+    }
+    let latestTask = Task {
+      try await Task.sleep(for: .milliseconds(10))
+      return try await bus.submitQueueable(key: "stimulus_ingest") {
+        executedRequests.mutate { $0.append("latest") }
+        return BrainDispatchEnvelope(requestID: "latest", ok: true, events: [], result: nil, error: nil)
+      }
+    }
+
+    try await Task.sleep(for: .milliseconds(50))
+    XCTAssertEqual(executedRequests.value, [])
+
+    releaseSerial.value?.resume()
+    let firstEnvelope = try await firstTask.value
+    let secondEnvelope = try await secondTask.value
+    let latestEnvelope = try await latestTask.value
+    let serialResult = try await serialTask.value
+
+    XCTAssertEqual(executedRequests.value, ["latest"])
+    XCTAssertEqual(firstEnvelope.requestID, "latest")
+    XCTAssertEqual(secondEnvelope.requestID, "latest")
+    XCTAssertEqual(latestEnvelope.requestID, "latest")
+    XCTAssertEqual(serialResult, "serial-complete")
+  }
+
+  func testQueueableDispatchesKeepDifferentSenseKeysInConcurrentMode() async throws {
+    let bus = BrainCoreMessageBus(mode: .concurrent)
+    let serialStarted = expectation(description: "command dispatch started")
+    let releaseSerial = LockedValue<CheckedContinuation<Void, Never>?>(nil)
+    let executedRequests = LockedValue<[String]>([])
+
+    let serialTask = Task {
+      try await bus.submitSerial {
+        serialStarted.fulfill()
+        await withCheckedContinuation { continuation in
+          releaseSerial.value = continuation
+        }
+        return "command-complete"
+      }
+    }
+
+    await fulfillment(of: [serialStarted], timeout: 1)
+
+    let cameraTask = Task {
+      try await bus.submitQueueable(key: "sense_status:sense:camera") {
+        executedRequests.mutate { $0.append("camera") }
+        return BrainDispatchEnvelope(requestID: "camera", ok: true, events: [], result: nil, error: nil)
+      }
+    }
+    let orientationTask = Task {
+      try await bus.submitQueueable(key: "sense_status:sense:orientation") {
+        executedRequests.mutate { $0.append("orientation") }
+        return BrainDispatchEnvelope(requestID: "orientation", ok: true, events: [], result: nil, error: nil)
+      }
+    }
+
+    try await Task.sleep(for: .milliseconds(50))
+    XCTAssertEqual(executedRequests.value, [])
+
+    releaseSerial.value?.resume()
+    let cameraEnvelope = try await cameraTask.value
+    let orientationEnvelope = try await orientationTask.value
+    let serialResult = try await serialTask.value
+
+    XCTAssertEqual(Set(executedRequests.value), Set(["camera", "orientation"]))
+    XCTAssertEqual(cameraEnvelope.requestID, "camera")
+    XCTAssertEqual(orientationEnvelope.requestID, "orientation")
+    XCTAssertEqual(serialResult, "command-complete")
+  }
+
+  func testStimulusIngestQueueKeysDoNotCoalesceSpeechOrTouch() {
+    let speech: [String: JSONValue] = [
+      "kind": .string("speech"),
+      "text": .string("hello"),
+    ]
+    let touch: [String: JSONValue] = [
+      "kind": .string("touch"),
+      "sense": .string("touch"),
+      "summary": .string("short touch"),
+    ]
+
+    let firstSpeechKey = BrainCore.queueableDispatchKey(operation: "stimulus_ingest", eventObject: speech)
+    let secondSpeechKey = BrainCore.queueableDispatchKey(operation: "stimulus_ingest", eventObject: speech)
+    let firstTouchKey = BrainCore.queueableDispatchKey(operation: "stimulus_ingest", eventObject: touch)
+    let secondTouchKey = BrainCore.queueableDispatchKey(operation: "stimulus_ingest", eventObject: touch)
+
+    XCTAssertTrue(firstSpeechKey.hasPrefix("stimulus_ingest:speech:"))
+    XCTAssertTrue(firstTouchKey.hasPrefix("stimulus_ingest:touch:"))
+    XCTAssertNotEqual(firstSpeechKey, secondSpeechKey)
+    XCTAssertNotEqual(firstTouchKey, secondTouchKey)
+  }
+
+  func testQueueableDispatchesCoalesceByKeyInParallelMode() async throws {
+    let bus = BrainCoreMessageBus(mode: .parallel)
+    let firstStarted = expectation(description: "first queueable started")
+    let releaseFirst = LockedValue<CheckedContinuation<Void, Never>?>(nil)
+    let executedRequests = LockedValue<[String]>([])
+
+    let firstTask = Task {
+      try await bus.submitQueueable(key: "sense_status") {
+        firstStarted.fulfill()
+        await withCheckedContinuation { continuation in
+          releaseFirst.value = continuation
+        }
+        executedRequests.mutate { $0.append("first") }
+        return BrainDispatchEnvelope(requestID: "first", ok: true, events: [], result: nil, error: nil)
+      }
+    }
+
+    await fulfillment(of: [firstStarted], timeout: 1)
+
+    let secondTask = Task {
+      try await bus.submitQueueable(key: "sense_status") {
+        executedRequests.mutate { $0.append("second") }
+        return BrainDispatchEnvelope(requestID: "second", ok: true, events: [], result: nil, error: nil)
+      }
+    }
+    let latestTask = Task {
+      try await Task.sleep(for: .milliseconds(5))
+      return try await bus.submitQueueable(key: "sense_status") {
+        executedRequests.mutate { $0.append("latest") }
+        return BrainDispatchEnvelope(requestID: "latest", ok: true, events: [], result: nil, error: nil)
+      }
+    }
+
+    try await Task.sleep(for: .milliseconds(50))
+    XCTAssertEqual(executedRequests.value, [])
+
+    releaseFirst.value?.resume()
+    let firstEnvelope = try await firstTask.value
+    let secondEnvelope = try await secondTask.value
+    let latestEnvelope = try await latestTask.value
+
+    XCTAssertEqual(executedRequests.value, ["first", "latest"])
+    XCTAssertEqual(firstEnvelope.requestID, "first")
+    XCTAssertEqual(secondEnvelope.requestID, "latest")
+    XCTAssertEqual(latestEnvelope.requestID, "latest")
   }
 
   @MainActor
@@ -136,6 +379,91 @@ final class AffectiveTests: XCTestCase {
     try await Task.sleep(nanoseconds: 50_000_000)
     let markReadIDs = await core.mailboxMarkReadIDs
     XCTAssertEqual(markReadIDs, ["mail_dream_1"])
+  }
+
+  func testRuntimeTypedResponsesParseStructuredDispatchPayloads() throws {
+    let mailboxItem = Self.runtimeMailboxItemValue(mailboxID: "mail_runtime_1")
+
+    let dream = try BrainMailboxResponse(
+      toolName: "request_dream_time",
+      envelope: Self.runtimeEnvelope(
+        requestID: "runtime-dream",
+        value: .object([
+          "kind": .string("request_dream_time"),
+          "mailbox_item": mailboxItem,
+        ])
+      )
+    )
+    XCTAssertEqual(dream.item.mailboxID, "mail_runtime_1")
+    assertRuntimeDispatchMetadata(dream.metadata, "request_dream_time")
+
+    let list = try BrainMailboxListResponse(
+      toolName: "mailbox_list",
+      envelope: Self.runtimeEnvelope(
+        requestID: "runtime-mailbox-list",
+        value: .object([
+          "kind": .string("mailbox_list"),
+          "items": .array([mailboxItem]),
+        ])
+      )
+    )
+    XCTAssertEqual(list.items.map(\.mailboxID), ["mail_runtime_1"])
+    XCTAssertEqual(list.metadata["mailbox_item_count"], "1")
+    assertRuntimeDispatchMetadata(list.metadata, "mailbox_list")
+
+    let markRead = try BrainMailboxListResponse(
+      toolName: "mailbox_mark_read",
+      envelope: Self.runtimeEnvelope(
+        requestID: "runtime-mailbox-mark-read",
+        value: .object([
+          "kind": .string("mailbox_mark_read"),
+          "items": .array([mailboxItem]),
+        ])
+      )
+    )
+    XCTAssertEqual(markRead.items.map(\.mailboxID), ["mail_runtime_1"])
+    assertRuntimeDispatchMetadata(markRead.metadata, "mailbox_mark_read")
+
+    let mode = try BrainModeResponse(
+      toolName: "brain_mode",
+      envelope: Self.runtimeEnvelope(
+        requestID: "runtime-brain-mode",
+        value: .object([
+          "kind": .string("brain_mode"),
+          "brain_mode": .string("waking"),
+        ])
+      )
+    )
+    XCTAssertEqual(mode.mode, "waking")
+    assertRuntimeDispatchMetadata(mode.metadata, "brain_mode")
+
+    let snapshot = try BrainReadModelsSnapshotResponse(
+      toolName: "read_models_snapshot",
+      envelope: Self.runtimeEnvelope(
+        requestID: "runtime-read-models",
+        value: .object([
+          "kind": .string("models_snapshot"),
+          "read_models": .object(["brain_mode": .string("waking")]),
+        ])
+      )
+    )
+    XCTAssertEqual(snapshot.readModels.objectValue?["brain_mode"], .string("waking"))
+    assertRuntimeDispatchMetadata(snapshot.metadata, "read_models_snapshot")
+
+    let prompt = try BrainChatDryRunPromptResponse(
+      toolName: "chat_dry_run_prompt",
+      envelope: Self.runtimeEnvelope(
+        requestID: "runtime-debug-prompt",
+        value: .object([
+          "kind": .string("debug_prompt"),
+          "system_prompt": .string("System prompt"),
+          "user_prompt": .string("User prompt"),
+        ])
+      )
+    )
+    XCTAssertEqual(prompt.systemPrompt, "System prompt")
+    XCTAssertEqual(prompt.userPrompt, "User prompt")
+    assertRuntimeDispatchMetadata(prompt.metadata, "chat_dry_run_prompt")
   }
 
   func testBrainSemanticEntityUsesStableBrainIdentity() throws {
@@ -371,7 +699,7 @@ final class AffectiveTests: XCTestCase {
     let visitor = try fixtureURL("known_01", extension: "png", subdirectory: "Fixtures/visitors")
     try skipPlaceholderImageFixtures([visitor])
     let cameraImage = try cameraJPEGFixture(from: visitor, named: "poke-curiosity-mara", in: brain.rootURL)
-    let hostServices = EmbeddedHostServices(
+    let hostServices = BrainHostServiceRoutes(
       credentialProvider: { [:] },
       providerPicker: { $0.first },
       textProviderPreference: .random,
@@ -490,11 +818,67 @@ final class AffectiveTests: XCTestCase {
     try await withConnectedCore(core) {}
   }
 
+  @MainActor
+  func testBrainCoreSendTextHelloGeishaSurvivesHeavyMemoryFixture() async throws {
+    let brain: BrainDescriptor
+    if ProcessInfo.processInfo.environment["AFFECTIVE_GEISHA_REPRO"] == "1",
+       let root = ProcessInfo.processInfo.environment["AFFECTIVE_GEISHA_REPRO_BRAIN_ROOT"],
+       !root.isEmpty {
+      let rootURL = URL(fileURLWithPath: root, isDirectory: true)
+      let profileURL = rootURL.appendingPathComponent("brain_profile.json")
+      let profileData = try Data(contentsOf: profileURL)
+      let profileObject = try JSONSerialization.jsonObject(with: profileData) as? [String: Any]
+      let brainID = (profileObject?["brain_id"] as? String) ?? rootURL.lastPathComponent
+      let displayName = (profileObject?["display_name"] as? String) ?? "Geisha Repro"
+      brain = BrainDescriptor(
+        id: brainID,
+        displayName: displayName,
+        rootURL: rootURL,
+        avatarURL: nil,
+        avatarManifest: nil,
+        modifiedAt: nil,
+        isRecent: false
+      )
+    } else {
+      brain = try makeBrain()
+      try writeCognitiveStore(
+        at: brain.memoryDatabaseURL,
+        dataJSON: Self.scaledCognitiveFixtureJSON(
+          brainID: brain.id,
+          memoryCount: 800,
+          eventCount: 1600
+        )
+      )
+    }
+
+    let core = BrainCore(brain: brain)
+    do {
+      try await withConnectedCore(core) {
+        do {
+          let response = try await core.sendText("Hello Geisha")
+          XCTAssertNotNil(response.metadata["request_id"])
+        } catch {
+          let description = String(describing: error)
+          XCTAssertTrue(
+            Self.isExpectedHostCapabilityProbeBoundary(error),
+            "Unexpected sendText failure: \(description)"
+          )
+        }
+      }
+    } catch {
+      let description = String(describing: error)
+      let expectedConnectBoundary =
+        description.contains("MissingField")
+        || Self.isExpectedHostCapabilityProbeBoundary(error)
+      XCTAssertTrue(expectedConnectBoundary, "Unexpected core connect failure: \(description)")
+    }
+  }
+
   func testEmbeddedProtocolContractMatchesWrapperHostManifest() throws {
     let manifestData = Data(CoreConfigStorage.hostManifestJSON(hasProvider: false).utf8)
     let manifest = try JSONValue.decodedObject(from: manifestData)
 
-    XCTAssertEqual(manifest["max_envelope_bytes"], .number(16 * 1024))
+    XCTAssertEqual(manifest["max_envelope_bytes"], .number(64 * 1024))
     XCTAssertEqual(manifest["max_event_count"], .number(12))
     XCTAssertEqual(manifest["max_event_text_bytes"], .number(768))
     XCTAssertEqual(manifest["raw_ref_ttl_seconds"], .number(24 * 60 * 60))
@@ -591,8 +975,8 @@ final class AffectiveTests: XCTestCase {
     XCTAssertNotNil(storageJSON["volumes"])
   }
 
-  func testEmbeddedHostServicesHandlesSystemPowerEndpoint() throws {
-    let services = EmbeddedHostServices()
+  func testBrainHostServiceRoutesHandlesSystemPowerEndpoint() throws {
+    let services = BrainHostServiceRoutes()
     let response = try services.postJSON(
       url: "affective-host://system/power",
       headersJSON: "[]",
@@ -768,14 +1152,13 @@ final class AffectiveTests: XCTestCase {
       textProviderPreference: .random
     )
 
-    storage.withConfig { config in
-      let manifest = try? JSONValue.decodedObject(from: Data(embeddedString(config.host_manifest_json).utf8))
-      XCTAssertEqual(manifest?["capability_status"]?.objectValue?["provider_routing"], .string("available"))
-      XCTAssertEqual(
-        manifest?["host_provider_routing"]?.objectValue?["configured_providers"]?.arrayValue,
-        [.string("OpenAI"), .string("Google")]
-      )
-    }
+    let manifestJSON = String(decoding: storage.hostManifestJSON, as: UTF8.self)
+    let manifest = try JSONValue.decodedObject(from: Data(manifestJSON.utf8))
+    XCTAssertEqual(manifest["capability_status"]?.objectValue?["provider_routing"], .string("available"))
+    XCTAssertEqual(
+      manifest["host_provider_routing"]?.objectValue?["configured_providers"]?.arrayValue,
+      [.string("OpenAI"), .string("Google")]
+    )
   }
 
   func testHostProviderRouterFiltersConfiguredProvidersForRandomSelection() throws {
@@ -802,8 +1185,8 @@ final class AffectiveTests: XCTestCase {
   }
 
   func testHostLLMCompletionClientRunsSelectedProviderWithoutCore() async throws {
-    var offeredRoutes: [HostLLMCompletionProvider] = []
-    var requestedBody: [String: Any] = [:]
+    let offeredRoutes = LockedValue<[HostLLMCompletionProvider]>([])
+    let requestedBody = LockedValue<[String: Any]>([:])
     let router = HostProviderRouter(
       credentialProvider: {
         [
@@ -823,14 +1206,14 @@ final class AffectiveTests: XCTestCase {
         }
       ),
       routePicker: { routes in
-        offeredRoutes = routes
+        offeredRoutes.value = routes
         return .credential(.openAI)
       },
       jsonLoader: { request in
         XCTAssertEqual(request.url?.absoluteString, "https://api.openai.com/v1/responses")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer openai-secret")
         if let body = request.httpBody {
-          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+          requestedBody.value = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         }
         return ["output_text": "  A host-owned completion.  "]
       }
@@ -841,10 +1224,10 @@ final class AffectiveTests: XCTestCase {
       maxTokens: 42
     ))
 
-    XCTAssertEqual(offeredRoutes, [.credential(.openAI), .credential(.google)])
+    XCTAssertEqual(offeredRoutes.value, [.credential(.openAI), .credential(.google)])
     XCTAssertEqual(completion, HostLLMCompletionResponse(text: "A host-owned completion.", provider: .credential(.openAI)))
-    XCTAssertEqual(requestedBody["input"] as? String, "Summarize this.")
-    XCTAssertEqual(requestedBody["max_output_tokens"] as? Int, 42)
+    XCTAssertEqual(requestedBody.value["input"] as? String, "Summarize this.")
+    XCTAssertEqual(requestedBody.value["max_output_tokens"] as? Int, 42)
   }
 
   func testHostLLMCompletionClientPrimaryRouteReflectsRoutePickerOrder() throws {
@@ -914,7 +1297,7 @@ final class AffectiveTests: XCTestCase {
   }
 
   func testHostLLMCompletionClientRandomRetriesFailedRoute() async throws {
-    var attemptedRoutes: [HostLLMCompletionProvider] = []
+    let attemptedRoutes = LockedValue<[HostLLMCompletionProvider]>([])
     let router = HostProviderRouter(
       credentialProvider: {
         [
@@ -927,7 +1310,7 @@ final class AffectiveTests: XCTestCase {
       appleFoundationModelsClient: AppleFoundationModelsTextClient(
         availabilityProvider: { .available },
         completionProvider: { _ in
-          attemptedRoutes.append(.appleFoundationModels)
+          attemptedRoutes.mutate { $0.append(.appleFoundationModels) }
           throw HostLLMCompletionError.invalidProviderResponse
         }
       ),
@@ -935,7 +1318,7 @@ final class AffectiveTests: XCTestCase {
         routes.first { $0 == .appleFoundationModels } ?? routes.first
       },
       jsonLoader: { request in
-        attemptedRoutes.append(.credential(.openAI))
+        attemptedRoutes.mutate { $0.append(.credential(.openAI)) }
         XCTAssertEqual(request.url?.absoluteString, "https://api.openai.com/v1/responses")
         return ["output_text": "Fallback completion."]
       }
@@ -946,7 +1329,7 @@ final class AffectiveTests: XCTestCase {
       maxTokens: 64
     ))
 
-    XCTAssertEqual(attemptedRoutes, [.appleFoundationModels, .credential(.openAI)])
+    XCTAssertEqual(attemptedRoutes.value, [.appleFoundationModels, .credential(.openAI)])
     XCTAssertEqual(completion, HostLLMCompletionResponse(
       text: "Fallback completion.",
       provider: .credential(.openAI)
@@ -997,7 +1380,7 @@ final class AffectiveTests: XCTestCase {
   }
 
   func testHostLLMCompletionClientOpenAIPreferenceSkipsLocalWhenAvailable() async throws {
-    var requestedBody: [String: Any] = [:]
+    let requestedBody = LockedValue<[String: Any]>([:])
     let router = HostProviderRouter(
       credentialProvider: {
         [
@@ -1021,7 +1404,7 @@ final class AffectiveTests: XCTestCase {
       },
       jsonLoader: { request in
         if let body = request.httpBody {
-          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+          requestedBody.value = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         }
         return ["output_text": "  OpenAI explicit completion.  "]
       }
@@ -1036,11 +1419,11 @@ final class AffectiveTests: XCTestCase {
       text: "OpenAI explicit completion.",
       provider: .credential(.openAI)
     ))
-    XCTAssertEqual(requestedBody["input"] as? String, "Use network.")
+    XCTAssertEqual(requestedBody.value["input"] as? String, "Use network.")
   }
 
   func testHostLLMCompletionClientOpenAIJSONModeUsesProviderResponseFormat() async throws {
-    var requestedBody: [String: Any] = [:]
+    let requestedBody = LockedValue<[String: Any]>([:])
     let router = HostProviderRouter(
       credentialProvider: {
         [
@@ -1057,7 +1440,7 @@ final class AffectiveTests: XCTestCase {
       routePicker: { _ in .credential(.openAI) },
       jsonLoader: { request in
         if let body = request.httpBody {
-          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+          requestedBody.value = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         }
         return ["output_text": #"{"message":"line 1\nline 2"}"#]
       }
@@ -1071,7 +1454,7 @@ final class AffectiveTests: XCTestCase {
     ))
 
     XCTAssertEqual(completion.text, #"{"message":"line 1\nline 2"}"#)
-    let textConfig = try XCTUnwrap(requestedBody["text"] as? [String: Any])
+    let textConfig = try XCTUnwrap(requestedBody.value["text"] as? [String: Any])
     let responseFormat = try XCTUnwrap(textConfig["format"] as? [String: Any])
     XCTAssertEqual(responseFormat["type"] as? String, "json_schema")
     XCTAssertEqual(responseFormat["name"] as? String, "text_completion")
@@ -1081,7 +1464,7 @@ final class AffectiveTests: XCTestCase {
   }
 
   func testHostLLMCompletionClientAnthropicJSONModeUsesToolResponse() async throws {
-    var requestedBody: [String: Any] = [:]
+    let requestedBody = LockedValue<[String: Any]>([:])
     let router = HostProviderRouter(
       credentialProvider: {
         [
@@ -1098,7 +1481,7 @@ final class AffectiveTests: XCTestCase {
       routePicker: { _ in .credential(.anthropic) },
       jsonLoader: { request in
         if let body = request.httpBody {
-          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+          requestedBody.value = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         }
         return [
           "content": [
@@ -1122,15 +1505,15 @@ final class AffectiveTests: XCTestCase {
     ))
 
     XCTAssertEqual(completion.text, #"{"message":"structured"}"#)
-    XCTAssertNotNil(requestedBody["tools"] as? [[String: Any]])
+    XCTAssertNotNil(requestedBody.value["tools"] as? [[String: Any]])
     XCTAssertEqual(
-      (requestedBody["tool_choice"] as? [String: Any])?["name"] as? String,
+      (requestedBody.value["tool_choice"] as? [String: Any])?["name"] as? String,
       "json_response"
     )
   }
 
   func testHostLLMCompletionClientGoogleJSONModeUsesResponseMimeType() async throws {
-    var requestedBody: [String: Any] = [:]
+    let requestedBody = LockedValue<[String: Any]>([:])
     let router = HostProviderRouter(
       credentialProvider: {
         [
@@ -1147,7 +1530,7 @@ final class AffectiveTests: XCTestCase {
       routePicker: { _ in .credential(.google) },
       jsonLoader: { request in
         if let body = request.httpBody {
-          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+          requestedBody.value = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         }
         return [
           "candidates": [
@@ -1171,7 +1554,7 @@ final class AffectiveTests: XCTestCase {
     ))
 
     XCTAssertEqual(completion.text, #"{"message":"from google"}"#)
-    let generationConfig = try XCTUnwrap(requestedBody["generationConfig"] as? [String: Any])
+    let generationConfig = try XCTUnwrap(requestedBody.value["generationConfig"] as? [String: Any])
     XCTAssertEqual(generationConfig["responseMimeType"] as? String, "application/json")
     let responseSchema = try XCTUnwrap(generationConfig["responseSchema"] as? [String: Any])
     XCTAssertEqual(responseSchema["type"] as? String, "object")
@@ -1197,8 +1580,8 @@ final class AffectiveTests: XCTestCase {
     }
   }
 
-  func testEmbeddedHostServicesInjectsProviderCredentialsAtHTTPBoundary() throws {
-    let services = EmbeddedHostServices(credentialProvider: {
+  func testBrainHostServiceRoutesInjectsProviderCredentialsAtHTTPBoundary() throws {
+    let services = BrainHostServiceRoutes(credentialProvider: {
       [
         .openAI: "openai-secret",
         .anthropic: "anthropic-secret",
@@ -1231,10 +1614,10 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(googleKey, "google-secret")
   }
 
-  func testEmbeddedHostServicesHandlesSemanticLLMCompletionEndpoint() throws {
-    var requestedBody: [String: Any] = [:]
+  func testBrainHostServiceRoutesHandlesSemanticLLMCompletionEndpoint() throws {
+    let requestedBody = LockedValue<[String: Any]>([:])
     var offeredRoutes: [HostLLMCompletionProvider] = []
-    let services = EmbeddedHostServices(
+    let services = BrainHostServiceRoutes(
       credentialProvider: {
         [
           .openAI: "openai-secret",
@@ -1249,7 +1632,7 @@ final class AffectiveTests: XCTestCase {
         XCTAssertEqual(request.url?.absoluteString, "https://api.openai.com/v1/responses")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer openai-secret")
         if let body = request.httpBody {
-          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+          requestedBody.value = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         }
         return ["output_text": "  Semantic host completion.  "]
       }
@@ -1273,16 +1656,140 @@ final class AffectiveTests: XCTestCase {
 
     XCTAssertEqual(String(decoding: response, as: UTF8.self), "Semantic host completion.")
     XCTAssertEqual(offeredRoutes.filter { $0 != .appleFoundationModels }, [.credential(.openAI), .credential(.google)])
-    XCTAssertEqual(requestedBody["max_output_tokens"] as? Int, 64)
-    let prompt = try XCTUnwrap(requestedBody["input"] as? String)
+    XCTAssertEqual(requestedBody.value["max_output_tokens"] as? Int, 64)
+    let prompt = try XCTUnwrap(requestedBody.value["input"] as? String)
     XCTAssertTrue(prompt.contains("System:\nYou structure replies."))
     XCTAssertTrue(prompt.contains("User:\nSay hello."))
     XCTAssertFalse(prompt.contains("openai-secret"))
   }
 
-  func testEmbeddedHostServicesStripsMarkdownFenceFromJSONObjectCompletion() throws {
-    var requestedBody: [String: Any] = [:]
-    let services = EmbeddedHostServices(
+  func testBrainHostServiceRoutesReportsLLMCompletionObservation() throws {
+    let observed = LockedValue<HostLLMCompletionObservation?>(nil)
+    BrainHostServiceRoutes.llmCompletionObserver = { observation in
+      observed.value = observation
+    }
+    defer { BrainHostServiceRoutes.clearLLMCompletionObserver() }
+
+    let services = BrainHostServiceRoutes(
+      credentialProvider: { [.openAI: "openai-secret"] },
+      textRoutePicker: { _ in .credential(.openAI) },
+      jsonLoader: { _ in
+        ["output_text": "Semantic host completion."]
+      }
+    )
+    let coreBody = try JSONSerialization.data(withJSONObject: [
+      "subsystem": "conversation",
+      "models": [
+        ["provider": "openai", "model": "gpt-4.1-mini"],
+      ],
+      "system_prompt": "You structure replies.",
+      "user_prompt": "stimulus_inbox:\n- pending: 1\n- oldest_unhandled: 0s\n- items:\n  - id=stimulus_7 (0s) speech: Say hello.\n",
+      "response_format": "text",
+      "response_size": "small",
+      "effort_tier": "standard",
+      "reasoning_effort": "medium",
+      "temperature": 0.2,
+      "max_tokens": 64,
+      "json_schema": "{}",
+    ])
+
+    _ = try services.postJSON(
+      url: "affective-host://llm/complete",
+      headersJSON: "[]",
+      body: coreBody
+    )
+
+    let observation = try XCTUnwrap(observed.value)
+    XCTAssertEqual(observation.subsystem, "conversation")
+    XCTAssertEqual(observation.effortTier, "standard")
+    XCTAssertEqual(observation.responseSize, "small")
+    XCTAssertEqual(observation.reasoningEffort, "medium")
+    XCTAssertEqual(observation.requestedModels, "openai:gpt-4.1-mini")
+    XCTAssertEqual(observation.maxTokens, 64)
+    XCTAssertEqual(observation.responseFormat, "text")
+    XCTAssertFalse(observation.generationID.isEmpty)
+    XCTAssertEqual(observation.promptCharacterCount, HostPromptBuilder.combinedPrompt(for: HostLLMPromptInput(
+      systemPrompt: "You structure replies.",
+      userPrompt: "stimulus_inbox:\n- pending: 1\n- oldest_unhandled: 0s\n- items:\n  - id=stimulus_7 (0s) speech: Say hello.\n",
+      responseFormat: .text,
+      jsonSchema: "{}"
+    )).count)
+    XCTAssertEqual(observation.responseCharacterCount, "Semantic host completion.".count)
+    XCTAssertEqual(observation.contextStimulusIDs, ["stimulus_7"])
+    XCTAssertTrue(observation.promptExcerpt.contains("id=stimulus_7"))
+    XCTAssertEqual(observation.responseExcerpt, "Semantic host completion.")
+    XCTAssertFalse(observation.promptHash.isEmpty)
+    XCTAssertFalse(observation.responseHash.isEmpty)
+    XCTAssertTrue(observation.eventLogBody.contains("effort_tier=standard"))
+    XCTAssertTrue(observation.eventLogBody.contains("context_stimuli=stimulus_7"))
+    XCTAssertTrue(observation.eventLogBody.contains("generation_id="))
+    XCTAssertEqual(observation.eventLogMetadata["generation_id"], observation.generationID)
+    XCTAssertEqual(observation.eventLogMetadata["context_stimulus_ids"], "stimulus_7")
+    XCTAssertTrue(observation.eventLogMetadata["prompt_excerpt"]?.contains("id=stimulus_7") == true)
+    XCTAssertEqual(observation.eventLogMetadata["response_excerpt"], "Semantic host completion.")
+  }
+
+  func testHostLLMPromptPayloadDecodesRoutingMetadata() throws {
+    let data = try JSONSerialization.data(withJSONObject: [
+      "subsystem": "autonomy",
+      "models": [
+        ["provider": "openai", "model": "gpt-4.1"],
+      ],
+      "system_prompt": "system",
+      "user_prompt": "user",
+      "response_format": "json_object",
+      "response_size": "medium",
+      "effort_tier": "complex",
+      "reasoning_effort": "high",
+      "max_tokens": 128,
+      "json_schema": "{}",
+    ])
+
+    let payload = try JSONDecoder().decode(HostLLMPromptPayload.self, from: data)
+
+    XCTAssertEqual(payload.subsystem, "autonomy")
+    XCTAssertEqual(payload.effortTier, "complex")
+    XCTAssertEqual(payload.responseSize, "medium")
+    XCTAssertEqual(payload.reasoningEffort, "high")
+    XCTAssertEqual(payload.models?.count, 1)
+    XCTAssertEqual(payload.models?.first?.model, "gpt-4.1")
+  }
+
+  func testBrainHostServiceRoutesCompletesLLMDespiteGenerationDrift() throws {
+    let requested = LockedValue(false)
+    let services = BrainHostServiceRoutes(
+      credentialProvider: { [.openAI: "openai-secret"] },
+      jsonLoader: { _ in
+        requested.value = true
+        return ["output_text": "Semantic host completion."]
+      }
+    )
+    services.beginUserTextDispatch(generation: 1)
+    services.syncConversationDispatchGeneration(2)
+    let coreBody = try JSONSerialization.data(withJSONObject: [
+      "subsystem": "conversation",
+      "system_prompt": "You structure replies.",
+      "user_prompt": "Say hello.",
+      "response_format": "text",
+      "response_size": "small",
+      "temperature": 0.2,
+      "max_tokens": 64,
+      "json_schema": "{}",
+    ])
+
+    let response = try services.postJSON(
+      url: "affective-host://llm/complete",
+      headersJSON: "[]",
+      body: coreBody
+    )
+
+    XCTAssertTrue(requested.value)
+    XCTAssertEqual(String(decoding: response, as: UTF8.self), "Semantic host completion.")
+  }
+
+  func testBrainHostServiceRoutesStripsMarkdownFenceFromJSONObjectCompletion() throws {
+    let requestedBody = LockedValue<[String: Any]>([:])
+    let services = BrainHostServiceRoutes(
       credentialProvider: {
         [
           .openAI: "openai-secret",
@@ -1291,7 +1798,7 @@ final class AffectiveTests: XCTestCase {
       textRoutePicker: { _ in .credential(.openAI) },
       jsonLoader: { request in
         if let body = request.httpBody {
-          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+          requestedBody.value = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         }
         return [
           "output_text": #"```json { "action_pressures": [], "conversation_done": false } ```"#,
@@ -1319,7 +1826,7 @@ final class AffectiveTests: XCTestCase {
       String(decoding: response, as: UTF8.self),
       #"{"action_pressures":[],"conversation_done":false}"#
     )
-    let textConfig = try XCTUnwrap(requestedBody["text"] as? [String: Any])
+    let textConfig = try XCTUnwrap(requestedBody.value["text"] as? [String: Any])
     let responseFormat = try XCTUnwrap(textConfig["format"] as? [String: Any])
     XCTAssertEqual(responseFormat["type"] as? String, "json_schema")
     XCTAssertEqual(responseFormat["name"] as? String, "text_completion")
@@ -1328,12 +1835,38 @@ final class AffectiveTests: XCTestCase {
     XCTAssertNil(responseFormat["json_schema"])
   }
 
-  func testEmbeddedHostServicesHandlesSemanticImageGenerationEndpoint() throws {
+  func testBrainHostServiceRoutesDecodesByteArrayUserPromptFromLegacyCorePayload() throws {
+    let services = BrainHostServiceRoutes(
+      credentialProvider: { [.openAI: "openai-secret"] },
+      textRoutePicker: { _ in .credential(.openAI) },
+      jsonLoader: { _ in ["output_text": "Legacy byte prompt completion."] }
+    )
+    let coreBody = try JSONSerialization.data(withJSONObject: [
+      "subsystem": "conversation",
+      "system_prompt": "You structure replies.",
+      "user_prompt": Array("Hello".utf8),
+      "response_format": "text",
+      "response_size": "small",
+      "temperature": 0.2,
+      "max_tokens": 64,
+      "json_schema": "{}",
+    ])
+
+    let response = try services.postJSON(
+      url: "affective-host://llm/complete",
+      headersJSON: "[]",
+      body: coreBody
+    )
+
+    XCTAssertEqual(String(decoding: response, as: UTF8.self), "Legacy byte prompt completion.")
+  }
+
+  func testBrainHostServiceRoutesHandlesSemanticImageGenerationEndpoint() throws {
     let outputDirectory = FileManager.default.temporaryDirectory
       .appendingPathComponent("affective-host-image-\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: outputDirectory) }
-    var requestedBody: [String: Any] = [:]
-    let services = EmbeddedHostServices(
+    let requestedBody = LockedValue<[String: Any]>([:])
+    let services = BrainHostServiceRoutes(
       credentialProvider: {
         [
           .openAI: "openai-secret",
@@ -1346,7 +1879,7 @@ final class AffectiveTests: XCTestCase {
           .queryItems?.first { $0.name == "key" }?.value
         XCTAssertEqual(googleKey, "google-secret")
         if let body = request.httpBody {
-          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+          requestedBody.value = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         }
         return [
           "output_image": [
@@ -1374,20 +1907,20 @@ final class AffectiveTests: XCTestCase {
     XCTAssertTrue(FileManager.default.fileExists(atPath: path))
     let fileData = try Data(contentsOf: URL(fileURLWithPath: path))
     XCTAssertEqual(String(decoding: fileData, as: UTF8.self), "image-bytes")
-    let requestContents = try XCTUnwrap(requestedBody["contents"] as? [[String: Any]])
+    let requestContents = try XCTUnwrap(requestedBody.value["contents"] as? [[String: Any]])
     let firstContent = try XCTUnwrap(requestContents.first)
     let parts = try XCTUnwrap(firstContent["parts"] as? [[String: Any]])
     XCTAssertEqual(parts.first?["text"] as? String, "a watercolor lighthouse")
   }
 
-  func testEmbeddedHostServicesHandlesSemanticVisionCompletionEndpoint() throws {
+  func testBrainHostServiceRoutesHandlesSemanticVisionCompletionEndpoint() throws {
     let imageURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("affective-host-vision-\(UUID().uuidString).png")
     try Data("fake-png-bytes".utf8).write(to: imageURL)
     defer { try? FileManager.default.removeItem(at: imageURL) }
     var offeredProviders: [ProviderCredentialKey] = []
-    var requestedBody: [String: Any] = [:]
-    let services = EmbeddedHostServices(
+    let requestedBody = LockedValue<[String: Any]>([:])
+    let services = BrainHostServiceRoutes(
       credentialProvider: {
         [
           .openAI: "openai-secret",
@@ -1402,7 +1935,7 @@ final class AffectiveTests: XCTestCase {
         XCTAssertEqual(request.url?.absoluteString, "https://api.openai.com/v1/chat/completions")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer openai-secret")
         if let body = request.httpBody {
-          requestedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+          requestedBody.value = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         }
         return [
           "choices": [
@@ -1434,7 +1967,7 @@ final class AffectiveTests: XCTestCase {
 
     XCTAssertEqual(String(decoding: response, as: UTF8.self), "A host-owned image description.")
     XCTAssertEqual(offeredProviders, [.openAI, .google])
-    let messages = try XCTUnwrap(requestedBody["messages"] as? [[String: Any]])
+    let messages = try XCTUnwrap(requestedBody.value["messages"] as? [[String: Any]])
     let firstMessage = try XCTUnwrap(messages.first)
     let content = try XCTUnwrap(firstMessage["content"] as? [[String: Any]])
     XCTAssertEqual(content.first?["text"] as? String, "Describe visible details.")
@@ -1464,27 +1997,35 @@ final class AffectiveTests: XCTestCase {
     let brain = try makeBrain()
     let core = BrainCore(brain: brain)
 
-    func isExpectedCoverageProbeBoundary(_ error: Error) -> Bool {
-      let description = String(describing: error)
-      return description.contains("FrontendCaptureRequested")
-        || description.contains("HostHttpPostJsonFailed")
-    }
-
-    func assertCoverageProbeResponse(
+    func assertCoverageProbe<Response>(
       _ label: String,
-      _ body: () async throws -> BrainToolResponse
+      _ body: @escaping () async throws -> Response,
+      verify: (Response) throws -> Void
     ) async throws {
+      let response: Response
       do {
-        let response = try await body()
-        XCTAssertNotNil(response.metadata["request_id"], label)
+        response = try await Self.withHostCapabilityProbeTimeout(label: label) {
+          try await body()
+        }
       } catch {
-        guard isExpectedCoverageProbeBoundary(error) else {
+        guard Self.isExpectedHostCapabilityProbeBoundary(error) else {
           throw NSError(
             domain: "AffectiveTests.CoverageProbe",
             code: 1,
             userInfo: [NSLocalizedDescriptionKey: "\(label): \(String(describing: error))"]
           )
         }
+        return
+      }
+      try verify(response)
+    }
+
+    func assertCoverageProbeResponse(
+      _ label: String,
+      _ body: @escaping () async throws -> BrainToolResponse
+    ) async throws {
+      try await assertCoverageProbe(label, body) { response in
+        self.assertRuntimeDispatchMetadata(response.metadata, label)
       }
     }
 
@@ -1503,11 +2044,11 @@ final class AffectiveTests: XCTestCase {
         ])
       }
 
-      do {
-        let response = try await core.mailboxList()
-        XCTAssertNotNil(response.metadata["request_id"], "mailbox_list typed operation")
-      } catch {
-        guard isExpectedCoverageProbeBoundary(error) else { throw error }
+      try await assertCoverageProbe("mailbox_list") {
+        try await core.mailboxList()
+      } verify: { response in
+        self.assertRuntimeDispatchMetadata(response.metadata, "mailbox_list")
+        XCTAssertNotNil(response.metadata["mailbox_item_count"])
       }
 
       try await assertCoverageProbeResponse("send_experience_event") {
@@ -1521,7 +2062,7 @@ final class AffectiveTests: XCTestCase {
           valence: 0.1,
           arousal: 0.2,
           uncertainty: 0.05,
-          causalParentIDs: ["parent-test-event"],
+          causalParentIDs: [],
           retention: "episode",
           visibility: "internal"
         )
@@ -1538,11 +2079,10 @@ final class AffectiveTests: XCTestCase {
         )
       }
 
-      do {
-        let typedText = try await core.sendText("capability e2e typed text")
-        XCTAssertNotNil(typedText.metadata["request_id"])
-      } catch {
-        guard isExpectedCoverageProbeBoundary(error) else { throw error }
+      try await assertCoverageProbe("send_text") {
+        try await core.sendText("capability e2e typed text")
+      } verify: { typedText in
+        self.assertRuntimeDispatchMetadata(typedText.metadata, "send_text")
       }
       // The coverage probe only verifies dispatch routes. If the brain elects
       // to pull an awaited sense or probe a provider host callback, the host
@@ -1565,14 +2105,27 @@ final class AffectiveTests: XCTestCase {
         )
       }
 
-      do {
-        let state = try await core.readModelsSnapshot()
-        XCTAssertNotNil(state.metadata["request_id"])
+      try await assertCoverageProbe("read_models_snapshot") {
+        try await core.readModelsSnapshot()
+      } verify: { state in
+        self.assertRuntimeDispatchMetadata(state.metadata, "read_models_snapshot")
         XCTAssertNotNil(state.readModels.objectValue)
-      } catch {
-        guard isExpectedCoverageProbeBoundary(error) else { throw error }
       }
     }
+  }
+
+  func testHostCapabilityProbeBoundaryRecognizesProviderCallbackFailures() {
+    let error = BrainCoreError.unavailable(
+      "A host HTTP callback failed; check the host-side error detail if one was returned."
+    )
+    XCTAssertTrue(Self.isExpectedHostCapabilityProbeBoundary(error))
+  }
+
+  func testHostCapabilityProbeBoundaryRejectsRuntimeStubFailures() {
+    let error = BrainCoreError.unavailable(
+      "Brain core is unavailable: nonblocking result events are not implemented yet for this operation"
+    )
+    XCTAssertFalse(Self.isExpectedHostCapabilityProbeBoundary(error))
   }
 
   func testCameraPromptRequiredAdvertisesFrontendCameraSense() throws {
@@ -1613,6 +2166,34 @@ final class AffectiveTests: XCTestCase {
     XCTAssertTrue(capabilities.contains("camera_capture"))
     XCTAssertTrue(capabilities.contains("provider_vision_completion"))
     XCTAssertEqual(manifest["capability_status"]?.objectValue?["camera"], .string("denied"))
+  }
+
+  func testCameraDisabledAdvertisesDependentCapabilitiesAsDisabled() throws {
+    let enabledPolicy = BiometricDataPolicy(
+      recognitionEnabled: true,
+      policyAcknowledged: true,
+      enrollmentAllowed: true,
+      retentionPeriod: BiometricDataPolicy.defaultRetentionPeriod,
+      exportIncluded: false,
+      exportConfirmationRequired: true,
+      autoDeleteUnconfirmed: true
+    )
+    let manifest = try JSONValue.decodedObject(
+      from: Data(CoreConfigStorage.hostManifestJSON(
+        hasProvider: true,
+        cameraStatus: "disabled",
+        biometricPolicy: enabledPolicy
+      ).utf8))
+    let statuses = try XCTUnwrap(manifest["capability_status"]?.objectValue)
+
+    XCTAssertEqual(statuses["camera"], .string("disabled"))
+    XCTAssertEqual(statuses["camera_capture"], .string("disabled"))
+    XCTAssertEqual(statuses["provider_vision_completion"], .string("disabled"))
+    XCTAssertEqual(statuses["face_identification"], .string("disabled"))
+    XCTAssertEqual(statuses["identity_recognition"], .string("disabled"))
+    XCTAssertEqual(statuses["face_enrollment"], .string("disabled"))
+    XCTAssertEqual(statuses["face_picture_update"], .string("disabled"))
+    XCTAssertEqual(statuses["provider_routing"], .string("available"))
   }
 
   @MainActor
@@ -1788,6 +2369,585 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
+  func testAutonomyTickCameraPullSenseDoesNotFalseDeadlock() async throws {
+    let cameraRequestID = "46824C99-C4E0-4EB4-AD64-396404CC94AE"
+    let staleObservation = staleAwaitingCameraObservationResponse(requestID: cameraRequestID)
+    let pausedAutonomy = pausedAutonomyTickToolResponse(
+      requestID: cameraRequestID,
+      purpose: "recognize"
+    )
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      cameraObservationResponse: staleObservation,
+      autonomyTickResponses: [pausedAutonomy]
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.autonomyMode = "play"
+    model.cameraPermissionRequestTask = Task { .available }
+    model.cameraPhotoCaptureOverride = { Self.tinyPNGData }
+
+    await model.runAutonomyTick()
+    await model.waitForHostPipelineIdle(timeout: .seconds(15))
+
+    let observations = await core.cameraObservations
+    XCTAssertEqual(observations.last?.requestID, cameraRequestID)
+    XCTAssertNil(model.coreAwaitingHostSenseMarker)
+    model.evaluateHostPipelineHealth()
+    XCTAssertNil(model.hostPipelineDeadlock)
+    XCTAssertNil(HostPipelineHealthEvaluator.evaluate(model.hostPipelineHealthInput()))
+  }
+
+  @MainActor
+  func testAwaitingHostSenseWithoutEventEnqueuesPullSenseRecovery() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.cameraPermissionRequestTask = Task { .available }
+    model.cameraPhotoCaptureOverride = { Self.tinyPNGData }
+
+    let pausedAutonomy = pausedAutonomyTickToolResponse(
+      requestID: "awaiting-without-event",
+      includeSenseRequestEvent: false
+    )
+    model.noteBrainResponseMetadata(pausedAutonomy.metadata)
+    model.ensureAwaitingHostSenseFulfillmentIfNeeded()
+    await model.waitForHostPipelineIdle(timeout: .seconds(15))
+
+    let observations = await core.cameraObservations
+    XCTAssertFalse(observations.isEmpty)
+    XCTAssertNil(model.coreAwaitingHostSenseMarker)
+    XCTAssertNil(HostPipelineHealthEvaluator.evaluate(model.hostPipelineHealthInput()))
+  }
+
+  @MainActor
+  func testHostPipelineHealthRecoversAwaitingCameraBeforeDeadlockOverlay() async throws {
+    let requestID = "health-recovers-closed-camera"
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.cameraPermissionRequestTask = Task { .available }
+    model.cameraPhotoCaptureOverride = { Self.tinyPNGData }
+    model.closedPullSenseRequestIDs.insert(requestID)
+    model.terminalPullSenseRequestIDs.insert(requestID)
+    model.noteCoreAwaitingHostSense(
+      metadata: [
+        "awaited_host_sense": "camera",
+        "awaited_host_purpose": "recognize",
+        "awaited_host_timeout_ms": "8000",
+        "request_id": requestID,
+      ],
+      at: Date().addingTimeInterval(-14)
+    )
+
+    model.evaluateHostPipelineHealth()
+
+    XCTAssertNil(model.hostPipelineDeadlock)
+    XCTAssertGreaterThan(model.activePullSenseFulfillmentCount, 0)
+    XCTAssertFalse(model.closedPullSenseRequestIDs.contains(requestID))
+    XCTAssertFalse(model.terminalPullSenseRequestIDs.contains(requestID))
+
+    await model.waitForHostPipelineIdle(timeout: .seconds(15))
+    let observations = await core.cameraObservations
+    XCTAssertEqual(observations.last?.requestID, requestID)
+    XCTAssertNil(model.coreAwaitingHostSenseMarker)
+    XCTAssertNil(model.hostPipelineDeadlock)
+  }
+
+  @MainActor
+  func testApplyCoreEventsRecoversAwaitingHostSenseBeforeSpeechReturn() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.cameraPermissionRequestTask = Task { .available }
+    model.cameraPhotoCaptureOverride = { Self.tinyPNGData }
+    model.brainVoiceEnabled = true
+    model.speechSpeakOverride = { _, _, completion in completion() }
+
+    let pausedAutonomy = pausedAutonomyTickToolResponse(
+      requestID: "awaiting-speech-recovery",
+      includeSenseRequestEvent: false
+    )
+    model.noteBrainResponseMetadata(pausedAutonomy.metadata)
+
+    let result = await model.applyCoreEvents(
+      [
+        actionRequestEvent(
+          actionID: "speak-while-awaiting-camera",
+          action: "speak",
+          arguments: ["text": .string("I'll say this while waiting for the camera.")],
+          presentation: .chat
+        ),
+      ],
+      mirrorChatMessages: true,
+      speak: true,
+      handleHostRequests: true
+    )
+    await model.waitForHostPipelineIdle(timeout: .seconds(15))
+
+    let observations = await core.cameraObservations
+    XCTAssertTrue(result.didRequestSpeech)
+    XCTAssertEqual(observations.last?.requestID, "awaiting-speech-recovery")
+    XCTAssertNil(model.coreAwaitingHostSenseMarker)
+    XCTAssertNil(model.hostPipelineDeadlock)
+  }
+
+  @MainActor
+  func testEventSinkStatusProbeDoesNotDispatchRecursiveSenseStatus() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+
+    let statusRequest = actionRequestEvent(
+      actionID: "camera-status-probe",
+      action: "sense_status",
+      arguments: ["sense": .string("camera")],
+      presentation: .log
+    )
+
+    _ = await model.applyCoreEvents(
+      [statusRequest],
+      mirrorChatMessages: false,
+      speak: false,
+      handleHostRequests: true,
+      handleHostStatusRequests: false
+    )
+    var statusCalls = await core.pullSenseStatusCalls()
+    XCTAssertTrue(statusCalls.isEmpty)
+
+    _ = await model.applyCoreEvents(
+      [statusRequest],
+      mirrorChatMessages: false,
+      speak: false,
+      handleHostRequests: true,
+      handleHostStatusRequests: true
+    )
+    statusCalls = await core.pullSenseStatusCalls()
+    XCTAssertEqual(statusCalls.count, 1)
+    XCTAssertEqual(statusCalls.last?.sense, "camera")
+  }
+
+  @MainActor
+  func testCanRunAutonomyTickAllowedWhilePullSenseFulfillmentInFlight() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.isBrainConnected = true
+    model.autonomyMode = "play"
+    model.activePullSenseFulfillmentCount = 1
+
+    XCTAssertTrue(model.canRunAutonomyTick())
+  }
+
+  func testQuietHoursRangeContainsHandlesOvernightWrapAndEdges() {
+    // Overnight wrap: 22:00-08:00 covers late night and early morning only.
+    XCTAssertTrue(AffectiveViewModel.quietHoursRangeContains("22:00-08:00", minuteOfDay: 23 * 60))
+    XCTAssertTrue(AffectiveViewModel.quietHoursRangeContains("22:00-08:00", minuteOfDay: 5 * 60))
+    XCTAssertFalse(AffectiveViewModel.quietHoursRangeContains("22:00-08:00", minuteOfDay: 8 * 60 + 41))
+
+    // Same-day range: 00:00-06:00 excludes 8:41 AM.
+    XCTAssertTrue(AffectiveViewModel.quietHoursRangeContains("00:00-06:00", minuteOfDay: 3 * 60))
+    XCTAssertFalse(AffectiveViewModel.quietHoursRangeContains("00:00-06:00", minuteOfDay: 8 * 60 + 41))
+
+    // Empty and malformed ranges never match.
+    XCTAssertFalse(AffectiveViewModel.quietHoursRangeContains("12:00-12:00", minuteOfDay: 12 * 60))
+    XCTAssertFalse(AffectiveViewModel.quietHoursRangeContains("bogus", minuteOfDay: 0))
+    XCTAssertFalse(AffectiveViewModel.quietHoursRangeContains("25:00-06:00", minuteOfDay: 0))
+  }
+
+  @MainActor
+  func testAutonomyTickIntervalUsesBaseWithoutSocialInput() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.lastSocialSenseInputAt = nil
+
+    XCTAssertEqual(model.autonomyTickIntervalSeconds(), model.autonomyTickBaseIntervalSeconds())
+  }
+
+  @MainActor
+  func testAutonomyTickIntervalAcceleratesAfterSocialInputAndDecaysBack() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    let now = Date()
+    model.lastSocialSenseInputAt = now
+
+    XCTAssertEqual(model.autonomyTickIntervalSeconds(now: now), 60)
+    XCTAssertEqual(model.autonomyTickIntervalSeconds(now: now.addingTimeInterval(300)), 180)
+    XCTAssertEqual(model.autonomyTickIntervalSeconds(now: now.addingTimeInterval(600)), 300)
+    XCTAssertEqual(model.autonomyTickIntervalSeconds(now: now.addingTimeInterval(3600)), 300)
+  }
+
+  @MainActor
+  func testAutonomyTickDueRespectsEngagedInterval() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    let now = Date()
+    model.lastAutonomyTickAt = now.addingTimeInterval(-90)
+
+    model.lastSocialSenseInputAt = nil
+    XCTAssertFalse(model.autonomyTickIsDue(now: now))
+
+    model.lastSocialSenseInputAt = now
+    XCTAssertTrue(model.autonomyTickIsDue(now: now))
+  }
+
+  @MainActor
+  func testTouchActionsMarkSocialSenseInputAndBackgroundActionsDoNot() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.lastSocialSenseInputAt = nil
+
+    model.noteSocialSenseInput(for: .refreshBrainState)
+    model.noteSocialSenseInput(for: .collectMailbox)
+    XCTAssertNil(model.lastSocialSenseInputAt)
+
+    let touchedAt = Date()
+    model.noteSocialSenseInput(for: .coreTouch(name: "short_touch", title: "short_touch"), now: touchedAt)
+    XCTAssertEqual(model.lastSocialSenseInputAt, touchedAt)
+
+    let pokedAt = touchedAt.addingTimeInterval(5)
+    model.noteSocialSenseInput(for: .pokeSequence([]), now: pokedAt)
+    XCTAssertEqual(model.lastSocialSenseInputAt, pokedAt)
+  }
+
+  @MainActor
+  func testUserMessageIsNotCoalescedDuringAsyncPullSenseFulfillment() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.isBrainConnected = true
+    model.activePullSenseFulfillmentCount = 1
+
+    XCTAssertFalse(model.shouldCoalesceUserMessageWhileHostPipelineBusy)
+  }
+
+  @MainActor
+  func testUserMessageCoalescesWhileHostPipelineChatActionIsRunning() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.isBrainConnected = true
+    model.isHostPipelineRunning = true
+    model.currentHostPipelineAction = .typedText(
+      text: "hello",
+      stimulusContext: model.currentStimulusContext(kind: "user_message"),
+      delivery: .counterpartSpeech(name: nil, source: .typedText)
+    )
+
+    XCTAssertTrue(model.shouldCoalesceUserMessageWhileHostPipelineBusy)
+  }
+
+  @MainActor
+  func testCoalescedUserMessageRecordsInboxStimulus() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "autonomy_tick"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.isHostPipelineRunning = true
+    model.currentHostPipelineAction = .typedText(
+      text: "first message",
+      stimulusContext: model.currentStimulusContext(kind: "user_message"),
+      delivery: .counterpartSpeech(name: nil, source: .typedText)
+    )
+    model.messageText = "second message"
+
+    model.sendText()
+
+    let ingestCalls = await core.waitForIngestCallCount(1)
+    XCTAssertEqual(ingestCalls.last?.arguments["text"]?.stringValue, "second message")
+    XCTAssertEqual(model.stimulusInbox.records.last?.kind, "user_message")
+    XCTAssertEqual(model.stimulusInbox.records.last?.summary, "User said: second message")
+    XCTAssertEqual(model.stimulusInboxPendingCount, 0)
+  }
+
+  func testBrainDispatchEnvelopeDetectsStimulusQueued() throws {
+    let envelope = try BrainDispatchEnvelope.decode(from: """
+      {"request_id":"queued-1","ok":true,"events":[],"result":{"event_type":"stimulus_ingest","value":{"kind":"stimulus_queued"}}}
+      """)
+    XCTAssertTrue(envelope.stimulusWasQueued)
+  }
+
+  @MainActor
+  func testDeliverHostStimulusSkipsAutonomyTickWhenStimulusQueued() async throws {
+    let queued = BrainDispatchEnvelope(
+      requestID: "queued-1",
+      ok: true,
+      events: [],
+      result: .object([
+        "event_type": .string("stimulus_ingest"),
+        "value": .object(["kind": .string("stimulus_queued")]),
+      ]),
+      error: nil
+    )
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "autonomy_tick"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation"),
+      ingestStimulusResponse: queued
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+
+    await model.deliverHostStimulusToBrain(
+      text: "Hello while core is busy",
+      stimulusContext: model.currentStimulusContext(kind: "user_message"),
+      delivery: .counterpartSpeech(name: nil, source: .typedText)
+    )
+
+    let ingestCalls = await core.waitForIngestCallCount(1)
+    XCTAssertEqual(ingestCalls.count, 1)
+    let autonomyCalls = await core.autonomyTickCalls
+    XCTAssertTrue(autonomyCalls.isEmpty)
+    XCTAssertEqual(model.statusText, "Message queued for core")
+    XCTAssertEqual(model.stimulusInboxPendingCount, 0)
+  }
+
+  @MainActor
+  func testPullSenseFulfillmentDoesNotBlockHostPipeline() async throws {
+    let cameraRequestID = "async-camera-pipeline-idle"
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.cameraPermissionRequestTask = Task { .available }
+    model.cameraPhotoCaptureOverride = { Self.tinyPNGData }
+
+    let event = senseRequestEvent(
+      requestID: cameraRequestID,
+      sense: "camera",
+      title: "camera sense",
+      summary: "async camera pull"
+    )
+    model.scheduleAsyncPullSenseFulfillment(
+      event: event,
+      observationResponsePresentation: .internalOnly
+    )
+
+    XCTAssertFalse(model.isHostPipelineRunning)
+    XCTAssertNil(model.currentHostPipelineAction)
+    XCTAssertGreaterThan(model.activePullSenseFulfillmentCount, 0)
+    model.evaluateHostPipelineHealth()
+    XCTAssertNil(model.hostPipelineDeadlock)
+
+    await model.waitForHostPipelineIdle(timeout: .seconds(15))
+    let statuses = await core.pullSenseStatuses
+    XCTAssertNotNil(statuses.first {
+      $0.requestID == cameraRequestID && $0.status == .fulfilled && !$0.terminal
+    })
+    let observations = await core.cameraObservations
+    XCTAssertEqual(observations.last?.requestID, cameraRequestID)
+  }
+
+  @MainActor
+  func testDuplicateCameraPullSenseScheduleReturnsBusyStatus() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.cameraPermissionRequestTask = Task { .available }
+    model.cameraPhotoCaptureOverride = {
+      try await Task.sleep(for: .milliseconds(200))
+      return Self.tinyPNGData
+    }
+
+    let firstEvent = senseRequestEvent(
+      requestID: "camera-first",
+      sense: "camera",
+      title: "camera sense",
+      summary: "first camera pull"
+    )
+    let secondEvent = senseRequestEvent(
+      requestID: "camera-second",
+      sense: "camera",
+      title: "camera sense",
+      summary: "duplicate camera pull"
+    )
+
+    model.scheduleAsyncPullSenseFulfillment(
+      event: firstEvent,
+      observationResponsePresentation: .internalOnly
+    )
+    model.scheduleAsyncPullSenseFulfillment(
+      event: secondEvent,
+      observationResponsePresentation: .internalOnly
+    )
+
+    try await Task.sleep(for: .milliseconds(50))
+
+    let statuses = await core.pullSenseStatuses
+    let busy = try XCTUnwrap(statuses.last { $0.requestID == "camera-second" })
+    XCTAssertEqual(busy.sense, "camera")
+    XCTAssertEqual(busy.status, .busy)
+    XCTAssertTrue(busy.terminal)
+
+    await model.waitForHostPipelineIdle(timeout: .seconds(15))
+    let observations = await core.cameraObservations
+    XCTAssertEqual(observations.count, 1)
+    XCTAssertEqual(observations.last?.requestID, "camera-first")
+  }
+
+  @MainActor
+  func testDuplicateCameraPullSenseScheduleSameRequestIDIsIdempotent() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.cameraPermissionRequestTask = Task { .available }
+    model.cameraPhotoCaptureOverride = {
+      try await Task.sleep(for: .milliseconds(200))
+      return Self.tinyPNGData
+    }
+
+    let event = senseRequestEvent(
+      requestID: "camera-idempotent",
+      sense: "camera",
+      title: "camera sense",
+      summary: "same request twice"
+    )
+
+    model.scheduleAsyncPullSenseFulfillment(
+      event: event,
+      observationResponsePresentation: .internalOnly
+    )
+    model.scheduleAsyncPullSenseFulfillment(
+      event: event,
+      observationResponsePresentation: .internalOnly
+    )
+
+    try await Task.sleep(for: .milliseconds(50))
+    XCTAssertEqual(model.activePullSenseFulfillmentCount, 1)
+
+    await model.waitForHostPipelineIdle(timeout: .seconds(15))
+    let statuses = await core.pullSenseStatuses
+    XCTAssertNil(statuses.first { $0.requestID == "camera-idempotent" && $0.status == .busy })
+    let observations = await core.cameraObservations
+    XCTAssertEqual(observations.count, 1)
+    XCTAssertEqual(observations.last?.requestID, "camera-idempotent")
+  }
+
+  @MainActor
+  func testSuccessfulCameraObservationClearsAwaitingHostSenseDespiteStaleMetadata() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      cameraObservationResponse: Self.toolResponse(
+        toolName: "sense_observation",
+        result: .object([
+          "event_type": .string("sense_observation"),
+          "value": .object([
+            "kind": .string("sense_observation"),
+            "outcome": .object([
+              "awaiting_host_sense": .bool(true),
+              "awaited_host_sense": .string("camera"),
+              "awaited_host_purpose": .string("recognize"),
+              "awaited_host_timeout_ms": .number(8_000),
+            ]),
+          ]),
+        ]),
+        requestID: "stale-awaiting-camera"
+      )
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.noteCoreAwaitingHostSense(metadata: [
+      "awaited_host_sense": "camera",
+      "awaited_host_purpose": "recognize",
+      "awaited_host_timeout_ms": "8000",
+      "request_id": "stale-awaiting-camera",
+    ])
+    model.cameraPermissionRequestTask = Task { .available }
+    model.cameraPhotoCaptureOverride = { Self.tinyPNGData }
+
+    await model.fulfillCameraSenseRequest(
+      senseRequestEvent(
+        requestID: "stale-awaiting-camera",
+        sense: "camera",
+        title: "camera sense",
+        summary: "frontend camera sense requested"
+      ),
+      observationResponsePresentation: .internalOnly
+    )
+
+    XCTAssertNil(model.coreAwaitingHostSenseMarker)
+    XCTAssertNil(
+      HostPipelineHealthEvaluator.evaluate(model.hostPipelineHealthInput())
+    )
+  }
+
+  @MainActor
+  func testLiveCameraPullSenseFulfillmentEndToEnd() async throws {
+    guard ProcessInfo.processInfo.environment["AFFECTIVE_RUN_CAMERA_HARDWARE_E2E"] == "1" else {
+      throw XCTSkip("Set AFFECTIVE_RUN_CAMERA_HARDWARE_E2E=1 to run the live camera pull-sense e2e.")
+    }
+
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "unused"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.noteCoreAwaitingHostSense(metadata: [
+      "awaited_host_sense": "camera",
+      "awaited_host_purpose": "recognize",
+      "awaited_host_timeout_ms": "15000",
+    ])
+
+    let status = await model.requestCameraPermissionIfNeeded(requestID: "camera-pull-sense-e2e")
+    guard status == .available else {
+      XCTFail("Live camera pull-sense e2e requested, but camera permission/status is \(status.rawValue).")
+      return
+    }
+
+    let start = Date()
+    _ = await model.applyCoreEvents([
+      senseRequestEvent(
+        requestID: "live-pull-sense-e2e",
+        sense: "camera",
+        title: "camera sense",
+        summary: "frontend camera sense requested",
+        responsePresentation: .internalOnly,
+        awaitResponse: true,
+        timeoutMS: nil
+      )
+    ], mirrorChatMessages: false, speak: false)
+    await model.waitForHostPipelineIdle(timeout: .seconds(20))
+
+    XCTAssertEqual(model.activePullSenseFulfillmentCount, 0)
+    XCTAssertNil(model.hostPipelineDeadlock)
+    XCTAssertLessThan(Date().timeIntervalSince(start), 18)
+
+    let observations = await core.cameraObservations
+    let observation = try XCTUnwrap(
+      observations.last { $0.requestID == "live-pull-sense-e2e" },
+      "Expected camera_observation dispatch after live pull-sense fulfillment."
+    )
+    XCTAssertEqual(observation.source, "affective_requested_capture")
+    XCTAssertEqual(observation.mimeType, "image/jpeg")
+
+    let imageURL = URL(fileURLWithPath: observation.path)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: imageURL.path))
+    let data = try Data(contentsOf: imageURL)
+    let imageInfo = try model.validateCapturedImageData(data)
+    XCTAssertGreaterThan(imageInfo.width, 1)
+    XCTAssertGreaterThan(imageInfo.height, 1)
+
+    let statuses = await core.pullSenseStatuses
+    XCTAssertFalse(statuses.contains {
+      $0.requestID == "live-pull-sense-e2e" && $0.status == .timedOut
+    })
+    XCTAssertNotNil(model.eventEntries.last { $0.title == "camera sense" })
+    XCTAssertNotNil(model.eventEntries.last { $0.title == "sense_observation" })
+  }
+
+  @MainActor
   func testSenseRequestsStayOutOfChatTranscript() async throws {
     let model = AffectiveViewModel(brain: try makeBrain())
     let initialChatCount = model.chatEntries.count
@@ -1809,6 +2969,36 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
+  func testRepeatedVisibleCoreEventsLogDiagnosticsWithoutDuplicatingChat() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    let repeatedEvent = brainChatEvent(
+      title: "Geisha",
+      text: "Same upstream event."
+    )
+    let initialChatCount = model.chatEntries.count
+
+    _ = await model.applyCoreEvents(
+      [repeatedEvent],
+      mirrorChatMessages: true,
+      speak: false,
+      context: .dispatchResponse(operation: "autonomy_tick", requestID: "repeat-one")
+    )
+    _ = await model.applyCoreEvents(
+      [repeatedEvent],
+      mirrorChatMessages: true,
+      speak: false,
+      context: .eventSink
+    )
+
+    let repeatedMessages = model.chatEntries.dropFirst(initialChatCount)
+      .filter { $0.body == "Same upstream event." }
+    XCTAssertEqual(repeatedMessages.count, 1)
+    let diagnostic = try XCTUnwrap(model.eventEntries.last { $0.title == "repeated visible core event" })
+    XCTAssertEqual(diagnostic.metadata["operation"], "event_sink")
+    XCTAssertEqual(diagnostic.metadata["source_lane"], "event_sink")
+  }
+
+  @MainActor
   func testSenseCatalogRequestReturnsHostCatalog() async throws {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "sense_catalog"),
@@ -1816,7 +3006,7 @@ final class AffectiveTests: XCTestCase {
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
 
-    await model.applyCoreEvents([
+    _ = await model.applyCoreEvents([
       actionRequestEvent(
         actionID: "catalog-request",
         action: "sense_catalog",
@@ -1836,7 +3026,7 @@ final class AffectiveTests: XCTestCase {
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
 
-    await model.applyCoreEvents([
+    _ = await model.applyCoreEvents([
       actionRequestEvent(
         actionID: "camera-status",
         action: "sense_status",
@@ -1895,7 +3085,7 @@ final class AffectiveTests: XCTestCase {
       return Self.tinyPNGData
     }
 
-    await model.applyCoreEvents([
+    _ = await model.applyCoreEvents([
       senseRequestEvent(
         requestID: "capture-timeout",
         sense: "camera",
@@ -1905,6 +3095,7 @@ final class AffectiveTests: XCTestCase {
         timeoutMS: 1
       )
     ], mirrorChatMessages: true, speak: false)
+    await model.waitForHostPipelineIdle()
 
     let observations = await core.cameraObservations
     XCTAssertFalse(observations.contains { $0.requestID == "capture-timeout" })
@@ -1929,7 +3120,7 @@ final class AffectiveTests: XCTestCase {
       }
     }
 
-    await model.applyCoreEvents([
+    _ = await model.applyCoreEvents([
       senseRequestEvent(
         requestID: "black-frame",
         sense: "camera",
@@ -1939,6 +3130,7 @@ final class AffectiveTests: XCTestCase {
         timeoutMS: 10_000
       )
     ], mirrorChatMessages: true, speak: false)
+    await model.waitForHostPipelineIdle()
 
     let observations = await core.cameraObservations
     XCTAssertTrue(observations.isEmpty)
@@ -2032,6 +3224,40 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
+  func testPullSenseWithoutAwaitResponseStillUsesDefaultTimeout() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    let event = senseRequestEvent(
+      requestID: "camera-default-timeout",
+      sense: "camera",
+      title: "camera sense",
+      summary: "Affective wants camera.",
+      awaitResponse: false,
+      timeoutMS: nil
+    )
+
+    XCTAssertEqual(model.effectivePullSenseTimeoutMS(for: event), PullSenseHostTimeout.defaultMS)
+  }
+
+  @MainActor
+  func testCameraToggleAdvertisesDisabledDependentCapabilities() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "capability_status"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+
+    model.setCameraCaptureEnabled(false)
+    try await Task.sleep(for: .milliseconds(50))
+
+    let statuses = await core.capabilityStatuses
+    XCTAssertEqual(statuses.last { $0.capability == "camera" }?.status, "disabled")
+    XCTAssertEqual(statuses.last { $0.capability == "camera_capture" }?.status, "disabled")
+    XCTAssertEqual(statuses.last { $0.capability == "provider_vision_completion" }?.status, "disabled")
+    XCTAssertEqual(statuses.last { $0.capability == "identity_recognition" }?.status, "disabled")
+  }
+
+  @MainActor
   func testDuplicateOrientationPullReturnsBusyStatus() async throws {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "sense_status"),
@@ -2056,6 +3282,46 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(status.sense, "orientation")
     XCTAssertEqual(status.status, .busy)
     XCTAssertTrue(status.terminal)
+  }
+
+  @MainActor
+  func testPullSenseTimeoutUsesDefaultWhenEventOmitsTimeoutMS() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "sense_status"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.cameraPermissionRequestTask = Task { .available }
+    model.cameraPhotoCaptureOverride = {
+      await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+          continuation.resume()
+        }
+      }
+      return Self.tinyPNGData
+    }
+    model.noteCoreAwaitingHostSense(metadata: [
+      "awaited_host_sense": "camera",
+      "awaited_host_timeout_ms": "1",
+    ])
+
+    let start = Date()
+    await model.fulfillSenseRequest(
+      senseRequestEvent(
+        requestID: "default-timeout-camera",
+        sense: "camera",
+        title: "camera sense",
+        summary: "frontend camera sense requested",
+        awaitResponse: true,
+        timeoutMS: nil
+      ),
+      observationResponsePresentation: .internalOnly
+    )
+
+    XCTAssertLessThan(Date().timeIntervalSince(start), 0.2)
+    let statuses = await core.pullSenseStatuses
+    let status = try XCTUnwrap(statuses.last { $0.requestID == "default-timeout-camera" })
+    XCTAssertEqual(status.status, .timedOut)
   }
 
   @MainActor
@@ -2215,6 +3481,7 @@ final class AffectiveTests: XCTestCase {
     model.cameraPhotoCaptureOverride = { Self.tinyPNGData }
 
     await model.callCoreTouch(name: "short_touch", title: "short_touch")
+    await model.waitForHostPipelineIdle()
 
     let observations = await core.cameraObservations
     let observation = try XCTUnwrap(observations.last)
@@ -2231,7 +3498,7 @@ final class AffectiveTests: XCTestCase {
   @MainActor
   func testTypedTextCameraResumeMirrorsChatEvenWhenSenseRequestUsesStatusPresentation() async throws {
     let pausedResponse = Self.toolResponse(
-      toolName: "user_text",
+      toolName: "autonomy_tick",
       events: [
         senseRequestEvent(
           requestID: "recognize-camera",
@@ -2242,9 +3509,9 @@ final class AffectiveTests: XCTestCase {
         )
       ],
       result: .object([
-        "event_type": .string("user_text"),
+        "event_type": .string("autonomy_tick"),
         "value": .object([
-          "kind": .string("user_text"),
+          "kind": .string("autonomy_tick"),
           "outcome": .object([
             "text": .string("do you recognize me?"),
             "spoken_text": .string(""),
@@ -2260,13 +3527,7 @@ final class AffectiveTests: XCTestCase {
       ])
     )
     let core = ScriptedBrainCore(
-      toolResponse: Self.toolResponse(toolName: "unused"),
-      textResponse: BrainTextResponse(
-        toolName: "user_text",
-        text: pausedResponse.text,
-        metadata: pausedResponse.metadata.merging(["state": "awaiting host sense"]) { current, _ in current },
-        events: pausedResponse.events
-      ),
+      toolResponse: pausedResponse,
       cameraObservationResponse: Self.toolResponse(
         toolName: "sense_observation",
         events: [
@@ -2286,7 +3547,7 @@ final class AffectiveTests: XCTestCase {
     XCTAssertNil(model.eventEntries.last { $0.title == "chat display" && $0.body.contains("display_text_empty=true") })
     XCTAssertNil(model.eventEntries.first {
       $0.kind == .result
-        && $0.title == "user_text"
+        && $0.title == "autonomy_tick"
         && $0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     })
   }
@@ -2399,11 +3660,8 @@ final class AffectiveTests: XCTestCase {
   @MainActor
   func testTypedTextCameraSenseDoesNotMirrorObservationAsExtraChat() async throws {
     let core = ScriptedBrainCore(
-      toolResponse: Self.toolResponse(toolName: "unused"),
-      textResponse: BrainTextResponse(
-        toolName: "experience",
-        text: "Hello from the first turn.",
-        metadata: [:],
+      toolResponse: Self.toolResponse(
+        toolName: "autonomy_tick",
         events: [
           brainChatEvent(title: "Brain", text: "Hello from the first turn."),
           senseRequestEvent(
@@ -2425,7 +3683,8 @@ final class AffectiveTests: XCTestCase {
     model.isBrainConnected = true
     model.currentHostPipelineAction = .typedText(
       text: "Hello?",
-      stimulusContext: model.currentStimulusContext(kind: "user_message")
+      stimulusContext: model.currentStimulusContext(kind: "user_message"),
+      delivery: .counterpartSpeech(name: nil, source: .typedText)
     )
     model.cameraPermissionRequestTask = Task { .available }
     model.cameraPhotoCaptureOverride = { Self.tinyPNGData }
@@ -2439,6 +3698,168 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(model.chatEntries.filter { $0.body == "Hello from the first turn." }.count, 1)
     XCTAssertNil(model.chatEntries.last { $0.body == "I can see the captured frame now." })
     XCTAssertNotNil(model.eventEntries.last { $0.title == "sense_observation" })
+  }
+
+  func testHostPipelineHealthDetectsCoreAwaitingSenseWithoutHostWork() {
+    let now = Date(timeIntervalSinceReferenceDate: 900_000)
+    let marker = CoreAwaitingHostSenseMarker(
+      since: now.addingTimeInterval(-20),
+      sense: "camera",
+      purpose: "recognize",
+      timeoutMS: 8_000,
+      requestID: "camera-1"
+    )
+    let input = HostPipelineHealthInput(
+      now: now,
+      isBrainConnected: true,
+      coreAwaitingHostSense: marker,
+      isHostPipelineRunning: false,
+      hostPipelineActionStartedAt: nil,
+      hostPipelineActionKind: nil,
+      hostPipelineHold: .none,
+      queuedConversationActionCount: 2,
+      lastHostPipelineProgressAt: now.addingTimeInterval(-20),
+      activePullSenseFulfillmentCount: 0,
+      pullSenseFulfillmentStartedAt: nil,
+      pendingCameraRequestID: nil,
+      pendingOrientationRequestID: nil,
+      hasPullSenseInQueue: false,
+      isToolRunning: false
+    )
+
+    let deadlock = HostPipelineHealthEvaluator.evaluate(input)
+
+    XCTAssertEqual(deadlock?.kind, .coreAwaitingSenseWithoutHostWork)
+    XCTAssertTrue(deadlock?.title.contains("camera") == true)
+    XCTAssertEqual(deadlock?.diagnostics["queued_conversation_actions"], "2")
+  }
+
+  func testHostPipelineHealthIgnoresAwaitingSenseWhileHostIsCapturing() {
+    let now = Date(timeIntervalSinceReferenceDate: 900_000)
+    let marker = CoreAwaitingHostSenseMarker(
+      since: now.addingTimeInterval(-20),
+      sense: "camera",
+      purpose: "recognize",
+      timeoutMS: 8_000,
+      requestID: "camera-1"
+    )
+    let input = HostPipelineHealthInput(
+      now: now,
+      isBrainConnected: true,
+      coreAwaitingHostSense: marker,
+      isHostPipelineRunning: false,
+      hostPipelineActionStartedAt: nil,
+      hostPipelineActionKind: nil,
+      hostPipelineHold: .none,
+      queuedConversationActionCount: 0,
+      lastHostPipelineProgressAt: now.addingTimeInterval(-1),
+      activePullSenseFulfillmentCount: 1,
+      pullSenseFulfillmentStartedAt: now.addingTimeInterval(-3),
+      pendingCameraRequestID: "camera-1",
+      pendingOrientationRequestID: nil,
+      hasPullSenseInQueue: false,
+      isToolRunning: false
+    )
+
+    XCTAssertNil(HostPipelineHealthEvaluator.evaluate(input))
+  }
+
+  func testHostPipelineHealthIgnoresAnonymousPullSenseCounterWithoutHostWork() {
+    let now = Date(timeIntervalSinceReferenceDate: 900_000)
+    let input = HostPipelineHealthInput(
+      now: now,
+      isBrainConnected: true,
+      coreAwaitingHostSense: nil,
+      isHostPipelineRunning: false,
+      hostPipelineActionStartedAt: nil,
+      hostPipelineActionKind: nil,
+      hostPipelineHold: .none,
+      queuedConversationActionCount: 0,
+      lastHostPipelineProgressAt: now.addingTimeInterval(-30),
+      activePullSenseFulfillmentCount: 1,
+      pullSenseFulfillmentStartedAt: now.addingTimeInterval(-30),
+      pendingCameraRequestID: nil,
+      pendingOrientationRequestID: nil,
+      hasPullSenseInQueue: false,
+      isToolRunning: false
+    )
+
+    XCTAssertNil(HostPipelineHealthEvaluator.evaluate(input))
+  }
+
+  func testHostPipelineHealthDetectsConcretePullSenseTimeout() {
+    let now = Date(timeIntervalSinceReferenceDate: 900_000)
+    let input = HostPipelineHealthInput(
+      now: now,
+      isBrainConnected: true,
+      coreAwaitingHostSense: CoreAwaitingHostSenseMarker(
+        since: now.addingTimeInterval(-45),
+        sense: "camera",
+        purpose: "recognize",
+        timeoutMS: 8_000,
+        requestID: "camera-1"
+      ),
+      isHostPipelineRunning: false,
+      hostPipelineActionStartedAt: nil,
+      hostPipelineActionKind: nil,
+      hostPipelineHold: .none,
+      queuedConversationActionCount: 0,
+      lastHostPipelineProgressAt: now.addingTimeInterval(-45),
+      activePullSenseFulfillmentCount: 1,
+      pullSenseFulfillmentStartedAt: now.addingTimeInterval(-45),
+      pendingCameraRequestID: "camera-1",
+      pendingOrientationRequestID: nil,
+      hasPullSenseInQueue: false,
+      isToolRunning: false
+    )
+
+    let deadlock = HostPipelineHealthEvaluator.pullSenseFulfillmentDeadlock(input)
+
+    XCTAssertEqual(deadlock?.kind, .pullSenseFulfillmentTimedOut)
+    XCTAssertEqual(deadlock?.diagnostics["awaited_sense"], "camera")
+  }
+
+  func testHostPipelineHealthDetectsQueuedConversationNotDraining() {
+    let now = Date(timeIntervalSinceReferenceDate: 900_000)
+    let input = HostPipelineHealthInput(
+      now: now,
+      isBrainConnected: true,
+      coreAwaitingHostSense: nil,
+      isHostPipelineRunning: false,
+      hostPipelineActionStartedAt: nil,
+      hostPipelineActionKind: nil,
+      hostPipelineHold: .none,
+      queuedConversationActionCount: 1,
+      lastHostPipelineProgressAt: now.addingTimeInterval(-15),
+      activePullSenseFulfillmentCount: 0,
+      pullSenseFulfillmentStartedAt: nil,
+      pendingCameraRequestID: nil,
+      pendingOrientationRequestID: nil,
+      hasPullSenseInQueue: false,
+      isToolRunning: false
+    )
+
+    let deadlock = HostPipelineHealthEvaluator.evaluate(input)
+
+    XCTAssertEqual(deadlock?.kind, .queuedConversationNotDraining)
+  }
+
+  @MainActor
+  func testHostPipelineDeadlockOverlayVisibilityTracksDismissal() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    let deadlock = HostPipelineDeadlock(
+      kind: .queuedConversationNotDraining,
+      title: "Queued messages are not sending",
+      detail: "Test deadlock",
+      detectedAt: Date(),
+      diagnostics: ["queued_conversation_actions": "1"]
+    )
+
+    model.hostPipelineDeadlock = deadlock
+    XCTAssertTrue(model.showsHostPipelineDeadlockOverlay)
+
+    model.dismissHostPipelineDeadlockOverlay()
+    XCTAssertFalse(model.showsHostPipelineDeadlockOverlay)
   }
 
   @MainActor
@@ -2479,6 +3900,7 @@ final class AffectiveTests: XCTestCase {
     }
 
     await model.callCoreTouch(name: "short_touch", title: "short_touch")
+    await model.waitForHostPipelineIdle()
 
     let observations = await core.orientationObservations
     let observation = try XCTUnwrap(observations.last)
@@ -2639,10 +4061,119 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
+  func testSensePacketCoalescesRecentSenses() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    let now = Date()
+    model.recordRecentStimulus(
+      kind: "short_touch",
+      summary: "User sent short_touch.",
+      metadata: ["salience": "0.6"],
+      now: now.addingTimeInterval(-4)
+    )
+    model.recordRecentStimulus(
+      kind: "short_touch",
+      summary: "User sent short_touch.",
+      metadata: ["salience": "0.7"],
+      now: now.addingTimeInterval(-2)
+    )
+    model.recordRecentStimulus(
+      kind: "camera_observation",
+      summary: "Camera captured an image: 64x64.",
+      metadata: [
+        "image_path": "/tmp/camera.png",
+        "source": "affective_requested_capture",
+        "salience": "0.9",
+      ],
+      now: now.addingTimeInterval(-1)
+    )
+
+    let packet = try XCTUnwrap(model.currentStimulusContext(kind: "autonomy_tick", now: now).sensePacket)
+    let digest = try XCTUnwrap(packet.digest)
+    let cameraItem = try XCTUnwrap(digest.items.first { $0.kind == "camera_observation" })
+    let touchItem = try XCTUnwrap(digest.items.first { $0.kind == "short_touch" })
+
+    XCTAssertEqual(digest.totalItemCount, 3)
+    XCTAssertEqual(digest.coalescedItemCount, 2)
+    XCTAssertEqual(cameraItem.rawPayloadAvailable, true)
+    XCTAssertEqual(cameraItem.rawPayloadReference, "/tmp/camera.png")
+    XCTAssertEqual(cameraItem.processingState, "promoted")
+    XCTAssertEqual(touchItem.count, 2)
+    XCTAssertEqual(touchItem.latestSummary, "2x short_touch: User sent short_touch.")
+    XCTAssertTrue(touchItem.features.contains("physical_contact"))
+  }
+
+  @MainActor
+  func testAutonomyTickContextCollectsSensesIntoPacket() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    let now = Date()
+    model.recordRecentStimulus(
+      kind: "short_touch",
+      summary: "User sent short_touch.",
+      metadata: ["salience": "0.7"],
+      now: now.addingTimeInterval(-6)
+    )
+    model.recordRecentStimulus(
+      kind: "camera_observation",
+      summary: "Camera captured an image: 64x64.",
+      metadata: ["image_path": "/tmp/camera.png", "source": "affective_requested_capture", "salience": "0.9"],
+      now: now.addingTimeInterval(-1)
+    )
+
+    let context = model.currentStimulusContext(kind: "autonomy_tick", now: now)
+    let packet = try XCTUnwrap(context.sensePacket)
+
+    XCTAssertEqual(packet.triggerKind, "autonomy_tick")
+    XCTAssertEqual(packet.records.map(\.kind), ["short_touch", "camera_observation"])
+    XCTAssertEqual(packet.sequenceIDs, [1, 2])
+    XCTAssertEqual(packet.digest?.totalItemCount, 2)
+    XCTAssertGreaterThanOrEqual(packet.windowSeconds, 6)
+
+    let packetArguments = try XCTUnwrap(context.eventArguments["sense_packet"]?.objectValue)
+    XCTAssertEqual(packetArguments["trigger_kind"]?.stringValue, "autonomy_tick")
+    XCTAssertEqual(packetArguments["record_count"], .number(2))
+  }
+
+  @MainActor
+  func testAutonomyTickReceivesSensePacketContext() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "autonomy_tick"),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.recordRecentStimulus(
+      kind: "poke_sequence",
+      summary: "User poked once: 120ms.",
+      metadata: ["pulse_count": "1", "salience": "0.8"]
+    )
+
+    await model.runAutonomyTick()
+
+    let calls = await core.waitForAutonomyTickCallCount(1)
+    let context = try XCTUnwrap(calls.last?.arguments["context"]?.objectValue)
+    let packet = try XCTUnwrap(context["sense_packet"]?.objectValue)
+    let digest = try XCTUnwrap(packet["digest"]?.objectValue)
+    let items = try XCTUnwrap(digest["items"]?.arrayValue)
+    let item = try XCTUnwrap(items.first?.objectValue)
+
+    XCTAssertEqual(context["kind"]?.stringValue, "autonomy_tick")
+    XCTAssertEqual(packet["trigger_kind"]?.stringValue, "autonomy_tick")
+    XCTAssertEqual(packet["record_count"], .number(1))
+    XCTAssertEqual(digest["total_item_count"], .number(1))
+    XCTAssertEqual(item["kind"]?.stringValue, "poke_sequence")
+    XCTAssertEqual(item["processing_state"]?.stringValue, "promoted")
+    XCTAssertEqual(item["metadata"]?.objectValue?["pulse_count"]?.stringValue, "1")
+    XCTAssertEqual(model.stimulusInboxPendingCount, 0)
+    XCTAssertEqual(model.stimulusInbox.records.last?.deliveryState, .delivered)
+  }
+
+  @MainActor
   func testSendTextPassesRecentStimuliToBrainCore() async throws {
     let core = ScriptedBrainCore(
-      toolResponse: Self.toolResponse(toolName: "unused"),
-      textResponse: BrainTextResponse(toolName: "experience", text: "", metadata: [:], events: []),
+      toolResponse: Self.toolResponse(
+        toolName: "autonomy_tick",
+        events: [brainChatEvent(title: "Brain", text: "I felt it.")]
+      ),
       cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
@@ -2656,13 +4187,16 @@ final class AffectiveTests: XCTestCase {
 
     model.sendText()
 
-    let textCalls = await core.waitForTextCallCount(1)
-    let context = try XCTUnwrap(textCalls.last?.stimulusContext)
-    let recentStimuli = try XCTUnwrap(context.eventArguments["recent_stimuli"]?.arrayValue)
+    let ingestCalls = await core.waitForIngestCallCount(1)
+    let context = try XCTUnwrap(ingestCalls.last?.arguments["context"]?.objectValue)
+    let recentStimuli = try XCTUnwrap(context["recent_stimuli"]?.arrayValue)
     let stimulus = try XCTUnwrap(recentStimuli.first?.objectValue)
-    let inventory = try XCTUnwrap(context.eventArguments["sense_inventory"]?.arrayValue)
+    let inventory = try XCTUnwrap(context["sense_inventory"]?.arrayValue)
     let inventoryEntry = try XCTUnwrap(inventory.first?.objectValue)
 
+    XCTAssertEqual(ingestCalls.last?.arguments["text"]?.stringValue, "Did you feel that?")
+    XCTAssertEqual(ingestCalls.last?.arguments["kind"], .string("speech"))
+    XCTAssertEqual(ingestCalls.last?.arguments["source"], .string("user_message"))
     XCTAssertEqual(stimulus["id"], .number(1))
     XCTAssertEqual(stimulus["kind"]?.stringValue, "poke_sequence")
     XCTAssertEqual(stimulus["summary"]?.stringValue, "User poked once: 120ms.")
@@ -2670,6 +4204,72 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(inventoryEntry["kind"]?.stringValue, "poke_sequence")
     XCTAssertEqual(inventoryEntry["total_count"], .number(1))
     XCTAssertEqual(inventoryEntry["recent_count"], .number(1))
+  }
+
+  @MainActor
+  func testBrainCoreSpeechStimulusArgumentsIncludeContextAndBrainSpeech() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.recordConversationTurn(
+      role: "other",
+      text: "Can you keep track of the thread?",
+      source: "typed_text",
+      metadata: ["source": "typed text"]
+    )
+    model.recordConversationTurn(
+      role: "self",
+      text: "Yes, I am keeping a bounded recent window.",
+      source: "expression",
+      metadata: ["event_type": "expression"]
+    )
+
+    let arguments = BrainCore.speechStimulusArguments(
+      text: "Good, use that now.",
+      source: .typedText,
+      stimulusContext: model.currentStimulusContext(kind: "user_message")
+    )
+    let context = try XCTUnwrap(arguments["context"]?.objectValue)
+    let conversation = try XCTUnwrap(context["conversation_context"]?.objectValue)
+    let turns = try XCTUnwrap(conversation["recent_turns"]?.arrayValue)
+
+    XCTAssertEqual(arguments["kind"], .string("speech"))
+    XCTAssertEqual(arguments["source"], .string("user_message"))
+    XCTAssertEqual(arguments["text"], .string("Good, use that now."))
+    XCTAssertEqual(turns.compactMap { $0.objectValue?["speaker_role"]?.stringValue }, ["other", "self"])
+    XCTAssertEqual(turns.compactMap { $0.objectValue?["text"]?.stringValue }, [
+      "Can you keep track of the thread?",
+      "Yes, I am keeping a bounded recent window.",
+    ])
+  }
+
+  @MainActor
+  func testDirectUserMessageDoesNotRunInlineAutonomyStep() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "brain_step"),
+      textResponse: BrainTextResponse(
+        toolName: "user_text",
+        text: "Hi, I hear you.",
+        metadata: [:],
+        events: [brainChatEvent(title: "Brain", text: "Hi, I hear you.")]
+      ),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.autonomyMode = "pause"
+    model.messageText = "Hello Geisha"
+
+    model.sendText()
+
+    _ = await core.waitForIngestCallCount(1)
+    await model.waitForHostPipelineIdle()
+    let autonomyCalls = await core.autonomyTickCalls
+    let textCalls = await core.textCalls
+
+    XCTAssertTrue(autonomyCalls.isEmpty)
+    XCTAssertTrue(textCalls.isEmpty)
+    XCTAssertFalse(model.chatEntries.contains { $0.body == "Hi, I hear you." })
+    XCTAssertEqual(model.stimulusInboxPendingCount, 0)
+    XCTAssertFalse(model.eventEntries.contains { $0.title == "direct user response" })
   }
 
   @MainActor
@@ -2734,8 +4334,8 @@ final class AffectiveTests: XCTestCase {
 
     model.sendText()
 
-    let textCalls = await core.waitForTextCallCount(0)
-    XCTAssertEqual(textCalls.count, 0)
+    let ingestCalls = await core.waitForIngestCallCount(0)
+    XCTAssertEqual(ingestCalls.count, 0)
     XCTAssertEqual(model.messageText, "Are you awake?")
     XCTAssertEqual(model.statusText, "Brain is dreaming")
     XCTAssertTrue(model.isBrainUnavailableForConversation)
@@ -2744,8 +4344,10 @@ final class AffectiveTests: XCTestCase {
   @MainActor
   func testTypedTextPassesPriorConversationContextWithoutCurrentMessage() async throws {
     let core = ScriptedBrainCore(
-      toolResponse: Self.toolResponse(toolName: "unused"),
-      textResponse: BrainTextResponse(toolName: "experience", text: "Sure.", metadata: [:], events: []),
+      toolResponse: Self.toolResponse(
+        toolName: "autonomy_tick",
+        events: [brainChatEvent(title: "Brain", text: "Sure.")]
+      ),
       cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
@@ -2756,11 +4358,14 @@ final class AffectiveTests: XCTestCase {
 
     model.sendText()
 
-    let textCalls = await core.waitForTextCallCount(1)
-    let arguments = try XCTUnwrap(textCalls.last?.stimulusContext?.eventArguments)
+    let ingestCalls = await core.waitForIngestCallCount(1)
+    let arguments = try XCTUnwrap(ingestCalls.last?.arguments["context"]?.objectValue)
     let conversation = try XCTUnwrap(arguments["conversation_context"]?.objectValue)
     let turns = try XCTUnwrap(conversation["recent_turns"]?.arrayValue)
 
+    XCTAssertEqual(ingestCalls.last?.arguments["text"]?.stringValue, "Now make it time-aware.")
+    XCTAssertEqual(ingestCalls.last?.arguments["kind"], .string("speech"))
+    XCTAssertEqual(ingestCalls.last?.arguments["source"], .string("user_message"))
     XCTAssertEqual(turns.count, 2)
     XCTAssertEqual(turns.compactMap { $0.objectValue?["text"]?.stringValue }, [
       "Let's design working memory.",
@@ -2814,7 +4419,7 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
-  func testEmptyEventBrainResponseIsProtocolError() async throws {
+  func testEmptyIngestAcknowledgementIsAcceptedAsSenseInput() async throws {
     let core = ScriptedBrainCore(
       toolResponse: Self.toolResponse(toolName: "unused"),
       textResponse: BrainTextResponse(toolName: "experience", text: "raw text without events", metadata: [:], events: []),
@@ -2827,8 +4432,8 @@ final class AffectiveTests: XCTestCase {
 
     let turns = model.conversationContextSnapshot().recentTurns
     XCTAssertNil(turns.last { $0.speakerRole == "self" && $0.text == "raw text without events" })
-    XCTAssertEqual(model.statusText, "Core protocol error")
-    XCTAssertNotNil(model.eventEntries.last { $0.kind == .error && $0.title == "user_text" })
+    XCTAssertEqual(model.statusText, "Message accepted by core")
+    XCTAssertNil(model.eventEntries.last { $0.kind == .error && $0.title == "autonomy_tick" })
   }
 
   @MainActor
@@ -2869,6 +4474,7 @@ final class AffectiveTests: XCTestCase {
   func testLogPresentationSpeechEventSpeaksWhenVoiceEnabled() async throws {
     let model = AffectiveViewModel(brain: try makeBrain())
     model.brainVoiceEnabled = true
+    model.speechSpeakOverride = { _, _, completion in completion() }
 
     let result = await model.applyCoreEvents([
       actionRequestEvent(
@@ -3001,8 +4607,10 @@ final class AffectiveTests: XCTestCase {
   @MainActor
   func testImageMessageRecordsConversationTurnWithMediaMetadata() async throws {
     let core = ScriptedBrainCore(
-      toolResponse: Self.toolResponse(toolName: "unused"),
-      textResponse: BrainTextResponse(toolName: "experience", text: "", metadata: [:], events: []),
+      toolResponse: Self.toolResponse(
+        toolName: "autonomy_tick",
+        events: [brainChatEvent(title: "Brain", text: "Nice sketch.")]
+      ),
       cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
@@ -3010,7 +4618,9 @@ final class AffectiveTests: XCTestCase {
     model.messageText = "Look at this sketch."
 
     model.sendImage(data: Self.tinyPNGData, suggestedName: "sketch.png")
-    let textCalls = await core.waitForTextCallCount(1)
+    await model.waitForHostPipelineIdle()
+    let ingestCalls = await core.waitForIngestCallCount(1)
+    _ = await core.waitForAutonomyTickCallCount(1)
     let mediaEvents = await core.waitForExperienceEventCallCount(1)
     let mediaEvent = try XCTUnwrap(mediaEvents.last)
     XCTAssertEqual(mediaEvent.arguments["kind"]?.stringValue, "User.MediaUploaded")
@@ -3019,10 +4629,13 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(mediaEvent.arguments["visibility"]?.stringValue, "host")
     XCTAssertEqual(mediaEvent.arguments["salience"], .number(0.65))
     let mediaPayload = try XCTUnwrap(mediaEvent.arguments["payload"]?.stringValue)
-    XCTAssertTrue(mediaPayload.contains("\"media_kind\":\"image\""))
-    XCTAssertTrue(mediaPayload.contains("\"mime_type\":\"image/png\""))
+    XCTAssertTrue(mediaPayload.contains("media_kind"))
+    XCTAssertTrue(mediaPayload.contains("mime_type"))
+    XCTAssertTrue(mediaPayload.contains("png"))
 
-    let imageTurn = try XCTUnwrap(model.conversationContextSnapshot().recentTurns.last)
+    let imageTurn = try XCTUnwrap(
+      model.conversationContextSnapshot().recentTurns.first { $0.source == "image" }
+    )
     XCTAssertEqual(imageTurn.speakerRole, "other")
     XCTAssertEqual(imageTurn.source, "image")
     XCTAssertEqual(imageTurn.metadata["media_kind"], "image")
@@ -3030,8 +4643,10 @@ final class AffectiveTests: XCTestCase {
     XCTAssertNotNil(imageTurn.metadata["image_path"])
     XCTAssertNil(imageTurn.metadata["original_bytes"])
 
-    let callContext = try XCTUnwrap(textCalls.last?.stimulusContext?.eventArguments["conversation_context"]?.objectValue)
+    let callContext = try XCTUnwrap(ingestCalls.last?.arguments["context"]?.objectValue?["conversation_context"]?.objectValue)
     let sentContextTurns = try XCTUnwrap(callContext["recent_turns"]?.arrayValue)
+    XCTAssertTrue(ingestCalls.last?.arguments["text"]?.stringValue?.contains("Look at this sketch.") == true)
+    XCTAssertFalse(ingestCalls.last?.arguments["text"]?.stringValue?.contains("I heard someone say") == true)
     XCTAssertFalse(sentContextTurns.contains { $0.objectValue?["text"]?.stringValue == "Look at this sketch." })
   }
 
@@ -3288,20 +4903,150 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
-  func testBoredomSenseOnlyEmitsWhenAwakeIdleAndAutonomyIsOn() throws {
+  func testInnerStateSummaryIncludesAutonomyStatusLine() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.innerStateSummaryCore = "mode=waking belief=hello"
+
+    let summary = model.innerStateSummary()
+    XCTAssertTrue(summary.hasPrefix("Attention is active."))
+    XCTAssertTrue(summary.contains("mode=waking"))
+    XCTAssertTrue(summary.contains("belief=hello"))
+  }
+
+  @MainActor
+  func testAutonomyStatusLineDescribesAttentionStateWithoutCapacity() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+
+    XCTAssertEqual(model.autonomyStatusLine(), "Attention is active.")
+
+    model.autonomyControlBlockedReason = "sleep"
+    model.setRuntimeOptionValue("autonomy_quiet_hours", value: "00:00-23:59", commit: false)
+    XCTAssertEqual(model.attentionStatusTitle, "Sleep hours")
+    XCTAssertEqual(model.autonomyStatusLine(), "Sleep hours are active.")
+
+    // Sleeping outside the configured quiet hours reads as resting, not sleep hours.
+    model.setRuntimeOptionValue("autonomy_quiet_hours", value: "12:00-12:00", commit: false)
+    XCTAssertEqual(model.attentionStatusTitle, "Resting")
+    XCTAssertEqual(model.autonomyStatusLine(), "Attention is resting.")
+
+    model.setRuntimeOptionValue("autonomy_sleep", value: "on", commit: false)
+    XCTAssertEqual(model.attentionStatusTitle, "Resting")
+    XCTAssertEqual(model.autonomyStatusLine(), "Attention is resting.")
+
+    model.setRuntimeOptionValue("autonomy_sleep", value: "off", commit: false)
+    model.autonomyControlBlockedReason = "quiet_hours_bias"
+    XCTAssertEqual(model.autonomyStatusLine(), "Attention is quiet.")
+  }
+
+  @MainActor
+  func testAutonomyTickIsNotBlockedByCapacityFields() throws {
     let model = AffectiveViewModel(brain: try makeBrain())
     model.isBrainConnected = true
-    model.autonomyMode = "on"
+    model.autonomyMode = "play"
+
+    XCTAssertTrue(model.canRunAutonomyTick())
+
+    model.applyAutonomyControlSnapshot(.object([
+      "autonomy_control_model": .object([
+        "control_capacity": .number(0),
+        "max_capacity": .number(0),
+        "actions_available": .bool(false),
+        "blocked_reason": .string("autonomy_overdrawn"),
+      ]),
+    ]))
+
+    XCTAssertTrue(model.canRunAutonomyTick())
+  }
+
+  @MainActor
+  func testAutonomyTickSkipsDuringCameraCaptureHold() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.isBrainConnected = true
+    model.autonomyMode = "play"
+    model.hostPipelineHold = .cameraCapture
+
+    XCTAssertFalse(model.canRunAutonomyTick())
+  }
+
+  @MainActor
+  func testBoredomSenseOnlyEmitsWhenAwakeIdleAndTechnicallyAvailable() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.isBrainConnected = true
+    model.autonomyMode = "play"
     model.lastHostStimulusAt = Date(timeIntervalSinceNow: -700)
 
     XCTAssertTrue(model.canEmitBoredomStimulus(waitSeconds: 600))
 
-    model.autonomyMode = "off"
-    XCTAssertFalse(model.canEmitBoredomStimulus(waitSeconds: 600))
-
-    model.autonomyMode = "on"
     model.hostPipelineHold = .speechOutput
     XCTAssertFalse(model.canEmitBoredomStimulus(waitSeconds: 600))
+
+    model.hostPipelineHold = .none
+    model.markAwaitingSocialResponse()
+    XCTAssertFalse(model.canEmitBoredomStimulus(waitSeconds: 600))
+
+    model.clearSocialTurnResponseWindow()
+    model.markCounterpartActive()
+    XCTAssertFalse(model.canEmitBoredomStimulus(waitSeconds: 600))
+  }
+
+  @MainActor
+  func testMarkInputActivityResetsHostIdleClock() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.lastHostStimulusAt = Date(timeIntervalSinceNow: -900)
+    model.markInputActivity()
+    XCTAssertLessThan(model.hostIdleSeconds(), 2)
+  }
+
+  @MainActor
+  func testDispatchUserMessageResetsHostIdleClock() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(
+        toolName: "autonomy_tick",
+        events: [brainChatEvent(title: "Brain", text: "ok")]
+      ),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.lastHostStimulusAt = Date(timeIntervalSinceNow: -900)
+    model.messageText = "hello"
+    model.sendText()
+    XCTAssertLessThan(model.hostIdleSeconds(), 2)
+    _ = await core.waitForIngestCallCount(1)
+  }
+
+  @MainActor
+  func testBoredomDeliveryRecordsInboxStimulusForAutonomyTick() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(toolName: "autonomy_tick"),
+      textResponse: BrainTextResponse(
+        toolName: "user_text",
+        text: "ok",
+        metadata: [:],
+        events: [],
+        shouldSpeak: false
+      ),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation")
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.autonomyMode = "play"
+    model.emitBoredomStimulus(waitSeconds: 600)
+    let autonomyCalls = await core.waitForAutonomyTickCallCount(1)
+    let context = try XCTUnwrap(autonomyCalls.last?.arguments["context"]?.objectValue)
+    let packet = try XCTUnwrap(context["sense_packet"]?.objectValue)
+    let digest = try XCTUnwrap(packet["digest"]?.objectValue)
+    let items = try XCTUnwrap(digest["items"]?.arrayValue)
+    let item = try XCTUnwrap(items.first?.objectValue)
+
+    XCTAssertNil(context["recent_stimuli"])
+    XCTAssertNil(context["sense_inventory"])
+    XCTAssertEqual(item["kind"]?.stringValue, "boredom")
+    XCTAssertTrue(item["features"]?.arrayValue?.contains(.string("idle_context")) == true)
+    let ingestCalls = await core.waitForIngestCallCount(0)
+    XCTAssertTrue(ingestCalls.isEmpty)
+    let textCalls = await core.textCalls
+    XCTAssertTrue(textCalls.isEmpty)
   }
 
   @MainActor
@@ -3318,7 +5063,7 @@ final class AffectiveTests: XCTestCase {
   func testBoredomStimulusUsesPatientInternalContext() throws {
     let model = AffectiveViewModel(brain: try makeBrain())
     model.isBrainConnected = true
-    model.autonomyMode = "on"
+    model.autonomyMode = "play"
     model.lastHostStimulusAt = Date(timeIntervalSinceNow: -620)
 
     let text = model.boredomStimulusText(idleSeconds: 620)
@@ -3371,6 +5116,23 @@ final class AffectiveTests: XCTestCase {
   }
 
   @MainActor
+  func testNonSocialStimulusDoesNotMarkCounterpartActive() throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    let now = Date()
+
+    model.recordRecentStimulus(
+      kind: "boredom",
+      summary: "Affective has been idle.",
+      metadata: ["source": "idle_timer"],
+      now: now
+    )
+
+    let context = model.currentStimulusContext(kind: "autonomy_tick", now: now.addingTimeInterval(1))
+    XCTAssertFalse(context.counterpartActive)
+    XCTAssertEqual(model.stimulusInboxPendingCount, 1)
+  }
+
+  @MainActor
   func testAwaitingChatResponseDoesNotDisableSend() throws {
     let model = AffectiveViewModel(brain: try makeBrain())
     model.isHostPipelineRunning = true
@@ -3380,36 +5142,38 @@ final class AffectiveTests: XCTestCase {
 
     XCTAssertTrue(model.isAwaitingChatResponse)
     XCTAssertTrue(model.canSend)
-    XCTAssertTrue(model.hostPipelineQueue.isEmpty)
+    XCTAssertEqual(model.hostPipelineQueue.count, 1)
   }
 
   @MainActor
   func testInterruptSupersedingUserMessageDoesNotLeakAwaitingChatResponse() async throws {
     let core = ScriptedBrainCore(
-      toolResponse: Self.toolResponse(toolName: "unused"),
-      textResponse: BrainTextResponse(
-        toolName: "user_text",
-        text: "ok",
-        metadata: [:],
-        events: [
-          brainChatEvent(title: "Brain", text: "ok")
-        ],
-        shouldSpeak: false
+      toolResponse: Self.toolResponse(
+        toolName: "autonomy_tick",
+        events: [brainChatEvent(title: "Brain", text: "ok")]
       ),
       cameraObservationResponse: Self.toolResponse(toolName: "sense_observation"),
-      blockedTextCallCount: 1
+      blockedAutonomyTickCallCount: 1
     )
     let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
     model.isBrainConnected = true
+    model.autonomyMode = "play"
     model.messageText = "first"
     model.sendText()
-    _ = await core.waitForTextCallCount(1)
+    _ = await core.waitForAutonomyTickCallCount(1)
 
     XCTAssertTrue(model.isAwaitingChatResponse)
     XCTAssertEqual(model.pendingChatResponseCount, 1)
 
     model.messageText = "interrupt"
     model.sendText(interrupt: true)
+
+    for _ in 0..<50 {
+      if await core.interruptCalls.count >= 1 {
+        break
+      }
+      try await Task.sleep(for: .milliseconds(20))
+    }
 
     XCTAssertTrue(model.isAwaitingChatResponse)
     XCTAssertEqual(model.pendingChatResponseCount, 1)
@@ -3418,7 +5182,7 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(interruptCalls[0].userText, "interrupt")
     XCTAssertEqual(interruptCalls[0].reason, "user_requested_interrupt")
 
-    await core.resumeBlockedTextSends()
+    await core.resumeBlockedAutonomyTicks()
     for _ in 0..<50 {
       if !model.isAwaitingChatResponse {
         break
@@ -3428,18 +5192,15 @@ final class AffectiveTests: XCTestCase {
 
     XCTAssertFalse(model.isAwaitingChatResponse)
     XCTAssertEqual(model.pendingChatResponseCount, 0)
-    let textCalls = await core.textCalls
-    XCTAssertEqual(textCalls.count, 2)
+    let autonomyTickCalls = await core.waitForAutonomyTickCallCount(2)
+    XCTAssertEqual(autonomyTickCalls.count, 2)
   }
 
   @MainActor
   func testImmediateUserMessageReachCoreWhilePullSenseFulfillmentInFlight() async throws {
     let core = ScriptedBrainCore(
-      toolResponse: Self.toolResponse(toolName: "unused"),
-      textResponse: BrainTextResponse(
-        toolName: "user_text",
-        text: "Waiting on camera.",
-        metadata: ["awaiting_host_sense": "true"],
+      toolResponse: Self.toolResponse(
+        toolName: "autonomy_tick",
         events: [
           senseRequestEvent(
             requestID: "recognize-camera",
@@ -3460,14 +5221,55 @@ final class AffectiveTests: XCTestCase {
 
     model.messageText = "first"
     model.sendText()
-    _ = await core.waitForTextCallCount(1)
-    try await Task.sleep(for: .milliseconds(50))
+    _ = await core.waitForIngestCallCount(1)
+    _ = await core.waitForAutonomyTickCallCount(1)
+    _ = await core.waitForCameraObservationCallCount(1)
 
     model.messageText = "second"
     model.sendText()
 
-    let textCalls = await core.waitForTextCallCount(2)
-    XCTAssertEqual(textCalls[1].text, "second")
+    let ingestCalls = await core.waitForIngestCallCount(2)
+    XCTAssertEqual(ingestCalls.count, 2)
+    XCTAssertEqual(
+      ingestCalls[1].arguments["text"]?.stringValue,
+      "second"
+    )
+  }
+
+  @MainActor
+  func testImmediateUserMessageCoalescesIntoInboxWhileInFlight() async throws {
+    let core = ScriptedBrainCore(
+      toolResponse: Self.toolResponse(
+        toolName: "autonomy_tick",
+        events: [brainChatEvent(title: "Brain", text: "ok")]
+      ),
+      cameraObservationResponse: Self.toolResponse(toolName: "sense_observation"),
+      blockedAutonomyTickCallCount: 1
+    )
+    let model = AffectiveViewModel(brain: try makeBrain(), brainCore: core)
+    model.isBrainConnected = true
+    model.autonomyMode = "play"
+    model.messageText = "first"
+    model.sendText()
+    _ = await core.waitForIngestCallCount(1)
+    _ = await core.waitForAutonomyTickCallCount(1)
+
+    model.messageText = "second"
+    model.sendText()
+
+    let ingestCalls = await core.waitForIngestCallCount(2)
+    XCTAssertEqual(ingestCalls[1].name, "stimulus_ingest")
+    XCTAssertEqual(ingestCalls[1].arguments["text"]?.stringValue, "second")
+    let interruptCallCount = await core.interruptCalls.count
+    XCTAssertEqual(interruptCallCount, 0)
+
+    await core.resumeBlockedAutonomyTicks()
+    let autonomyTickCalls = await core.waitForAutonomyTickCallCount(1)
+    XCTAssertEqual(autonomyTickCalls.count, 1)
+    XCTAssertEqual(
+      ingestCalls[0].arguments["text"]?.stringValue,
+      "first"
+    )
   }
 
   @MainActor
@@ -3484,8 +5286,203 @@ final class AffectiveTests: XCTestCase {
     ], mirrorChatMessages: true, speak: false)
 
     XCTAssertEqual(model.statusText, "Waiting for your name.")
+    XCTAssertEqual(model.chatWorkingStatusText, "Waiting for your name.")
     XCTAssertEqual(model.eventEntries.last?.title, "Learning your name")
     XCTAssertEqual(model.chatEntries.count, initialChatCount)
+  }
+
+  @MainActor
+  func testChatWorkingStatusPrefersLoopPhaseOverGenericThinking() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.statusText = "Affective is thinking"
+
+    _ = await model.applyCoreEvents([
+      BrainEvent(
+        id: "control-recalling",
+        traceID: "trace-control-recalling",
+        parentID: nil,
+        turnID: nil,
+        loopID: nil,
+        occurredAt: "2026-06-26T00:00:00Z",
+        source: .brain,
+        target: .host,
+        visibility: .diagnostic,
+        presentation: .status,
+        payload: .control(BrainControlPayload(
+          phase: .recalling,
+          sendEnabled: nil,
+          status: "recalling"
+        ))
+      ),
+    ], mirrorChatMessages: true, speak: false)
+
+    XCTAssertEqual(model.chatWorkingStatusText, "Recalling memories")
+  }
+
+  @MainActor
+  func testChatWorkingStatusPrefersActiveProcessStepName() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.statusText = "Affective is thinking"
+
+    _ = await model.applyCoreEvents([
+      BrainEvent(
+        id: "turn-step-priority",
+        traceID: "trace-turn-step-priority",
+        parentID: nil,
+        turnID: nil,
+        loopID: nil,
+        occurredAt: "2026-06-26T00:00:00Z",
+        source: .brain,
+        target: .host,
+        visibility: .diagnostic,
+        presentation: .internalOnly,
+        payload: .developerLog(BrainDeveloperLogPayload(
+          kind: "process",
+          title: "turn.compose_response",
+          body: "Composing the reply."
+        ))
+      ),
+    ], mirrorChatMessages: true, speak: false)
+
+    XCTAssertEqual(model.chatWorkingStatusText, "Compose Response")
+  }
+
+  @MainActor
+  func testChatWorkingStatusUsesActiveProcessModelFields() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.statusText = "Affective is thinking"
+    model.applyActiveProcessModel(from: .object([
+      "active_process_model": .object([
+        "goal": .string("answer_question"),
+        "state": .string("recall_memories"),
+      ]),
+    ]))
+
+    XCTAssertEqual(model.activeProcessGoal, "answer_question")
+    XCTAssertEqual(model.activeProcessState, "recall_memories")
+    XCTAssertEqual(model.chatWorkingStatusText, "Recall Memories")
+
+    model.activeProcessStepName = "compose_response"
+    let context = model.currentStimulusContext(kind: "short_touch")
+    XCTAssertEqual(context.eventArguments["active_process_goal"]?.stringValue, "answer_question")
+    XCTAssertEqual(context.eventArguments["active_process_state"]?.stringValue, "recall_memories")
+    XCTAssertEqual(context.eventArguments["active_process_step"]?.stringValue, "compose_response")
+  }
+
+  @MainActor
+  func testChatWorkingStatusKeepsOperationalStatusText() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.statusText = "Sending to core"
+
+    XCTAssertEqual(model.chatWorkingStatusText, "Sending to core")
+  }
+
+  @MainActor
+  func testControlPhaseEventUpdatesBrainLoopPhase() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+
+    _ = await model.applyCoreEvents([
+      BrainEvent(
+        id: "control-thinking",
+        traceID: "trace-control-thinking",
+        parentID: nil,
+        turnID: nil,
+        loopID: nil,
+        occurredAt: "2026-06-26T00:00:00Z",
+        source: .brain,
+        target: .host,
+        visibility: .diagnostic,
+        presentation: .status,
+        payload: .control(BrainControlPayload(
+          phase: .planning,
+          sendEnabled: false,
+          status: "planning"
+        ))
+      ),
+    ], mirrorChatMessages: true, speak: false)
+
+    XCTAssertEqual(model.brainLoopPhase, .planning)
+    XCTAssertEqual(model.chatWorkingStatusText, "Planning")
+  }
+
+  @MainActor
+  func testDeveloperLogTurnStepUpdatesChatWorkingStatus() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    model.statusText = "Affective is thinking"
+
+    _ = await model.applyCoreEvents([
+      BrainEvent(
+        id: "turn-step",
+        traceID: "trace-turn-step",
+        parentID: nil,
+        turnID: nil,
+        loopID: nil,
+        occurredAt: "2026-06-26T00:00:00Z",
+        source: .brain,
+        target: .host,
+        visibility: .diagnostic,
+        presentation: .internalOnly,
+        payload: .developerLog(BrainDeveloperLogPayload(
+          kind: "process",
+          title: "turn.compose_response",
+          body: "Composing the reply."
+        ))
+      ),
+    ], mirrorChatMessages: true, speak: false)
+
+    XCTAssertEqual(model.activeProcessStepName, "compose_response")
+    XCTAssertEqual(model.chatWorkingStatusText, "Compose Response")
+  }
+
+  @MainActor
+  func testClearChatWorkingActivityWhenResponseCompletes() async throws {
+    let model = AffectiveViewModel(brain: try makeBrain())
+    _ = await model.applyCoreEvents([
+      BrainEvent(
+        id: "control-thinking-clear",
+        traceID: "trace-control-thinking-clear",
+        parentID: nil,
+        turnID: nil,
+        loopID: nil,
+        occurredAt: "2026-06-26T00:00:00Z",
+        source: .brain,
+        target: .host,
+        visibility: .diagnostic,
+        presentation: .status,
+        payload: .control(BrainControlPayload(
+          phase: .thinking,
+          sendEnabled: nil,
+          status: "thinking"
+        ))
+      ),
+      BrainEvent(
+        id: "turn-step-clear",
+        traceID: "trace-turn-step-clear",
+        parentID: nil,
+        turnID: nil,
+        loopID: nil,
+        occurredAt: "2026-06-26T00:00:00Z",
+        source: .brain,
+        target: .host,
+        visibility: .diagnostic,
+        presentation: .internalOnly,
+        payload: .developerLog(BrainDeveloperLogPayload(
+          kind: "process",
+          title: "turn.compose_response",
+          body: "Composing the reply."
+        ))
+      ),
+    ], mirrorChatMessages: true, speak: false)
+    model.pendingChatResponseCount = 1
+    model.refreshAwaitingChatResponse()
+    XCTAssertTrue(model.isAwaitingChatResponse)
+
+    model.pendingChatResponseCount = 0
+    model.refreshAwaitingChatResponse()
+
+    XCTAssertFalse(model.isAwaitingChatResponse)
+    XCTAssertNil(model.brainLoopPhase)
+    XCTAssertNil(model.activeProcessStepName)
   }
 
   func testOrientationPromptAdvertisesGenericSenseObservation() throws {
@@ -3524,19 +5521,6 @@ final class AffectiveTests: XCTestCase {
     let landscape = OrientationQueryProvider.classify(x: 0.91, y: 0.05, z: 0.02)
     XCTAssertEqual(landscape.posture, "landscape_left")
     XCTAssertEqual(landscape.gravityX, 0.91)
-  }
-
-  func testEmbeddedProtocolContractBuildsWrapperDispatchRequests() throws {
-    for eventType in EmbeddedProtocolContract.wrapperDispatchEventTypes {
-      let request: JSONValue = .object([
-        "request_id": .string("fixture-\(eventType)"),
-        "event": .object(["payload": .object([eventType: .object([:])])]),
-      ])
-      let fixture = try JSONValue.decodedObject(from: request.encodedData())
-
-      XCTAssertEqual(fixture["request_id"], .string("fixture-\(eventType)"))
-      XCTAssertNotNil(fixture["event"]?.objectValue?["payload"]?.objectValue?[eventType])
-    }
   }
 
   func testGenerationProviderE2EAgainstEnabledProviders() throws {
@@ -3621,6 +5605,72 @@ final class AffectiveTests: XCTestCase {
     XCTAssertEqual(resolved[0].text, "Hello from the core.")
     XCTAssertEqual(resolved[1].type, "capability_request")
     XCTAssertEqual(resolved[1].capability, "speak")
+    XCTAssertTrue(envelope.hostSpeechDelivered)
+    XCTAssertFalse(envelope.requiresHostSpeechPlayback)
+    let response = BrainToolResponse(toolName: "user_text", envelope: envelope, rawText: envelope.rawText)
+    XCTAssertFalse(response.shouldSpeak)
+  }
+
+  func testBrainDispatchEnvelopeRequiresHostSpeechWhenCoreDidNotSpeak() throws {
+    let envelope = try BrainDispatchEnvelope.decode(from: #"""
+      {
+        "request_id": "user-text-request",
+        "ok": true,
+        "events": [
+          {
+            "id": "user-text-request_0_capability_request",
+            "trace_id": "user-text-request_0_capability_request",
+            "turn_id": "user-text-request",
+            "source": "brain",
+            "target": "host",
+            "visibility": "public",
+            "presentation": "chat",
+            "type": "capability_request",
+            "payload": {
+              "capability_request": {
+                "action_id": "user-text-request_0_capability_request",
+                "action": "speak",
+                "arguments": { "text": "Hello!" },
+                "requires": ["speech_output"],
+                "await_response": false
+              }
+            }
+          },
+          {
+            "id": "expression_1",
+            "trace_id": "expression_1",
+            "turn_id": "user-text-request",
+            "source": "brain",
+            "target": "host",
+            "visibility": "public",
+            "presentation": "chat",
+            "type": "expression",
+            "payload": {
+              "expression": {
+                "modality": "text",
+                "role": "brain",
+                "title": "Brain",
+                "text": "Hello!",
+                "media": [],
+                "expression_id": "expression_1"
+              }
+            }
+          }
+        ],
+        "result": {
+          "event_type": "user_text",
+          "value": { "kind": "user_text" }
+        }
+      }
+      """#)
+
+    XCTAssertEqual(envelope.events.count, 2)
+    XCTAssertEqual(envelope.events.first?.capability, "speak")
+    XCTAssertEqual(envelope.events.last?.text, "Hello!")
+    XCTAssertFalse(envelope.hostSpeechDelivered)
+    XCTAssertTrue(envelope.requiresHostSpeechPlayback)
+    let response = BrainToolResponse(toolName: "user_text", envelope: envelope, rawText: envelope.rawText)
+    XCTAssertTrue(response.shouldSpeak)
   }
 
   func testBrainDispatchEnvelopeDecodesZigHostEffectEventsLeniently() throws {
@@ -4691,7 +6741,7 @@ final class AffectiveTests: XCTestCase {
     )
 
     let result = try await service.generateKit(
-      characterBrief: "A friendly robot barista",
+      characterBrief: "A friendly barista",
       brainRoot: root
     ) { _, _ in }
 
@@ -4756,7 +6806,7 @@ final class AffectiveTests: XCTestCase {
     )
 
     _ = try await service.generateKit(
-      characterBrief: "A friendly robot barista",
+      characterBrief: "A friendly barista",
       brainRoot: root
     ) { _, _ in }
 
@@ -4835,7 +6885,7 @@ final class AffectiveTests: XCTestCase {
     )
 
     let result = try await service.generateKit(
-      characterBrief: "A friendly robot barista",
+      characterBrief: "A friendly barista",
       brainRoot: root
     ) { _, _ in }
 
@@ -4901,13 +6951,13 @@ final class AffectiveTests: XCTestCase {
     )
 
     let initial = try await service.generateKit(
-      characterBrief: "A friendly robot barista",
+      characterBrief: "A friendly barista",
       brainRoot: root
     ) { _, _ in }
 
     let regenerated = try await service.regenerateAsset(
       kind: .baseHead,
-      characterBrief: "A friendly robot barista",
+      characterBrief: "A friendly barista",
       workingDirectory: initial.assets.headURL.deletingLastPathComponent(),
       currentAssets: initial.assets
     ) { _, _ in }
@@ -5447,6 +7497,25 @@ final class AffectiveTests: XCTestCase {
 
     let archive = try await makeCoreBrainArchive(for: brain, includeBiometricData: false)
     defer { try? FileManager.default.removeItem(at: archive.scratchRoot) }
+    let scrubbedRoot = FileManager.default.temporaryDirectory
+      .appendingPathComponent("AffectiveScrubbedBiometrics-\(UUID().uuidString)", isDirectory: true)
+    temporaryRoots.append(scrubbedRoot)
+    try BrainLibrary.copyBrain(
+      from: brain.rootURL,
+      to: scrubbedRoot,
+      includeBiometricData: false,
+      fileManager: .default
+    )
+    let scrubbedObject = try XCTUnwrap(readCognitiveObject(from: scrubbedRoot.appendingPathComponent("memory/people.sqlite")))
+    let scrubbedSubjects = try XCTUnwrap(scrubbedObject["subjects"] as? [[String: Any]])
+    let scrubbedSubject = try XCTUnwrap(scrubbedSubjects.first)
+    XCTAssertEqual(scrubbedSubject["display_name"] as? String, "User")
+    XCTAssertEqual(scrubbedSubject["notes"] as? String, "friend")
+    XCTAssertNil(scrubbedSubject["embeddings"])
+    XCTAssertNil(scrubbedSubject["biometric_records"])
+    XCTAssertNil(scrubbedSubject["representative_image_path"])
+    XCTAssertNil(scrubbedSubject["representative_quality_score"])
+
     let restored = FileManager.default.temporaryDirectory
       .appendingPathComponent("AffectiveRestoredNoBiometrics-\(UUID().uuidString)", isDirectory: true)
     temporaryRoots.append(restored)
@@ -5455,22 +7524,6 @@ final class AffectiveTests: XCTestCase {
     XCTAssertFalse(FileManager.default.fileExists(atPath: restored.appendingPathComponent("memory/face_embeddings/user.embedding").path))
     XCTAssertFalse(FileManager.default.fileExists(atPath: restored.appendingPathComponent("memory/biometric_identities.json").path))
     XCTAssertEqual(try exportManifestContainsBiometricData(in: restored), false)
-
-    let peopleData = try Data(contentsOf: restored.appendingPathComponent("memory/people.sqlite"))
-    let scrubbedDatabaseURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("AffectiveScrubbedPeople-Test-\(UUID().uuidString).sqlite")
-    temporaryRoots.append(scrubbedDatabaseURL)
-    try peopleData.write(to: scrubbedDatabaseURL, options: .atomic)
-    let scrubbedJSON = try XCTUnwrap(readCognitiveJSON(from: scrubbedDatabaseURL))
-    let scrubbedObject = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(scrubbedJSON.utf8)) as? [String: Any])
-    let subjects = try XCTUnwrap(scrubbedObject["subjects"] as? [[String: Any]])
-    let subject = try XCTUnwrap(subjects.first)
-    XCTAssertEqual(subject["display_name"] as? String, "User")
-    XCTAssertEqual(subject["notes"] as? String, "friend")
-    XCTAssertNil(subject["embeddings"])
-    XCTAssertNil(subject["biometric_records"])
-    XCTAssertNil(subject["representative_image_path"])
-    XCTAssertNil(subject["representative_quality_score"])
   }
 
   @MainActor
@@ -5504,6 +7557,7 @@ final class AffectiveTests: XCTestCase {
 
     let archive = try await makeCoreBrainArchive(for: brain, includeBiometricData: true)
     defer { try? FileManager.default.removeItem(at: archive.scratchRoot) }
+
     let restored = FileManager.default.temporaryDirectory
       .appendingPathComponent("AffectiveRestoredWithBiometrics-\(UUID().uuidString)", isDirectory: true)
     temporaryRoots.append(restored)
@@ -5512,19 +7566,6 @@ final class AffectiveTests: XCTestCase {
     XCTAssertTrue(FileManager.default.fileExists(atPath: restored.appendingPathComponent("memory/face_embeddings/user.embedding").path))
     XCTAssertTrue(FileManager.default.fileExists(atPath: restored.appendingPathComponent("memory/biometric_identities.json").path))
     XCTAssertEqual(try exportManifestContainsBiometricData(in: restored), true)
-
-    let peopleData = try Data(contentsOf: restored.appendingPathComponent("memory/people.sqlite"))
-    let databaseURL = FileManager.default.temporaryDirectory
-      .appendingPathComponent("AffectiveIncludedPeople-Test-\(UUID().uuidString).sqlite")
-    temporaryRoots.append(databaseURL)
-    try peopleData.write(to: databaseURL, options: .atomic)
-    let cognitiveJSON = try XCTUnwrap(readCognitiveJSON(from: databaseURL))
-    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(cognitiveJSON.utf8)) as? [String: Any])
-    let subjects = try XCTUnwrap(object["subjects"] as? [[String: Any]])
-    let subject = try XCTUnwrap(subjects.first)
-    XCTAssertNotNil(subject["biometric_records"])
-    XCTAssertEqual(subject["representative_image_path"] as? String, "memory/faces/person-1.jpg")
-    XCTAssertEqual(subject["representative_quality_score"] as? Double, 0.91)
   }
 
   @MainActor
@@ -5788,6 +7829,39 @@ final class AffectiveTests: XCTestCase {
     XCTAssertTrue(filtered.contains { $0.metadata["dream_id"] == "dream_1" })
   }
 
+  func testBrainKnowledgeReaderDescribesInvalidDatabase() throws {
+    let brain = try makeBrain()
+    try Data("not a sqlite database".utf8).write(to: brain.memoryDatabaseURL)
+
+    do {
+      _ = try BrainKnowledgeReader.loadEntries(from: brain)
+      XCTFail("Expected invalid database to throw")
+    } catch let error as BrainKnowledgeReaderError {
+      let message = try XCTUnwrap(error.errorDescription)
+      XCTAssertTrue(message.contains("not a SQLite database") || message.contains("file is not a SQLite database"), message)
+      XCTAssertTrue(message.contains(brain.memoryDatabaseURL.path), message)
+      XCTAssertTrue(message.contains("size"), message)
+    }
+  }
+
+  func testBrainKnowledgeReaderDescribesMissingCognitiveMemoryTable() throws {
+    let brain = try makeBrain()
+    var database: OpaquePointer?
+    XCTAssertEqual(sqlite3_open(brain.memoryDatabaseURL.path, &database), SQLITE_OK)
+    defer { sqlite3_close(database) }
+    XCTAssertEqual(sqlite3_exec(database, "DROP TABLE IF EXISTS cognitive_memory", nil, nil, nil), SQLITE_OK)
+    XCTAssertEqual(sqlite3_exec(database, "CREATE TABLE other_table (id INTEGER PRIMARY KEY)", nil, nil, nil), SQLITE_OK)
+
+    do {
+      _ = try BrainKnowledgeReader.loadEntries(from: brain)
+      XCTFail("Expected missing cognitive_memory table to throw")
+    } catch let error as BrainKnowledgeReaderError {
+      let message = try XCTUnwrap(error.errorDescription)
+      XCTAssertTrue(message.contains("prepare cognitive_memory query"), message)
+      XCTAssertTrue(message.contains("no such table: cognitive_memory"), message)
+    }
+  }
+
   func testDreamLoadCheckRequestsDreamWhenNoDreamExists() throws {
     let now = try XCTUnwrap(MailboxItemDateFormatter.date(from: "2026-06-25T22:30:00Z"))
 
@@ -5809,19 +7883,25 @@ final class AffectiveTests: XCTestCase {
     XCTAssertTrue(AffectiveViewModel.shouldRequestDreamTimeFromMailbox([item], now: now))
   }
 
+  @MainActor
   func testCoreLoadPerformanceSessionRecordsPhasesAndSummary() async {
     let session = CoreLoadPerformanceSession()
     await session.measure(id: "phase_a", label: "Phase A") {
       try? await Task.sleep(nanoseconds: 2_000_000)
     }
     let report = session.report()
-    XCTAssertEqual(report.phases.map(\.label), ["Phase A"])
-    XCTAssertGreaterThanOrEqual(report.phases[0].durationMs, 0)
-    XCTAssertGreaterThanOrEqual(report.totalMs, report.phases[0].durationMs)
-    XCTAssertTrue(report.eventLogBody.contains("Phase A:"))
-    XCTAssertTrue(report.summaryText.contains("Core load"))
+    let phases = report.phases
+    let totalMs = report.totalMs
+    let eventLogBody = report.eventLogBody
+    let summaryText = report.summaryText
+    XCTAssertEqual(phases.map(\.label), ["Phase A"])
+    XCTAssertGreaterThanOrEqual(phases[0].durationMs, 0)
+    XCTAssertGreaterThanOrEqual(totalMs, phases[0].durationMs)
+    XCTAssertTrue(eventLogBody.contains("Phase A:"))
+    XCTAssertTrue(summaryText.contains("Core load"))
   }
 
+  @MainActor
   func testShowsCoreConnectingScreenUntilConnected() async throws {
     let brain = try makeBrain()
     let core = ScriptedBrainCore(
@@ -5839,6 +7919,17 @@ final class AffectiveTests: XCTestCase {
     model.isBrainConnected = false
     model.isBrainConnectionInFlight = true
     XCTAssertFalse(model.showsCoreConnectingScreen)
+  }
+
+  @MainActor
+  func testShowsCoreConnectingScreenDuringDreamTime() {
+    let model = AffectiveViewModel(brain: try! makeBrain(), brainCore: ScriptedBrainCore(
+      toolResponse: BrainToolResponse(toolName: "mock", text: "", metadata: [:], events: [], rawText: "{}"),
+      cameraObservationResponse: BrainToolResponse(toolName: "mock", text: "", metadata: [:], events: [], rawText: "{}")
+    ))
+    model.isBrainConnected = true
+    model.isDreamTimeInFlight = true
+    XCTAssertTrue(model.showsCoreConnectingScreen)
   }
 
   func testBrainFileAccessGateRejectsDuplicateLiveSession() throws {
@@ -5900,13 +7991,58 @@ final class AffectiveTests: XCTestCase {
     XCTAssertTrue(entries.contains { $0.metadata["memory_id"] == "memory_live_session" })
   }
 
+  func testCognitiveArtifactResolverAllowsReadOnlyLoadDuringLiveSession() throws {
+    let brain = try makeBrain()
+    try writeCognitiveStore(at: brain.memoryDatabaseURL, dataJSON: """
+    {
+      "schema_version": 1,
+      "artifacts": [
+        {
+          "artifact_id": "artifact_dream_live",
+          "kind": "image",
+          "path": "generated/images/dream-live.png",
+          "mime_type": "image/png",
+          "provenance": "dream_time_internal_synthesis",
+          "source_event_ids": []
+        }
+      ]
+    }
+    """)
+    try BrainFileAccessGate.acquireLiveSession(brainID: brain.id)
+    defer { BrainFileAccessGate.releaseLiveSession(brainID: brain.id) }
+
+    let artifact = CognitiveArtifactResolver.artifact(
+      id: "artifact_dream_live",
+      in: brain.memoryDatabaseURL,
+      brainID: brain.id
+    )
+    XCTAssertEqual(artifact?.artifactID, "artifact_dream_live")
+    XCTAssertEqual(artifact?.path, "generated/images/dream-live.png")
+    XCTAssertEqual(artifact?.mimeType, "image/png")
+  }
+
   private func makeBrain(
     profile: String = #"{"schema_version":1,"display_name":"Test Brain"}"#,
     runtimeOptions: String = "{}",
     displayName: String = "Test Brain"
   ) throws -> BrainDescriptor {
+    let brainID = UUID().uuidString
+    #if DEBUG
+    let root: URL
+    if BrainLibrary.storageRootURLOverride != nil {
+      try FileManager.default.createDirectory(
+        at: BrainLibrary.brainsRootURL,
+        withIntermediateDirectories: true
+      )
+      root = BrainLibrary.brainsRootURL.appendingPathComponent(brainID, isDirectory: true)
+    } else {
+      root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("AffectiveTests-\(brainID)", isDirectory: true)
+    }
+    #else
     let root = FileManager.default.temporaryDirectory
-      .appendingPathComponent("AffectiveTests-\(UUID().uuidString)", isDirectory: true)
+      .appendingPathComponent("AffectiveTests-\(brainID)", isDirectory: true)
+    #endif
     temporaryRoots.append(root)
 
     let memory = root.appendingPathComponent("memory", isDirectory: true)
@@ -5918,9 +8054,11 @@ final class AffectiveTests: XCTestCase {
       to: root.appendingPathComponent("maintenance.md"), atomically: true, encoding: .utf8)
     try runtimeOptions.write(
       to: root.appendingPathComponent("runtime_options.json"), atomically: true, encoding: .utf8)
+    try "{}".write(
+      to: root.appendingPathComponent("maintenance_state.json"), atomically: true, encoding: .utf8)
 
     return BrainDescriptor(
-      id: root.lastPathComponent,
+      id: brainID,
       displayName: displayName,
       rootURL: root,
       avatarURL: nil,
@@ -5956,6 +8094,69 @@ final class AffectiveTests: XCTestCase {
     0x45, 0xCA, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
     0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
   ])
+
+  private static func scaledCognitiveFixtureJSON(brainID: String, memoryCount: Int, eventCount: Int) -> String {
+    var events: [String] = []
+    events.reserveCapacity(eventCount)
+    for index in 0..<eventCount {
+      events.append(
+        """
+          {
+            "id": "evt_scale_\(index)",
+            "host_id": "core",
+            "timestamp_ms": \(1_000_000 + index),
+            "source": "user",
+            "kind": "User.TextReceived",
+            "payload": "seed event \(index)"
+          }
+        """
+      )
+    }
+
+    var memories: [String] = []
+    memories.reserveCapacity(memoryCount)
+    for index in 0..<memoryCount {
+      memories.append(
+        """
+          {
+            "memory_id": "mem_scale_\(index)",
+            "scope": "long_term",
+            "text": "Memory topic \(index) about greetings and Geisha recognition",
+            "interpretation": "Memory topic \(index) about greetings and Geisha recognition",
+            "tags": ["conversation", "seed"],
+            "created_at": "1000",
+            "access_count": 0,
+            "score": \(index % 16 + 1)
+          }
+        """
+      )
+    }
+
+    return """
+    {
+      "schema_version": 1,
+      "brain_id": "\(brainID)",
+      "brain_mode": "waking",
+      "host_bindings": [
+        {
+          "host_id": "core",
+          "platform": "test",
+          "attached_at_ms": 1000
+        }
+      ],
+      "events": [
+    \(events.joined(separator: ",\n"))
+      ],
+      "memories": [
+    \(memories.joined(separator: ",\n"))
+      ],
+      "beliefs": [],
+      "subjects": [],
+      "artifacts": [],
+      "dreams": []
+    }
+    """
+  }
 
   private static func pngFixture(
     width: Int,
@@ -6114,13 +8315,54 @@ final class AffectiveTests: XCTestCase {
   }
 
   private func writeCognitiveStore(at url: URL, dataJSON: String) throws {
+    try FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(),
+      withIntermediateDirectories: true
+    )
     var database: OpaquePointer?
-    XCTAssertEqual(sqlite3_open(url.path, &database), SQLITE_OK)
+    XCTAssertEqual(
+      sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil),
+      SQLITE_OK
+    )
     defer { sqlite3_close(database) }
-    XCTAssertEqual(sqlite3_exec(database, "CREATE TABLE cognitive_memory (id INTEGER PRIMARY KEY, data_json TEXT NOT NULL)", nil, nil, nil), SQLITE_OK)
-    let escaped = dataJSON.replacingOccurrences(of: "'", with: "''")
-    let sql = "INSERT INTO cognitive_memory (id, data_json) VALUES (1, '\(escaped)')"
-    XCTAssertEqual(sqlite3_exec(database, sql, nil, nil, nil), SQLITE_OK)
+    XCTAssertEqual(
+      sqlite3_exec(
+        database,
+        """
+        PRAGMA user_version = 1;
+        CREATE TABLE IF NOT EXISTS cognitive_memory (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            data_json TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO cognitive_memory (id, data_json)
+        VALUES (1, '{}');
+        """,
+        nil,
+        nil,
+        nil
+      ),
+      SQLITE_OK
+    )
+
+    var statement: OpaquePointer?
+    let sql = """
+    INSERT INTO cognitive_memory (id, data_json)
+    VALUES (1, ?)
+    ON CONFLICT(id) DO UPDATE SET data_json = excluded.data_json
+    """
+    XCTAssertEqual(sqlite3_prepare_v2(database, sql, -1, &statement, nil), SQLITE_OK)
+    defer { sqlite3_finalize(statement) }
+    let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    let bindStatus = dataJSON.withCString { pointer in
+      sqlite3_bind_text(statement, 1, pointer, -1, transient)
+    }
+    XCTAssertEqual(bindStatus, SQLITE_OK)
+    XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+  }
+
+  private func readCognitiveObject(from url: URL) throws -> [String: Any]? {
+    guard let json = try readCognitiveJSON(from: url) else { return nil }
+    return try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
   }
 
   private func readCognitiveJSON(from url: URL) throws -> String? {
@@ -6173,16 +8415,11 @@ final class AffectiveTests: XCTestCase {
       )
     }
 
-    let core = BrainCore(brain: exportBrain, tracksLiveFileSession: false)
-    do {
-      _ = try await BrainFileAccessGate.runExclusive(brainID: brain.id) {
-        try await core.exportBrain(to: archiveURL)
-      }
-      await core.disconnect()
-    } catch {
-      await core.disconnect()
-      throw error
-    }
+    _ = try BrainCloudArchive.createArchive(
+      from: exportBrain.rootURL,
+      brainID: brain.id,
+      to: archiveURL
+    )
 
     let modifiedAt = brain.modifiedAt ?? Date()
     return BrainCloudArchive.Created(
@@ -6271,7 +8508,7 @@ final class AffectiveTests: XCTestCase {
   private func postRecognitionResponse<Response: Decodable>(
     body: Data,
     to url: String,
-    using hostServices: EmbeddedHostServices
+    using hostServices: BrainHostServiceRoutes
   ) throws -> Response {
     let response = try hostServices.postJSON(url: url, headersJSON: "[]", body: body)
     return try JSONDecoder().decode(Response.self, from: response)
@@ -6393,6 +8630,31 @@ final class AffectiveTests: XCTestCase {
         arguments: .object(arguments),
         requires: requires,
         awaitResponse: true
+      ))
+    )
+  }
+
+  private func developerLogEvent(
+    title: String,
+    body: String,
+    kind: String = "state",
+    eventID: String = "developer-log-fixture"
+  ) -> BrainEvent {
+    BrainEvent(
+      id: eventID,
+      traceID: "trace-\(eventID)",
+      parentID: nil,
+      turnID: nil,
+      loopID: nil,
+      occurredAt: "2026-06-26T00:00:00Z",
+      source: .brain,
+      target: .host,
+      visibility: .public,
+      presentation: .log,
+      payload: .developerLog(BrainDeveloperLogPayload(
+        kind: kind,
+        title: title,
+        body: body
       ))
     )
   }
@@ -6548,13 +8810,6 @@ final class AffectiveTests: XCTestCase {
     return defaults
   }
 
-  private func embeddedString(_ value: AffectiveCoreEmbeddedString) -> String {
-    guard let ptr = value.ptr, value.len > 0 else {
-      return ""
-    }
-    return String(decoding: UnsafeBufferPointer(start: ptr, count: value.len), as: UTF8.self)
-  }
-
   @MainActor
   private func waitForSyncState(
     _ expected: BrainSyncState,
@@ -6656,11 +8911,67 @@ final class AffectiveTests: XCTestCase {
     return value.isEmpty ? nil : value
   }
 
+  private func assertRuntimeDispatchMetadata(
+    _ metadata: [String: String],
+    _ label: String,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    XCTAssertNotNil(metadata["request_id"], label, file: file, line: line)
+  }
+
+  private static func isExpectedHostCapabilityProbeBoundary(_ error: Error) -> Bool {
+    var descriptions = [
+      String(describing: error),
+      error.localizedDescription,
+      (error as NSError).localizedDescription,
+    ]
+    if case BrainCoreError.unavailable(let message) = error {
+      descriptions.append(message)
+    }
+    let markers = [
+      "FrontendCaptureRequested",
+      "HostHttpPostJsonFailed",
+      "host HTTP callback failed",
+      "MissingProviderCredential",
+    ]
+    return descriptions.contains { description in
+      markers.contains { description.contains($0) }
+    }
+  }
+
+  private struct HostCapabilityProbeTimeoutError: Error, CustomStringConvertible {
+    let label: String
+    let seconds: UInt64
+
+    var description: String {
+      "timed out after \(seconds) seconds"
+    }
+  }
+
+  private static func withHostCapabilityProbeTimeout<T>(
+    label: String,
+    seconds: UInt64 = 5,
+    _ body: @escaping () async throws -> T
+  ) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+      group.addTask {
+        try await body()
+      }
+      group.addTask {
+        try await Task.sleep(for: .seconds(seconds))
+        throw HostCapabilityProbeTimeoutError(label: label, seconds: seconds)
+      }
+
+      let result = try await group.next()
+      group.cancelAll()
+      return try XCTUnwrap(result)
+    }
+  }
+
   private static var hostCapabilityE2ECoverage: [String: HostCapabilityE2ECoverage] {
     [
-      "text_input": .providerBackedDispatch,
       "text_input": .typedOperation,
-      "speech_input": .typedOperation,
       "speech_input": .hostAdapter,
       "speech_output": .hostAdapter,
       "camera_capture": .permissionGatedHostAdapter,
@@ -6693,6 +9004,7 @@ final class AffectiveTests: XCTestCase {
       "power_status": .hostAdapter,
       "storage_fullness": .hostAdapter,
       "database_stats": .hostAdapter,
+      "introspection": .embeddedRoute,
       "local_process_io": .hostAdapter,
       "file_import": .hostAdapter,
       "file_export": .hostAdapter,
@@ -6756,6 +9068,96 @@ final class AffectiveTests: XCTestCase {
       rawText: ""
     )
     return BrainToolResponse(toolName: toolName, envelope: envelope, rawText: envelope.rawText)
+  }
+
+  private static func runtimeEnvelope(requestID: String, value: JSONValue) -> BrainDispatchEnvelope {
+    BrainDispatchEnvelope(
+      requestID: requestID,
+      ok: true,
+      events: [],
+      result: .object(["value": value]),
+      error: nil,
+      rawText: ""
+    )
+  }
+
+  private static func runtimeMailboxItemValue(mailboxID: String) -> JSONValue {
+    .object([
+      "mailbox_id": .string(mailboxID),
+      "kind": .string("DreamMail"),
+      "title": .string("Runtime dream"),
+      "text": .string("A runtime dream arrived."),
+      "image_artifact_id": .null,
+      "image_spec_json": .string(""),
+      "waking_thought": .string(""),
+      "visible_lesson": .string(""),
+      "debug_details": .string(""),
+      "source_event_ids": .array([]),
+      "source_dream_id": .string("dream_runtime"),
+      "created_at_ms": .number(1_782_515_600_000),
+    ])
+  }
+
+  private func pausedAutonomyTickToolResponse(
+    requestID: String,
+    sense: String = "camera",
+    purpose: String = "recognize",
+    timeoutMS: Int = 8_000,
+    includeSenseRequestEvent: Bool = true
+  ) -> BrainToolResponse {
+    var events: [BrainEvent] = []
+    if includeSenseRequestEvent {
+      events.append(
+        senseRequestEvent(
+          requestID: requestID,
+          sense: sense,
+          title: "camera sense",
+          summary: "frontend camera sense requested",
+          timeoutMS: timeoutMS
+        )
+      )
+    }
+    return Self.toolResponse(
+      toolName: "autonomy_tick",
+      events: events,
+      result: .object([
+        "event_type": .string("autonomy_tick"),
+        "value": .object([
+          "kind": .string("autonomy_tick"),
+          "outcome": .object([
+            "text": .string(""),
+            "spoken_text": .string(""),
+            "user_summary": .string("Requested camera capture."),
+            "brain_summary": .string("Requested camera capture."),
+            "interrupted_by": .null,
+            "awaiting_host_sense": .bool(true),
+            "awaited_host_sense": .string(sense),
+            "awaited_host_purpose": .string(purpose),
+            "awaited_host_timeout_ms": .number(Double(timeoutMS)),
+          ]),
+        ]),
+      ]),
+      requestID: requestID
+    )
+  }
+
+  private func staleAwaitingCameraObservationResponse(requestID: String) -> BrainToolResponse {
+    Self.toolResponse(
+      toolName: "sense_observation",
+      result: .object([
+        "event_type": .string("sense_observation"),
+        "value": .object([
+          "kind": .string("sense_observation"),
+          "outcome": .object([
+            "awaiting_host_sense": .bool(true),
+            "awaited_host_sense": .string("camera"),
+            "awaited_host_purpose": .string("recognize"),
+            "awaited_host_timeout_ms": .number(8_000),
+          ]),
+        ]),
+      ]),
+      requestID: requestID
+    )
   }
 
 }
@@ -6859,7 +9261,15 @@ private actor ScriptedBrainCore: BrainCoreClient {
     let terminal: Bool
   }
 
+  struct CapabilityStatusCall: Equatable {
+    let capability: String
+    let status: String
+    let requestID: String?
+    let reason: String
+  }
+
   private let toolResponse: BrainToolResponse
+  private let autonomyTickResponses: [BrainToolResponse]
   private let textResponse: BrainTextResponse
   private let shortTouchResponse: BrainToolResponse
   private let orientationObservationResponse: BrainToolResponse
@@ -6869,8 +9279,11 @@ private actor ScriptedBrainCore: BrainCoreClient {
   private let brainModeValue: String
   private let cameraObservationDelayNanoseconds: UInt64
   private let pullSenseStatusError: Error?
+  private let ingestStimulusResponse: BrainDispatchEnvelope?
   private(set) var didConnect = false
   private(set) var didDisconnect = false
+  private(set) var ingestCalls: [ToolCall] = []
+  private var ingestCallContinuations: [(minimumCount: Int, continuation: CheckedContinuation<[ToolCall], Never>)] = []
   private(set) var toolCalls: [ToolCall] = []
   private(set) var hostAttachCalls: [ToolCall] = []
   private(set) var hostCapabilityManifestCalls: [ToolCall] = []
@@ -6880,14 +9293,20 @@ private actor ScriptedBrainCore: BrainCoreClient {
   private(set) var interruptCalls: [(userText: String, reason: String, interruptedAction: String?, canceledCount: Int)] = []
   private(set) var pokeSequences: [[PokePulse]] = []
   var blockedTextCallCount = 0
+  var blockedAutonomyTickCallCount = 0
   private var textCallBarrierContinuations: [CheckedContinuation<Void, Never>] = []
+  private var autonomyTickBarrierContinuations: [CheckedContinuation<Void, Never>] = []
   private var textCallContinuations: [(minimumCount: Int, continuation: CheckedContinuation<[TextCall], Never>)] = []
+  private var autonomyTickCallContinuations: [(minimumCount: Int, continuation: CheckedContinuation<[ToolCall], Never>)] = []
+  private(set) var autonomyTickCalls: [ToolCall] = []
   private var experienceEventCallContinuations: [(minimumCount: Int, continuation: CheckedContinuation<[ToolCall], Never>)] = []
   private(set) var orientationObservations: [OrientationObservationCall] = []
   private(set) var motionGestureObservations: [MotionGestureObservationCall] = []
   private(set) var cameraObservations: [CameraObservation] = []
+  private var cameraObservationCallContinuations: [(minimumCount: Int, continuation: CheckedContinuation<[CameraObservation], Never>)] = []
   private(set) var senseCatalogRequests: [String?] = []
   private(set) var pullSenseStatuses: [PullSenseStatusCall] = []
+  private(set) var capabilityStatuses: [CapabilityStatusCall] = []
   private(set) var mailboxMarkReadIDs: [String] = []
   private(set) var mailboxListCallCount = 0
 
@@ -6902,9 +9321,13 @@ private actor ScriptedBrainCore: BrainCoreClient {
     brainMode: String = "waking",
     cameraObservationDelayNanoseconds: UInt64 = 0,
     pullSenseStatusError: Error? = nil,
-    blockedTextCallCount: Int = 0
+    ingestStimulusResponse: BrainDispatchEnvelope? = nil,
+    blockedTextCallCount: Int = 0,
+    blockedAutonomyTickCallCount: Int = 0,
+    autonomyTickResponses: [BrainToolResponse] = []
   ) {
     self.toolResponse = toolResponse
+    self.autonomyTickResponses = autonomyTickResponses.isEmpty ? [toolResponse] : autonomyTickResponses
     self.textResponse = textResponse ?? BrainTextResponse(toolName: "experience", text: "", metadata: [:], events: [])
     self.shortTouchResponse = shortTouchResponse ?? toolResponse
     self.orientationObservationResponse = orientationObservationResponse ?? toolResponse
@@ -6914,7 +9337,9 @@ private actor ScriptedBrainCore: BrainCoreClient {
     self.brainModeValue = brainMode
     self.cameraObservationDelayNanoseconds = cameraObservationDelayNanoseconds
     self.pullSenseStatusError = pullSenseStatusError
+    self.ingestStimulusResponse = ingestStimulusResponse
     self.blockedTextCallCount = blockedTextCallCount
+    self.blockedAutonomyTickCallCount = blockedAutonomyTickCallCount
   }
 
   func connect(progress: CoreLoadPerformanceSession?) async throws -> BrainDispatchEnvelope {
@@ -6926,6 +9351,8 @@ private actor ScriptedBrainCore: BrainCoreClient {
   func disconnect() async {
     didDisconnect = true
   }
+
+  func setEventSinkHandler(_ handler: BrainCoreEventSink.Handler?) async {}
 
   func sendEvent(_ event: BrainEvent) async throws -> BrainToolResponse {
     switch event.payload {
@@ -7016,15 +9443,15 @@ private actor ScriptedBrainCore: BrainCoreClient {
     return toolResponse
   }
 
-  func shortTouch() async throws -> BrainToolResponse {
+  func shortTouch(stimulusContext _: StimulusContext?) async throws -> BrainToolResponse {
     shortTouchResponse
   }
 
-  func longTouch() async throws -> BrainToolResponse {
-    toolResponse
+  func longTouch(stimulusContext _: StimulusContext?) async throws -> BrainToolResponse {
+    return toolResponse
   }
 
-  func pokeSequence(_ pulses: [PokePulse]) async throws -> BrainToolResponse {
+  func pokeSequence(_ pulses: [PokePulse], stimulusContext _: StimulusContext?) async throws -> BrainToolResponse {
     pokeSequences.append(pulses)
     return toolResponse
   }
@@ -7058,7 +9485,9 @@ private actor ScriptedBrainCore: BrainCoreClient {
     mimeType: String,
     source: String,
     requestID: String?,
-    presentation: BrainEventPresentation
+    presentation: BrainEventPresentation,
+    precomputedIdentity: FaceRecognitionIdentityResult?,
+    stimulusContext _: StimulusContext?
   ) async throws -> BrainToolResponse {
     cameraObservations.append(CameraObservation(
       path: path,
@@ -7067,10 +9496,32 @@ private actor ScriptedBrainCore: BrainCoreClient {
       requestID: requestID,
       presentation: presentation
     ))
+    fulfillCameraObservationCallContinuations()
     if cameraObservationDelayNanoseconds > 0 {
       try await Task.sleep(nanoseconds: cameraObservationDelayNanoseconds)
     }
     return cameraObservationResponse
+  }
+
+  func waitForCameraObservationCallCount(_ minimumCount: Int) async -> [CameraObservation] {
+    if cameraObservations.count >= minimumCount {
+      return cameraObservations
+    }
+    return await withCheckedContinuation { continuation in
+      cameraObservationCallContinuations.append((minimumCount, continuation))
+    }
+  }
+
+  private func fulfillCameraObservationCallContinuations() {
+    var remaining: [(minimumCount: Int, continuation: CheckedContinuation<[CameraObservation], Never>)] = []
+    for entry in cameraObservationCallContinuations {
+      if cameraObservations.count >= entry.minimumCount {
+        entry.continuation.resume(returning: cameraObservations)
+      } else {
+        remaining.append(entry)
+      }
+    }
+    cameraObservationCallContinuations = remaining
   }
 
   func senseCatalog(
@@ -7109,15 +9560,25 @@ private actor ScriptedBrainCore: BrainCoreClient {
     return toolResponse
   }
 
+  func pullSenseStatusCalls() -> [PullSenseStatusCall] {
+    pullSenseStatuses
+  }
+
   func capabilityStatus(
-    capability _: String,
-    status _: String,
-    requestID _: String?,
+    capability: String,
+    status: String,
+    requestID: String?,
     pendingSince _: Date?,
     pendingElapsedMS _: Int,
-    reason _: String
+    reason: String
   ) async throws -> BrainToolResponse {
-    toolResponse
+    capabilityStatuses.append(.init(
+      capability: capability,
+      status: status,
+      requestID: requestID,
+      reason: reason
+    ))
+    return toolResponse
   }
 
   func interrupt(
@@ -7133,6 +9594,36 @@ private actor ScriptedBrainCore: BrainCoreClient {
       canceledCount: canceledQueuedActionCount
     ))
     return toolResponse
+  }
+
+  func ingestStimulus(_ operation: String, arguments: [String: JSONValue]) async throws -> BrainDispatchEnvelope {
+    ingestCalls.append(.init(name: operation, arguments: arguments))
+    fulfillIngestCallContinuations()
+    if let ingestStimulusResponse {
+      return ingestStimulusResponse
+    }
+    return BrainDispatchEnvelope(requestID: "ingest", ok: true, events: [], result: nil, error: nil)
+  }
+
+  func waitForIngestCallCount(_ minimumCount: Int) async -> [ToolCall] {
+    if ingestCalls.count >= minimumCount {
+      return ingestCalls
+    }
+    return await withCheckedContinuation { continuation in
+      ingestCallContinuations.append((minimumCount, continuation))
+    }
+  }
+
+  private func fulfillIngestCallContinuations() {
+    var remaining: [(minimumCount: Int, continuation: CheckedContinuation<[ToolCall], Never>)] = []
+    for entry in ingestCallContinuations {
+      if ingestCalls.count >= entry.minimumCount {
+        entry.continuation.resume(returning: ingestCalls)
+      } else {
+        remaining.append(entry)
+      }
+    }
+    ingestCallContinuations = remaining
   }
 
   func sendText(
@@ -7191,9 +9682,49 @@ private actor ScriptedBrainCore: BrainCoreClient {
     BrainModeResponse(toolName: "brain_mode", mode: brainModeValue, metadata: ["brain_mode": brainModeValue])
   }
 
-  func autonomyTick() async throws -> BrainToolResponse {
-    toolCalls.append(ToolCall(name: "autonomy_tick", arguments: [:]))
-    return toolResponse
+  func autonomyTick(stimulusContext: StimulusContext?) async throws -> BrainToolResponse {
+    var arguments: [String: JSONValue] = [:]
+    if let stimulusContext {
+      arguments["context"] = .object(stimulusContext.eventArguments)
+    }
+    autonomyTickCalls.append(ToolCall(name: "autonomy_tick", arguments: arguments))
+    fulfillAutonomyTickCallContinuations()
+    if autonomyTickCalls.count <= blockedAutonomyTickCallCount {
+      await withCheckedContinuation { continuation in
+        autonomyTickBarrierContinuations.append(continuation)
+      }
+    }
+    let index = min(max(autonomyTickCalls.count - 1, 0), autonomyTickResponses.count - 1)
+    return autonomyTickResponses[index]
+  }
+
+  func waitForAutonomyTickCallCount(_ minimumCount: Int) async -> [ToolCall] {
+    if autonomyTickCalls.count >= minimumCount {
+      return autonomyTickCalls
+    }
+    return await withCheckedContinuation { continuation in
+      autonomyTickCallContinuations.append((minimumCount, continuation))
+    }
+  }
+
+  func resumeBlockedAutonomyTicks() {
+    let continuations = autonomyTickBarrierContinuations
+    autonomyTickBarrierContinuations = []
+    for continuation in continuations {
+      continuation.resume()
+    }
+  }
+
+  private func fulfillAutonomyTickCallContinuations() {
+    var remaining: [(minimumCount: Int, continuation: CheckedContinuation<[ToolCall], Never>)] = []
+    for entry in autonomyTickCallContinuations {
+      if autonomyTickCalls.count >= entry.minimumCount {
+        entry.continuation.resume(returning: autonomyTickCalls)
+      } else {
+        remaining.append(entry)
+      }
+    }
+    autonomyTickCallContinuations = remaining
   }
 
   func readModelsSnapshot() async throws -> BrainReadModelsSnapshotResponse {

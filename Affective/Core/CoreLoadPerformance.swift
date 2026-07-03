@@ -16,7 +16,7 @@ struct CoreLoadMetricsReport: Sendable, Equatable {
   let phases: [CoreLoadPhaseMetric]
   let totalMs: Int
 
-  var summaryText: String {
+  nonisolated var summaryText: String {
     var lines = ["Core load \(totalMs)ms total"]
     for phase in phases {
       lines.append("  \(phase.label) \(phase.durationMs)ms")
@@ -24,7 +24,7 @@ struct CoreLoadMetricsReport: Sendable, Equatable {
     return lines.joined(separator: "\n")
   }
 
-  var eventLogBody: String {
+  nonisolated var eventLogBody: String {
     phases.map { "\($0.label): \($0.durationMs)ms" }.joined(separator: ", ")
       + " (total \(totalMs)ms)"
   }

@@ -23,6 +23,10 @@ nonisolated struct SenseObservationTimeoutError: LocalizedError, Equatable {
     }
 }
 
+nonisolated enum PullSenseHostTimeout {
+    static let defaultMS = 8_000
+}
+
 actor PullSenseFulfillmentRace {
     private var isResolved = false
 
@@ -128,6 +132,15 @@ extension AffectiveViewModel {
         statusText = "Affective is speaking"
         let preferredVoice = runtimeOptionStringValue(for: Self.speechVoiceOptionKey)
         appendEventLog(kind: .state, title: "speech output", body: "apple_speech=true", metadata: ["voice": preferredVoice ?? "system"])
+        if let speechSpeakOverride {
+            speechSpeakOverride(text, preferredVoice) { [weak self] in
+                guard let self else { return }
+                self.markAwaitingSocialResponse()
+                self.canSend = true
+                self.statusText = "Ready"
+            }
+            return
+        }
         speechSpeaker.speak(text, preferredVoiceName: preferredVoice) { [weak self] in
             guard let self else { return }
             self.markAwaitingSocialResponse()
@@ -183,6 +196,22 @@ extension AffectiveViewModel {
         statusText = "Affective is speaking"
         let preferredVoice = runtimeOptionStringValue(for: Self.speechVoiceOptionKey)
         appendEventLog(kind: .state, title: "speech output", body: "apple_speech=true", metadata: ["voice": preferredVoice ?? "system"])
+        if let speechSpeakOverride {
+            await withCheckedContinuation { continuation in
+                speechSpeakOverride(text, preferredVoice) { [weak self] in
+                    guard let self else {
+                        continuation.resume()
+                        return
+                    }
+                    self.setHostPipelineHold(.none)
+                    self.markAwaitingSocialResponse()
+                    self.refreshUserSendAvailability()
+                    self.statusText = "Ready"
+                    continuation.resume()
+                }
+            }
+            return
+        }
         await withCheckedContinuation { continuation in
             speechSpeaker.speak(text, preferredVoiceName: preferredVoice) { [weak self] in
                 guard let self else {
@@ -204,6 +233,26 @@ extension AffectiveViewModel {
         observationResponsePresentation: BrainEventPresentation = .internalOnly
     ) async {
         let requestID = requestID ?? pullSenseRequestID(for: event)
+        guard cameraCaptureIsEnabled else {
+            statusText = "Camera sense paused"
+            await sendCapabilityStatus(
+                capability: "camera",
+                status: "disabled",
+                requestID: requestID,
+                reason: "Camera capture disabled by host"
+            )
+            await sendPullSenseStatus(
+                sense: "camera",
+                status: .unavailable,
+                requestID: requestID,
+                timeoutMS: event.timeoutMS,
+                reason: "Camera capture disabled by host",
+                availability: "disabled",
+                permissionState: currentPullSenseDescriptor(for: "camera")?.permissionState,
+                terminal: true
+            )
+            return
+        }
         if let pendingCameraRequestID {
             if !didLogCoalescedCameraRequest {
                 appendEventLog(
@@ -222,7 +271,8 @@ extension AffectiveViewModel {
                 reason: "Camera pull sense request already pending for \(pendingCameraRequestID).",
                 availability: currentPullSenseDescriptor(for: "camera")?.availability,
                 permissionState: currentPullSenseDescriptor(for: "camera")?.permissionState,
-                terminal: true
+                terminal: true,
+                updatesAwaitingHostSenseMarker: false
             )
             return
         }
@@ -258,12 +308,10 @@ extension AffectiveViewModel {
 
         do {
             phase = "capture"
-            setHostPipelineHold(.cameraCapture)
             let data = try await captureWebcamPhotoData()
             failureMetadata["byte_count"] = "\(data.count)"
             phase = "decode"
             let imageInfo = try validateCapturedImageData(data)
-            setHostPipelineHold(.none)
             phase = "store"
             let storedImage = try storeChatImage(data: data, suggestedName: "frontend-camera-\(UUID().uuidString)")
             guard closePullSenseForObservationDispatch(requestID: requestID) else { return }
@@ -283,14 +331,32 @@ extension AffectiveViewModel {
                 summary: "Camera captured an image: \(imageInfo.width)x\(imageInfo.height).",
                 metadata: metadata
             )
+            phase = "recognize"
+            let precomputedIdentity = await precomputeCameraIdentity(for: storedImage.url.path)
             phase = "dispatch_sense_observation"
-            let response = try await brainCore.cameraObservation(
-                path: storedImage.url.path,
-                mimeType: storedImage.mimeType,
-                source: "affective_requested_capture",
-                requestID: requestID,
-                presentation: observationResponsePresentation
-            )
+            let stimulusContext = currentStimulusContext(kind: "camera_observation")
+            let response: BrainToolResponse
+            if isAwaitingChatResponse || currentHostPipelineActionIsAwaitingChatResponse {
+                response = try await brainCore.cameraObservation(
+                    path: storedImage.url.path,
+                    mimeType: storedImage.mimeType,
+                    source: "affective_requested_capture",
+                    requestID: requestID,
+                    presentation: .internalOnly,
+                    precomputedIdentity: precomputedIdentity,
+                    stimulusContext: stimulusContext
+                )
+            } else {
+                response = try await brainCore.cameraObservation(
+                    path: storedImage.url.path,
+                    mimeType: storedImage.mimeType,
+                    source: "affective_requested_capture",
+                    requestID: requestID,
+                    presentation: observationResponsePresentation,
+                    precomputedIdentity: precomputedIdentity,
+                    stimulusContext: stimulusContext
+                )
+            }
             let responseText = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
             appendEventLog(
                 kind: .result,
@@ -302,8 +368,10 @@ extension AffectiveViewModel {
                 response.events,
                 mirrorChatMessages: observationResponsePresentation.mirrorsToChat,
                 speak: response.shouldSpeak,
-                handleHostRequests: false
+                context: .senseObservation(requestID: requestID)
             )
+            noteBrainResponseMetadata(response.metadata)
+            noteCoreHostSenseWaitCleared()
             _ = eventResult
             if observationResponsePresentation.mirrorsToChat, !responseText.isEmpty {
                 appendEventLog(
@@ -314,7 +382,6 @@ extension AffectiveViewModel {
                 )
             }
         } catch {
-            setHostPipelineHold(.none)
             guard !isPullSenseRequestClosed(requestID) else { return }
             statusText = "Camera sense failed"
             failureMetadata["phase"] = phase
@@ -509,8 +576,10 @@ extension AffectiveViewModel {
                 response.events,
                 mirrorChatMessages: observationResponsePresentation.mirrorsToChat,
                 speak: response.shouldSpeak,
-                handleHostRequests: false
+                context: .senseObservation(requestID: requestID)
             )
+            noteBrainResponseMetadata(response.metadata)
+            noteCoreHostSenseWaitCleared()
             _ = eventResult
             statusText = "Orientation sensed"
         } catch {
@@ -581,9 +650,11 @@ extension AffectiveViewModel {
             PullSenseDescriptor(
                 senseID: "camera",
                 direction: .pull,
-                availability: CoreConfigStorage.currentCameraCapabilityStatus(),
-                permissionState: CoreConfigStorage.currentCameraCapabilityStatus(),
-                statusReason: "Host camera permission and hardware status."
+                availability: currentHostCameraCapabilityStatus(),
+                permissionState: currentHostCameraPermissionState(),
+                statusReason: cameraCaptureIsEnabled
+                    ? "Host camera permission and hardware status."
+                    : "Camera capture disabled by host."
             ),
             PullSenseDescriptor(
                 senseID: "orientation",
@@ -611,6 +682,14 @@ extension AffectiveViewModel {
 
     func currentPullSenseDescriptor(for sense: String) -> PullSenseDescriptor? {
         pullSenseCatalog().first { $0.senseID == sense }
+    }
+
+    func currentHostCameraCapabilityStatus() -> String {
+        cameraCaptureIsEnabled ? CoreConfigStorage.currentCameraCapabilityStatus() : "disabled"
+    }
+
+    func currentHostCameraPermissionState() -> String {
+        cameraCaptureIsEnabled ? CoreConfigStorage.currentCameraCapabilityStatus() : "disabled"
     }
 
     func currentHostOrientationCapabilityStatus() -> String {
@@ -676,13 +755,23 @@ extension AffectiveViewModel {
         )
     }
 
+    func effectivePullSenseTimeoutMS(for event: BrainEvent) -> Int? {
+        if let timeoutMS = event.timeoutMS, timeoutMS > 0 {
+            return timeoutMS
+        }
+        if let markerTimeout = coreAwaitingHostSenseMarker?.timeoutMS, markerTimeout > 0 {
+            return markerTimeout
+        }
+        return PullSenseHostTimeout.defaultMS
+    }
+
     func awaitPullSenseFulfillment(
         event: BrainEvent,
         sense: String,
         requestID: String,
         operation: @escaping @Sendable () async -> Void
     ) async {
-        guard event.awaitResponse == true, let timeoutMS = event.timeoutMS, timeoutMS > 0 else {
+        guard let timeoutMS = effectivePullSenseTimeoutMS(for: event) else {
             await operation()
             return
         }
@@ -743,6 +832,9 @@ extension AffectiveViewModel {
         if pendingOrientationRequestID == requestID {
             pendingOrientationRequestID = nil
         }
+        if sense == "camera" {
+            cancelActiveCameraCapture()
+        }
         if sense == "orientation", orientationPermissionContinuation != nil {
             orientationPermissionPrompt = nil
             orientationPermissionContinuation?.resume(returning: .unavailable)
@@ -751,27 +843,91 @@ extension AffectiveViewModel {
         setHostPipelineHold(.none)
     }
 
-    func abortSupersededPullSenseFulfillment() {
-        if let requestID = pendingCameraRequestID {
-            closedPullSenseRequestIDs.insert(requestID)
-            pendingCameraRequestID = nil
-        }
-        if let requestID = pendingOrientationRequestID {
-            closedPullSenseRequestIDs.insert(requestID)
-            pendingOrientationRequestID = nil
-        }
-        if orientationPermissionContinuation != nil {
-            orientationPermissionPrompt = nil
-            orientationPermissionContinuation?.resume(returning: .unavailable)
-            orientationPermissionContinuation = nil
-        }
-        hostPipelineQueue.removeAll { action in
-            if case .pullSenseRequest = action {
-                return true
+    func cancelActiveCameraCapture() {
+        activeCameraCaptureCancel?()
+        activeCameraCaptureCancel = nil
+    }
+
+    func pullSenseKey(for event: BrainEvent) -> String {
+        let sense = (event.sense ?? event.senseID ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return sense.isEmpty ? "unknown" : sense
+    }
+
+    func scheduleAsyncPullSenseFulfillment(
+        event: BrainEvent,
+        observationResponsePresentation: BrainEventPresentation
+    ) {
+        let sense = pullSenseKey(for: event)
+        let requestID = pullSenseRequestID(for: event)
+        guard !isPullSenseRequestClosed(requestID) else { return }
+
+        if let activeRequestID = inFlightPullSenseRequestIDs[sense] {
+            if activeRequestID == requestID {
+                return
             }
-            return false
+            if coalescedPullSenseLoggedForActiveRequest[sense] != activeRequestID {
+                coalescedPullSenseLoggedForActiveRequest[sense] = activeRequestID
+                appendEventLog(
+                    kind: .state,
+                    title: "pull sense coalesced",
+                    body: "\(sense) request already in flight for \(activeRequestID).",
+                    metadata: [
+                        "sense": sense,
+                        "active_request_id": activeRequestID,
+                        "request_id": requestID,
+                    ]
+                )
+            }
+            Task { @MainActor [weak self] in
+                await self?.sendPullSenseStatus(
+                    sense: sense,
+                    status: .busy,
+                    requestID: requestID,
+                    timeoutMS: event.timeoutMS,
+                    reason: "\(sense) pull sense request already in flight for \(activeRequestID).",
+                    availability: self?.currentPullSenseDescriptor(for: sense)?.availability,
+                    permissionState: self?.currentPullSenseDescriptor(for: sense)?.permissionState,
+                    terminal: true,
+                    updatesAwaitingHostSenseMarker: false
+                )
+            }
+            return
         }
-        setHostPipelineHold(.none)
+
+        inFlightPullSenseRequestIDs[sense] = requestID
+        coalescedPullSenseLoggedForActiveRequest.removeValue(forKey: sense)
+        noteHostPipelineProgress()
+        noteCoreHostSenseWaitCleared()
+        activePullSenseFulfillmentCount += 1
+        notePullSenseFulfillmentStarted()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.inFlightPullSenseRequestIDs[sense] == requestID {
+                    self.inFlightPullSenseRequestIDs.removeValue(forKey: sense)
+                    self.coalescedPullSenseLoggedForActiveRequest.removeValue(forKey: sense)
+                }
+                self.activePullSenseFulfillmentCount -= 1
+                self.notePullSenseFulfillmentFinished()
+            }
+            await self.sendPullSenseStatus(
+                sense: sense,
+                status: .fulfilled,
+                requestID: requestID,
+                timeoutMS: event.timeoutMS,
+                reason: "\(sense) pull sense request accepted by host sense lane.",
+                availability: self.currentPullSenseDescriptor(for: sense)?.availability,
+                permissionState: self.currentPullSenseDescriptor(for: sense)?.permissionState,
+                terminal: false,
+                updatesAwaitingHostSenseMarker: false
+            )
+            await self.fulfillSenseRequest(
+                event,
+                observationResponsePresentation: observationResponsePresentation
+            )
+        }
     }
 
     func isPullSenseRequestClosed(_ requestID: String?) -> Bool {
@@ -795,7 +951,8 @@ extension AffectiveViewModel {
         reason: String,
         availability: String?,
         permissionState: String?,
-        terminal: Bool
+        terminal: Bool,
+        updatesAwaitingHostSenseMarker: Bool = true
     ) async -> Bool {
         let terminalRequestID = terminal == true
             ? requestID?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -825,8 +982,13 @@ extension AffectiveViewModel {
                 permissionState: permissionState,
                 terminal: terminal
             )
+            let logKind: LogKind = {
+                if status == .fulfilled || !terminal { return .state }
+                if status == .busy, !updatesAwaitingHostSenseMarker { return .state }
+                return .error
+            }()
             appendEventLog(
-                kind: status == .fulfilled || !terminal ? .state : .error,
+                kind: logKind,
                 title: "sense status",
                 body: "\(sense)=\(status.rawValue)",
                 metadata: response.metadata
@@ -834,6 +996,11 @@ extension AffectiveViewModel {
             if let terminalRequestID, !terminalRequestID.isEmpty {
                 terminalPullSenseRequestIDs.insert(terminalRequestID)
             }
+            if terminal, updatesAwaitingHostSenseMarker {
+                noteCoreHostSenseWaitCleared()
+                noteBrainResponseMetadata(response.metadata)
+            }
+            noteHostPipelineProgress()
             return true
         } catch {
             if let terminalRequestID {
@@ -949,6 +1116,47 @@ extension AffectiveViewModel {
         }
     }
 
+    func advertiseCameraCapabilityConfiguration(requestID: String? = nil) async {
+        let cameraStatus = currentHostCameraCapabilityStatus()
+        let reason = cameraCaptureIsEnabled
+            ? "Host camera permission and hardware status."
+            : "Camera capture disabled by host."
+        await sendCapabilityStatus(
+            capability: "camera",
+            status: cameraStatus,
+            requestID: requestID,
+            reason: reason
+        )
+        await sendCapabilityStatus(
+            capability: "camera_capture",
+            status: cameraStatus,
+            requestID: requestID,
+            reason: reason
+        )
+
+        let dependentStatus = cameraCaptureIsEnabled ? "available" : "disabled"
+        for capability in cameraDependentCapabilityIDs {
+            await sendCapabilityStatus(
+                capability: capability,
+                status: dependentStatus,
+                requestID: requestID,
+                reason: cameraCaptureIsEnabled
+                    ? "Camera-dependent host capability available."
+                    : "Camera-dependent host capability disabled because camera capture is off."
+            )
+        }
+    }
+
+    var cameraDependentCapabilityIDs: [String] {
+        [
+            "provider_vision_completion",
+            "face_identification",
+            "identity_recognition",
+            "face_enrollment",
+            "face_picture_update",
+        ]
+    }
+
     func recordOrientationPermissionStatus(_ status: HostOrientationPermissionStatus, requestID: String?) async {
         appendEventLog(
             kind: status == .available ? .state : .error,
@@ -1023,12 +1231,52 @@ extension AffectiveViewModel {
         #endif
     }
 
+    func precomputeCameraIdentity(for imagePath: String) async -> FaceRecognitionIdentityResult? {
+        guard biometricPolicy.canRecognize, FaceRecognitionService.bundledModelsAvailable else {
+            return nil
+        }
+        let thresholds = faceRecognitionThresholds()
+        let request = FaceRecognitionIdentifyRequest(
+            imagePath: imagePath,
+            memoryPath: brain.memoryDatabaseURL.path,
+            embeddingsDir: brain.faceEmbeddingsURL.path,
+            detectorModel: nil,
+            recognizerModel: nil,
+            knownThreshold: thresholds.known,
+            uncertainThreshold: thresholds.uncertain
+        )
+        return await Task.detached(priority: .userInitiated) {
+            let service = FaceRecognitionService()
+            guard let result = try? service.identify(request) else { return nil }
+            BrainHostServiceRoutes.primeIdentifyCache(imagePath: imagePath, result: result)
+            return result
+        }.value
+    }
+
+    func faceRecognitionThresholds() -> (known: Float, uncertain: Float) {
+        func floatValue(for key: String, default defaultValue: Float) -> Float {
+            guard let raw = runtimeOptionStringValue(for: key),
+                  let value = Float(raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                return defaultValue
+            }
+            return value
+        }
+        return (
+            floatValue(for: "known_threshold", default: 0.85),
+            floatValue(for: "uncertain_threshold", default: 0.60)
+        )
+    }
+
     func captureWebcamPhotoData() async throws -> Data {
         #if canImport(AVFoundation)
         var lastError: Error?
         let cameraDeviceID = selectedCameraDeviceIDForCapture()
-        let capturePhotoData = cameraPhotoCaptureOverride ?? {
-            try await CameraPhotoCaptureSession.capturePhotoDataWithManagedLifetime(preferredDeviceUniqueID: cameraDeviceID)
+        let capturePhotoData = cameraPhotoCaptureOverride ?? { [weak self] in
+            let captureSession = CameraPhotoCaptureSession()
+            captureSession.preferredDeviceUniqueID = cameraDeviceID
+            self?.activeCameraCaptureCancel = { captureSession.cancel() }
+            defer { self?.activeCameraCaptureCancel = nil }
+            return try await captureSession.capturePhotoData()
         }
         for attempt in 0..<2 {
             do {
@@ -1224,7 +1472,7 @@ final class CameraPhotoCaptureSession: NSObject, AVCaptureVideoDataOutputSampleB
         return try await captureSession.capturePhotoData()
     }
 
-    private var preferredDeviceUniqueID: String?
+    fileprivate var preferredDeviceUniqueID: String?
 
     func capturePhotoData() async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
@@ -1232,6 +1480,10 @@ final class CameraPhotoCaptureSession: NSObject, AVCaptureVideoDataOutputSampleB
                 startCapture(continuation: continuation)
             }
         }
+    }
+
+    func cancel() {
+        finish(with: .failure(CameraCaptureError.timedOut))
     }
 
     private func startCapture(continuation: CheckedContinuation<Data, Error>) {
@@ -1414,7 +1666,7 @@ final class CameraPhotoCaptureSession: NSObject, AVCapturePhotoCaptureDelegate {
         return try await captureSession.capturePhotoData()
     }
 
-    private var preferredDeviceUniqueID: String?
+    fileprivate var preferredDeviceUniqueID: String?
 
     func capturePhotoData() async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
@@ -1422,6 +1674,10 @@ final class CameraPhotoCaptureSession: NSObject, AVCapturePhotoCaptureDelegate {
                 startCapture(continuation: continuation)
             }
         }
+    }
+
+    func cancel() {
+        finish(with: .failure(CameraCaptureError.timedOut))
     }
 
     private func startCapture(continuation: CheckedContinuation<Data, Error>) {

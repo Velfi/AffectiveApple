@@ -72,6 +72,7 @@ public struct LlmTesterScenarioResult {
     public let semanticPassed: Bool?
     public let semanticMessage: String?
     public let errorMessage: String?
+    public let imageDataURL: String?
 
     public init(
         scenario: LlmTesterScenario,
@@ -84,7 +85,8 @@ public struct LlmTesterScenarioResult {
         jsonValid: Bool,
         semanticPassed: Bool? = nil,
         semanticMessage: String? = nil,
-        errorMessage: String? = nil
+        errorMessage: String? = nil,
+        imageDataURL: String? = nil
     ) {
         self.scenario = scenario
         self.combinedPrompt = combinedPrompt
@@ -97,6 +99,7 @@ public struct LlmTesterScenarioResult {
         self.semanticPassed = semanticPassed
         self.semanticMessage = semanticMessage
         self.errorMessage = errorMessage
+        self.imageDataURL = imageDataURL
     }
 }
 
@@ -143,8 +146,20 @@ public enum LlmTesterError: Error, CustomStringConvertible {
 }
 
 public enum LlmTesterOptions {
-    public static func parse(_ arguments: [String]) throws -> (manifestPath: String, outputPath: String, provider: String) {
+    public struct Parsed {
+        public let manifestPath: String?
+        public let snapshotPath: String?
+        public let baselinePath: String?
+        public let outputPath: String
+        public let provider: String
+
+        public var runsSnapshotReport: Bool { snapshotPath != nil }
+    }
+
+    public static func parse(_ arguments: [String]) throws -> Parsed {
         var manifestPath: String?
+        var snapshotPath: String?
+        var baselinePath: String?
         var outputPath = defaultOutputPath()
         var provider = "random"
 
@@ -158,6 +173,18 @@ public enum LlmTesterOptions {
                     throw LlmTesterError.invalidArguments("Missing value for --manifest.")
                 }
                 manifestPath = arguments[index]
+            case "--snapshot":
+                index += 1
+                guard index < arguments.count else {
+                    throw LlmTesterError.invalidArguments("Missing value for --snapshot.")
+                }
+                snapshotPath = arguments[index]
+            case "--baseline":
+                index += 1
+                guard index < arguments.count else {
+                    throw LlmTesterError.invalidArguments("Missing value for --baseline.")
+                }
+                baselinePath = arguments[index]
             case "--output":
                 index += 1
                 guard index < arguments.count else {
@@ -182,10 +209,22 @@ public enum LlmTesterOptions {
             index += 1
         }
 
-        guard let manifestPath else {
+        if manifestPath != nil, snapshotPath != nil {
+            throw LlmTesterError.invalidArguments("Use either --manifest or --snapshot, not both.")
+        }
+        if baselinePath != nil, snapshotPath == nil {
+            throw LlmTesterError.invalidArguments("--baseline can only be used with --snapshot.")
+        }
+        guard manifestPath != nil || snapshotPath != nil else {
             throw LlmTesterError.missingManifest
         }
-        return (manifestPath, outputPath, provider)
+        return Parsed(
+            manifestPath: manifestPath,
+            snapshotPath: snapshotPath,
+            baselinePath: baselinePath,
+            outputPath: outputPath,
+            provider: provider
+        )
     }
 
     public static func defaultOutputPath() -> String {
@@ -198,9 +237,12 @@ public enum LlmTesterOptions {
     public static func printUsage() {
         print(
             """
-            Usage: LlmTester --manifest PATH [--output PATH] [--provider openai|anthropic|google|local|random]
+            Usage:
+              LlmTester --manifest PATH [--output PATH] [--provider openai|anthropic|google|local|random]
+              LlmTester --snapshot PATH [--baseline PATH] [--output PATH]
 
             Runs live host LLM completions for every scenario in the manifest and writes an HTML report.
+            Renders structured E2E snapshot JSON as a flow report when --snapshot is used.
             """
         )
     }

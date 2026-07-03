@@ -17,7 +17,9 @@ HEADER_ROOT="${DERIVED_FILE_DIR}/AffectiveCore/include"
 STAGE_ROOT="${DERIVED_FILE_DIR}/AffectiveCore/stage/${PLATFORM_NAME}"
 ZIG_CACHE_ROOT="${DERIVED_FILE_DIR}/AffectiveCore/zig-cache/${PLATFORM_NAME}"
 ZIG_GLOBAL_CACHE_ROOT="${DERIVED_FILE_DIR}/AffectiveCore/zig-global-cache"
-OUTPUT_LIB="${OUTPUT_ROOT}/libaffective-core-embedded.a"
+OUTPUT_LIB="${OUTPUT_ROOT}/libaffective-core-session.a"
+OUTPUT_EXE="${OUTPUT_ROOT}/affective-core-session"
+SESSION_HEADER="${AFFECTIVE_CORE_ROOT}/include/affective_core_session.h"
 
 if ! command -v "${ZIG}" >/dev/null 2>&1; then
     if [ -x /opt/homebrew/bin/zig ]; then
@@ -31,13 +33,18 @@ if ! command -v "${ZIG}" >/dev/null 2>&1; then
 fi
 
 mkdir -p "${OUTPUT_ROOT}" "${HEADER_ROOT}" "${STAGE_ROOT}" "${ZIG_CACHE_ROOT}" "${ZIG_GLOBAL_CACHE_ROOT}"
-cp "${AFFECTIVE_CORE_ROOT}/include/affective_core_embedded.h" "${HEADER_ROOT}/affective_core_embedded.h"
-if ! grep -q "AffectiveCoreEmbeddedHostServices" "${HEADER_ROOT}/affective_core_embedded.h"; then
-    echo "error: AffectiveCore header is missing host-services ABI. Rebuild or update ${AFFECTIVE_CORE_ROOT}." >&2
+if [ ! -f "${SESSION_HEADER}" ]; then
+    echo "error: AffectiveCore BSP session header is missing at ${SESSION_HEADER}." >&2
+    echo "error: implement/build the affective-core-session target; the embedded callback ABI is no longer supported." >&2
     exit 1
 fi
-if ! grep -q "const AffectiveCoreEmbeddedHostServices \\*host_services" "${HEADER_ROOT}/affective_core_embedded.h"; then
-    echo "error: AffectiveCore create/api_e2e ABI does not match the Swift bridge." >&2
+cp "${SESSION_HEADER}" "${HEADER_ROOT}/affective_core_session.h"
+if ! grep -q "affective_session_start" "${HEADER_ROOT}/affective_core_session.h"; then
+    echo "error: AffectiveCore BSP session header is missing affective_session_start." >&2
+    exit 1
+fi
+if ! grep -q "affective_session_stop" "${HEADER_ROOT}/affective_core_session.h"; then
+    echo "error: AffectiveCore BSP session header is missing affective_session_stop." >&2
     exit 1
 fi
 
@@ -80,7 +87,7 @@ build_arch() {
     cache_dir="${ZIG_CACHE_ROOT}/${arch}"
     mkdir -p "${prefix}"
     cd "${AFFECTIVE_CORE_ROOT}"
-    "${ZIG}" build embedded \
+    "${ZIG}" build session \
         -Dtarget="${zig_target}" \
         -Doptimize=ReleaseSmall \
         ${zig_extra_args} \
@@ -88,13 +95,13 @@ build_arch() {
         --cache-dir "${cache_dir}" \
         --global-cache-dir "${ZIG_GLOBAL_CACHE_ROOT}"
 
-    if [ -f "${prefix}/include/affective_core_embedded.h" ] && \
-        ! cmp -s "${AFFECTIVE_CORE_ROOT}/include/affective_core_embedded.h" "${prefix}/include/affective_core_embedded.h"; then
-        echo "error: staged AffectiveCore header differs from source header for ${PLATFORM_NAME}/${arch}." >&2
+    if [ -f "${prefix}/include/affective_core_session.h" ] && \
+        ! cmp -s "${SESSION_HEADER}" "${prefix}/include/affective_core_session.h"; then
+        echo "error: staged AffectiveCore BSP session header differs from source header for ${PLATFORM_NAME}/${arch}." >&2
         exit 1
     fi
 
-    normalize_archive "${prefix}/lib/libaffective-core-embedded.a" "${STAGE_ROOT}/${arch}-normalized.a"
+    normalize_archive "${prefix}/lib/libaffective-core-session.a" "${STAGE_ROOT}/${arch}-normalized.a"
 }
 
 normalize_archive() {
@@ -121,4 +128,34 @@ if [ "$(echo ${libs} | wc -w | tr -d ' ')" = "1" ]; then
     cp ${libs} "${OUTPUT_LIB}"
 else
     xcrun lipo -create ${libs} -output "${OUTPUT_LIB}"
+fi
+
+if [ "${PLATFORM_NAME}" = "macosx" ]; then
+    executables=""
+    for arch in ${ARCHS}; do
+        executable="${STAGE_ROOT}/${arch}/bin/affective-core-session"
+        if [ ! -x "${executable}" ]; then
+            echo "error: staged AffectiveCore BSP session executable is missing at ${executable}." >&2
+            exit 1
+        fi
+        executables="${executables} ${executable}"
+    done
+
+    if [ "$(echo ${executables} | wc -w | tr -d ' ')" = "1" ]; then
+        cp ${executables} "${OUTPUT_EXE}"
+    else
+        xcrun lipo -create ${executables} -output "${OUTPUT_EXE}"
+    fi
+    chmod 755 "${OUTPUT_EXE}"
+
+    if [ -n "${TARGET_BUILD_DIR:-}" ] && [ -n "${UNLOCALIZED_RESOURCES_FOLDER_PATH:-}" ]; then
+        resources_dir="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+        bundled_executable="${resources_dir}/affective-core-session"
+        mkdir -p "${resources_dir}"
+        cp "${OUTPUT_EXE}" "${bundled_executable}"
+        chmod 755 "${bundled_executable}"
+        if [ "${CODE_SIGNING_ALLOWED:-NO}" = "YES" ] && [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && [ "${EXPANDED_CODE_SIGN_IDENTITY}" != "-" ]; then
+            /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" --timestamp=none "${bundled_executable}"
+        fi
+    fi
 fi

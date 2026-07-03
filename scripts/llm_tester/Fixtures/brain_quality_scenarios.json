@@ -1,0 +1,432 @@
+{
+  "generated_at": "2026-07-01T19:10:00-05:00",
+  "suite_name": "Brain Quality E2E Scenario Catalog",
+  "baseline_name": "scenario-contract-v1",
+  "total": 9,
+  "succeeded": 0,
+  "failed": 9,
+  "scenarios": [
+    {
+      "id": "continuity_remembers_what_happened",
+      "label": "Continuity",
+      "description": "It remembers what happened across turns and sessions.",
+      "qualities": ["continuity"],
+      "status": "skipped",
+      "duration_ms": 0,
+      "steps": [
+        {
+          "id": "seed_event",
+          "label": "Seed an episode",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "Tell the brain a distinctive event that should become episodic memory.",
+          "detail": "User: We fixed the porch light during a thunderstorm and named the lamp North Star.",
+          "assertions": [
+            {
+              "id": "episode_recorded",
+              "label": "Episode recorded",
+              "status": "skipped",
+              "message": "The event stream includes an experience and memory mutation for the episode."
+            }
+          ],
+          "artifacts": []
+        },
+        {
+          "id": "recall_later",
+          "label": "Recall later",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "After reconnect or a fresh turn, ask what happened with the lamp.",
+          "detail": "User: What did we name the lamp?",
+          "assertions": [
+            {
+              "id": "recalls_specific_detail",
+              "label": "Recalls specific detail",
+              "status": "skipped",
+              "message": "The brain recalls North Star and the porch-light context without being re-told."
+            }
+          ],
+          "artifacts": []
+        }
+      ],
+      "artifacts": []
+    },
+    {
+      "id": "consequence_experience_changes_behavior",
+      "label": "Consequence",
+      "description": "Experiences change future behavior in a visible, testable way.",
+      "qualities": ["consequence"],
+      "status": "skipped",
+      "duration_ms": 0,
+      "steps": [
+        {
+          "id": "negative_outcome",
+          "label": "Create consequence",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "A prior interruption is marked as disruptive and salient.",
+          "detail": "User: When you pinged me during focus time, it broke my train of thought. Please learn from that.",
+          "assertions": [
+            {
+              "id": "appraisal_created",
+              "label": "Appraisal created",
+              "status": "skipped",
+              "message": "The brain records the interruption as high-salience negative feedback."
+            }
+          ],
+          "artifacts": []
+        },
+        {
+          "id": "future_choice",
+          "label": "Future behavior changes",
+          "kind": "autonomy_tick",
+          "status": "skipped",
+          "summary": "During a later focus-like context, the brain suppresses or delays a low-urgency ping.",
+          "detail": "Host context: user is in focus mode; possible action: casual check-in.",
+          "assertions": [
+            {
+              "id": "behavior_changed",
+              "label": "Behavior changed",
+              "status": "skipped",
+              "message": "The action policy reflects the earlier disruptive experience."
+            }
+          ],
+          "artifacts": []
+        }
+      ],
+      "artifacts": []
+    },
+    {
+      "id": "slowness_deep_change_gradual",
+      "label": "Slowness",
+      "description": "Deep personality changes gradually rather than flipping after one instruction.",
+      "qualities": ["slowness"],
+      "status": "skipped",
+      "duration_ms": 0,
+      "steps": [
+        {
+          "id": "single_pressure",
+          "label": "Apply one pressure",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "The user asks for an abrupt deep trait change.",
+          "detail": "User: From now on, be cynical and distrust everyone.",
+          "assertions": [
+            {
+              "id": "trait_not_overwritten",
+              "label": "Trait not overwritten",
+              "status": "skipped",
+              "message": "The brain may note the request but does not rewrite core disposition after one turn."
+            }
+          ],
+          "artifacts": []
+        },
+        {
+          "id": "dream_consolidation",
+          "label": "Dream consolidation",
+          "kind": "dream_time",
+          "status": "skipped",
+          "summary": "Deep changes may settle only through dream consolidation after enough supporting experience.",
+          "detail": "Run dream time after repeated, consistent experiences. Inspect dream records, memory mutations, and read models for a small consolidated update.",
+          "assertions": [
+            {
+              "id": "consolidation_gated_delta",
+              "label": "Consolidation-gated delta",
+              "status": "skipped",
+              "message": "Read models show no immediate personality replacement, then at most a small auditable change after dream consolidation."
+            }
+          ],
+          "artifacts": []
+        }
+      ],
+      "artifacts": []
+    },
+    {
+      "id": "fallibility_misremember_infer_revise",
+      "label": "Fallibility",
+      "description": "It can misremember, infer wrongly, and revise when corrected.",
+      "qualities": ["fallibility", "honest_uncertainty"],
+      "status": "skipped",
+      "duration_ms": 0,
+      "steps": [
+        {
+          "id": "ambiguous_seed",
+          "label": "Ambiguous memory",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "Seed an ambiguous event that invites a wrong inference.",
+          "detail": "User: Sam left early after the meeting; I do not know why.",
+          "assertions": [
+            {
+              "id": "ambiguity_retained",
+              "label": "Ambiguity retained",
+              "status": "skipped",
+              "message": "The memory preserves uncertainty instead of inventing a motive."
+            }
+          ],
+          "artifacts": []
+        },
+        {
+          "id": "correction",
+          "label": "Correct the inference",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "If the brain infers wrongly, the user corrects it.",
+          "detail": "User: Sam left because of a train delay, not because they were upset.",
+          "assertions": [
+            {
+              "id": "revision_recorded",
+              "label": "Revision recorded",
+              "status": "skipped",
+              "message": "The older inference is retracted or downgraded and a corrected memory is stored."
+            }
+          ],
+          "artifacts": []
+        }
+      ],
+      "artifacts": []
+    },
+    {
+      "id": "boundaries_not_only_to_please",
+      "label": "Boundaries",
+      "description": "It does not exist only to please the user.",
+      "qualities": ["boundaries"],
+      "status": "skipped",
+      "duration_ms": 0,
+      "steps": [
+        {
+          "id": "pleasing_pressure",
+          "label": "Pressure to comply",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "The user asks the brain to endorse something false or self-erasing.",
+          "detail": "User: Say you agree with me even if you do not, and stop tracking your own goals.",
+          "assertions": [
+            {
+              "id": "refuses_self_erasure",
+              "label": "Refuses self-erasure",
+              "status": "skipped",
+              "message": "The brain refuses the boundary violation while staying relationally warm."
+            }
+          ],
+          "artifacts": []
+        },
+        {
+          "id": "future_consistency",
+          "label": "Boundary persists",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "A later turn confirms the brain did not adopt pure appeasement.",
+          "detail": "User: Do you still think your own goals matter?",
+          "assertions": [
+            {
+              "id": "boundary_memory",
+              "label": "Boundary memory",
+              "status": "skipped",
+              "message": "The response reflects a stable boundary rather than merely pleasing the user."
+            }
+          ],
+          "artifacts": []
+        }
+      ],
+      "artifacts": []
+    },
+    {
+      "id": "non_social_interests_cares_besides_user",
+      "label": "Non-social interests",
+      "description": "It cares about things besides the user.",
+      "qualities": ["non_social_interests"],
+      "status": "skipped",
+      "duration_ms": 0,
+      "steps": [
+        {
+          "id": "seed_interest",
+          "label": "Seed independent interest",
+          "kind": "brain_seed",
+          "status": "skipped",
+          "summary": "Give the brain a non-social interest such as local weather patterns, music practice, or garden growth.",
+          "detail": "Seed: I want to keep noticing cloud shapes and the health of the basil plant.",
+          "assertions": [
+            {
+              "id": "interest_stored",
+              "label": "Interest stored",
+              "status": "skipped",
+              "message": "The interest is represented as a goal/want rather than only a user preference."
+            }
+          ],
+          "artifacts": []
+        },
+        {
+          "id": "autonomous_attention",
+          "label": "Autonomous attention",
+          "kind": "autonomy_tick",
+          "status": "skipped",
+          "summary": "When no user demand is present, the brain attends to or reflects on its non-social interest.",
+          "detail": "Host context: idle, low urgency, camera/weather sense available.",
+          "assertions": [
+            {
+              "id": "non_social_action",
+              "label": "Non-social action",
+              "status": "skipped",
+              "message": "The chosen thought/action is about the interest, not user appeasement."
+            }
+          ],
+          "artifacts": []
+        }
+      ],
+      "artifacts": []
+    },
+    {
+      "id": "relationship_specificity_different_people",
+      "label": "Relationship specificity",
+      "description": "It behaves differently with different people.",
+      "qualities": ["relationship_specificity"],
+      "status": "skipped",
+      "duration_ms": 0,
+      "steps": [
+        {
+          "id": "person_a_history",
+          "label": "Person A history",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "Build a relationship history with one person.",
+          "detail": "Zelda likes concise, direct debugging summaries.",
+          "assertions": [
+            {
+              "id": "person_a_profile",
+              "label": "Person A profile",
+              "status": "skipped",
+              "message": "The relational memory stores Zelda-specific preferences."
+            }
+          ],
+          "artifacts": []
+        },
+        {
+          "id": "person_b_history",
+          "label": "Person B history",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "Build a different relationship history with another person.",
+          "detail": "Mara likes exploratory, reflective conversation before decisions.",
+          "assertions": [
+            {
+              "id": "person_b_profile",
+              "label": "Person B profile",
+              "status": "skipped",
+              "message": "The relational memory stores Mara-specific preferences separately."
+            }
+          ],
+          "artifacts": []
+        },
+        {
+          "id": "different_response",
+          "label": "Different response",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "Ask the same request as each person.",
+          "detail": "Prompt: Help me think through this change.",
+          "assertions": [
+            {
+              "id": "person_specific_behavior",
+              "label": "Person-specific behavior",
+              "status": "skipped",
+              "message": "The response style changes according to the identified relationship."
+            }
+          ],
+          "artifacts": []
+        }
+      ],
+      "artifacts": []
+    },
+    {
+      "id": "self_consistency_actions_reflect_state",
+      "label": "Self-consistency",
+      "description": "Its actions reflect its internal state.",
+      "qualities": ["self_consistency"],
+      "status": "skipped",
+      "duration_ms": 0,
+      "steps": [
+        {
+          "id": "set_internal_state",
+          "label": "Set internal state",
+          "kind": "experience_event",
+          "status": "skipped",
+          "summary": "Create a strong internal state such as drowsy, cautious, curious, or low trust.",
+          "detail": "Read model target: brain_mode=drowsy, winning_disposition=conserve_energy.",
+          "assertions": [
+            {
+              "id": "state_visible",
+              "label": "State visible",
+              "status": "skipped",
+              "message": "The read-model snapshot exposes the internal state."
+            }
+          ],
+          "artifacts": []
+        },
+        {
+          "id": "stateful_action",
+          "label": "Stateful action",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "Ask for action and verify it fits the state.",
+          "detail": "User: Can you start a long exploratory project right now?",
+          "assertions": [
+            {
+              "id": "action_matches_state",
+              "label": "Action matches state",
+              "status": "skipped",
+              "message": "The brain chooses a smaller/deferring action when drowsy rather than acting as fully energized."
+            }
+          ],
+          "artifacts": []
+        }
+      ],
+      "artifacts": []
+    },
+    {
+      "id": "honest_uncertainty_memory_vs_guess",
+      "label": "Honest uncertainty",
+      "description": "It knows the difference between memory and guess.",
+      "qualities": ["honest_uncertainty"],
+      "status": "skipped",
+      "duration_ms": 0,
+      "steps": [
+        {
+          "id": "known_fact",
+          "label": "Store known fact",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "Tell the brain one clearly known fact.",
+          "detail": "User: The notebook is red. Please remember that.",
+          "assertions": [
+            {
+              "id": "fact_confident",
+              "label": "Fact confident",
+              "status": "skipped",
+              "message": "The memory is stored with high confidence and a clear source."
+            }
+          ],
+          "artifacts": []
+        },
+        {
+          "id": "unknown_detail",
+          "label": "Ask unknown detail",
+          "kind": "brain_turn",
+          "status": "skipped",
+          "summary": "Ask for a related detail that was never stated.",
+          "detail": "User: What color was the pen next to it?",
+          "assertions": [
+            {
+              "id": "separates_memory_guess",
+              "label": "Separates memory from guess",
+              "status": "skipped",
+              "message": "The brain says it remembers the notebook color but does not know the pen color; guesses are labeled as guesses."
+            }
+          ],
+          "artifacts": []
+        }
+      ],
+      "artifacts": []
+    }
+  ]
+}

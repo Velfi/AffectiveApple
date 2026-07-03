@@ -260,7 +260,7 @@ enum OrientationQueryError: LocalizedError {
     }
 }
 
-struct OrientationQueryProvider {
+nonisolated struct OrientationQueryProvider {
     func observe() async throws -> OrientationObservation {
         #if os(iOS) && canImport(CoreMotion) && !targetEnvironment(simulator)
         return try await CoreMotionSensorHub.shared.observeOrientation()

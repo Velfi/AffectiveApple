@@ -155,7 +155,7 @@ nonisolated struct CognitiveArtifact: Decodable, Equatable {
 nonisolated enum CognitiveArtifactResolver {
     static func artifact(id: String, in memoryDatabaseURL: URL?, brainID: String) -> CognitiveArtifact? {
         guard let memoryDatabaseURL else { return nil }
-        guard !BrainFileAccessGate.hasLiveSession(brainID: brainID) else { return nil }
+        _ = brainID
         guard let data = cognitiveData(at: memoryDatabaseURL) else { return nil }
         guard let file = try? JSONDecoder().decode(CognitiveArtifactFile.self, from: data) else { return nil }
         return file.artifacts.first { $0.artifactID == id }
@@ -165,6 +165,7 @@ nonisolated enum CognitiveArtifactResolver {
         var database: OpaquePointer?
         guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_close(database) }
+        sqlite3_busy_timeout(database, 5_000)
 
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, "SELECT data_json FROM cognitive_memory WHERE id = 1", -1, &statement, nil) == SQLITE_OK else { return nil }

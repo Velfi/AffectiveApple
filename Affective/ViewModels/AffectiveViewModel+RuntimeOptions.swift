@@ -109,22 +109,18 @@ extension AffectiveViewModel {
             summary: "User sent \(title).",
             metadata: metadata
         )
-        await callCoreStimulus(
+        await submitAcceptedCoreStimulus(
             title: title,
             sentBody: "event_type=\(name)",
-            inProgressStatus: "Calling \(title)",
-            completeStatus: "\(title) complete",
-            failedStatus: "\(title) failed",
-            emptyDisplayText: "\(title) complete",
+            acceptedStatus: "Touch accepted by core",
+            failedStatus: "Touch failed",
             metadata: metadata
         ) {
             switch name {
-            case "short_touch":
-                return try await brainCore.shortTouch()
             case "long_touch":
-                return try await brainCore.longTouch()
+                return try await brainCore.longTouch(stimulusContext: currentStimulusContext(kind: name))
             default:
-                throw BrainCoreError.unavailable("Unsupported touch event \(name).")
+                return try await brainCore.shortTouch(stimulusContext: currentStimulusContext(kind: name))
             }
         }
     }
@@ -133,31 +129,79 @@ extension AffectiveViewModel {
         guard !pulses.isEmpty else { return }
         let title = "poke_sequence"
         let metadata = pokeMetadata(pulses: pulses, mirrorToChat: false)
-        await callCoreStimulus(
+        await submitAcceptedCoreStimulus(
             title: title,
             sentBody: metadata["rhythm"] ?? "poke",
-            inProgressStatus: "Sending poke",
-            completeStatus: "Poke sent",
+            acceptedStatus: "Poke accepted by core",
             failedStatus: "Poke failed",
-            emptyDisplayText: "Poke received",
             metadata: metadata
         ) {
-            try await brainCore.pokeSequence(pulses)
+            try await brainCore.pokeSequence(pulses, stimulusContext: currentStimulusContext(kind: title))
         }
     }
 
     func sendPushedMotionGestureObservation(_ observation: MotionGestureObservation) async {
         let metadata = motionGestureMetadata(observation)
-        await callCoreStimulus(
+        await submitAcceptedCoreStimulus(
             title: "pushed_motion_gesture",
             sentBody: observation.summary,
-            inProgressStatus: "Sending motion gesture",
-            completeStatus: "Motion gesture sent",
-            failedStatus: "Motion gesture failed",
-            emptyDisplayText: observation.summary,
+            acceptedStatus: "Motion accepted by core",
+            failedStatus: "Motion failed",
             metadata: metadata
         ) {
             try await brainCore.pushedMotionGestureObservation(observation, presentation: .internalOnly)
+        }
+    }
+
+    func submitAcceptedCoreStimulus(
+        title: String,
+        sentBody: String,
+        acceptedStatus: String,
+        failedStatus: String,
+        metadata: [String: String],
+        send: () async throws -> BrainToolResponse
+    ) async {
+        guard !isToolRunning else {
+            statusText = "Core call already running"
+            return
+        }
+
+        isToolRunning = true
+        defer { isToolRunning = false }
+
+        do {
+            if !isBrainConnected {
+                await connectToBrain()
+            }
+            guard isBrainConnected else {
+                throw BrainCoreError.unavailable("The core is not connected.")
+            }
+
+            appendEventLog(kind: .sent, title: title, body: sentBody, metadata: metadata)
+            let response = try await send()
+            noteBrainResponseMetadata(response.metadata)
+            if response.envelope.result?.objectValue?["raw_result"]?.boolValue == false {
+                let ignoredMetadata = ignoredStimulusMetadata(response: response, stimulusMetadata: metadata)
+                statusText = acceptedStatus
+                appendEventLog(
+                    kind: .state,
+                    title: title,
+                    body: response.envelope.result?.objectValue?["summary"]?.stringValue
+                        ?? "Core ignored the stimulus.",
+                    metadata: ignoredMetadata
+                )
+                return
+            }
+            statusText = acceptedStatus
+            appendEventLog(
+                kind: .state,
+                title: "\(title) accepted",
+                body: "Core accepted the stimulus; any brain work will arrive as events.",
+                metadata: response.metadata.merging(metadata) { current, _ in current }
+            )
+        } catch {
+            statusText = failedStatus
+            appendEventLog(kind: .error, title: "\(title) failed", body: error.localizedDescription, metadata: metadata)
         }
     }
 
@@ -169,6 +213,8 @@ extension AffectiveViewModel {
         failedStatus: String,
         emptyDisplayText: String,
         metadata: [String: String],
+        mirrorChatMessages: Bool = true,
+        speakResponse: Bool = true,
         send: () async throws -> BrainToolResponse
     ) async {
         guard !isToolRunning else {
@@ -194,7 +240,13 @@ extension AffectiveViewModel {
             let displayText = responseText.isEmpty
                 ? emptyDisplayText
                 : response.text
-            let eventResult = await applyCoreEvents(response.events, mirrorChatMessages: true, speak: response.shouldSpeak)
+            noteBrainResponseMetadata(response.metadata)
+            let eventResult = await applyCoreEvents(
+                response.events,
+                mirrorChatMessages: mirrorChatMessages,
+                speak: speakResponse && response.shouldSpeak,
+                context: .dispatchResponse(operation: response.toolName, requestID: response.envelope.requestID)
+            )
             statusText = completeStatus
             appendEventLog(kind: .result, title: title, body: displayText, metadata: response.metadata.merging(metadata) { current, _ in current })
             _ = eventResult
@@ -259,7 +311,9 @@ extension AffectiveViewModel {
         _ events: [BrainEvent],
         mirrorChatMessages: Bool,
         speak: Bool,
-        handleHostRequests: Bool = true
+        context: CoreEventApplicationContext = .dispatchResponse(operation: "unknown", requestID: nil),
+        handleHostRequests: Bool? = nil,
+        handleHostStatusRequests: Bool? = nil
     ) async -> (
         didAppendBrainChat: Bool,
         didRequestSpeech: Bool,
@@ -267,6 +321,8 @@ extension AffectiveViewModel {
         didRecordBrainTurn: Bool,
         resolvedBrainText: String?
     ) {
+        let shouldHandleHostRequests = handleHostRequests ?? context.allowsHostRequests
+        let shouldHandleHostStatusRequests = handleHostStatusRequests ?? context.allowsHostStatusRequests
         var didAppendBrainChat = false
         var speechText: String?
         var resolvedBrainText: String?
@@ -282,12 +338,34 @@ extension AffectiveViewModel {
             }
             switch event.type {
             case "control":
-                if event.state == "send_enabled", let enabled = event.enabled {
+                if case .control(let payload) = event.payload {
+                    if let phase = payload.phase {
+                        if phase == .idle {
+                            brainLoopPhase = nil
+                            activeProcessStepName = nil
+                        } else {
+                            brainLoopPhase = phase
+                        }
+                    }
+                    if let enabled = payload.sendEnabled {
+                        canSend = enabled
+                        if !enabled {
+                            statusText = brainVoiceEnabled ? "Affective is speaking" : "Affective is thinking"
+                        }
+                    }
+                } else if event.state == "send_enabled", let enabled = event.enabled {
                     canSend = enabled
                     statusText = enabled ? "Ready" : (brainVoiceEnabled ? "Affective is speaking" : "Affective is thinking")
                 }
             case "developer_log":
                 let title = event.title ?? "developer_log"
+                if title.hasPrefix("turn.") {
+                    let step = title.dropFirst("turn.".count)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !step.isEmpty {
+                        activeProcessStepName = step
+                    }
+                }
                 appendEventLog(
                     kind: logKind(for: event.kind, title: title),
                     title: title,
@@ -329,6 +407,9 @@ extension AffectiveViewModel {
                    expressionModality(for: event) == "emote" {
                     let body = emoteBody(from: event)
                     guard !body.isEmpty else { continue }
+                    if repeatedVisibleCoreEvent(event, text: body, context: context) {
+                        continue
+                    }
                     chatEntries.append(.init(
                         kind: .emote,
                         title: chatSenderTitle(for: event.title),
@@ -351,6 +432,9 @@ extension AffectiveViewModel {
                     let hasMedia = event.path != nil || event.url != nil
                     guard hasMedia || !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
                     resolvedBrainText = body
+                    if repeatedVisibleCoreEvent(event, text: body, context: context) {
+                        continue
+                    }
                     chatEntries.append(.init(
                         kind: .brain,
                         title: chatSenderTitle(for: event.title),
@@ -398,7 +482,7 @@ extension AffectiveViewModel {
                         body: event.body ?? event.text ?? "sense catalog requested",
                         metadata: metadata
                     )
-                    if handleHostRequests {
+                    if shouldHandleHostRequests && shouldHandleHostStatusRequests {
                         await sendSenseCatalog(requestID: event.requestID)
                     }
                 } else if event.capability == "sense_status" {
@@ -408,7 +492,7 @@ extension AffectiveViewModel {
                         body: event.body ?? event.text ?? "sense status requested",
                         metadata: metadata
                     )
-                    if handleHostRequests {
+                    if shouldHandleHostRequests && shouldHandleHostStatusRequests {
                         await sendSenseStatus(for: event.sense ?? event.senseID, requestID: event.requestID)
                     }
                 }
@@ -419,9 +503,15 @@ extension AffectiveViewModel {
                     body: event.body ?? event.text ?? "",
                     metadata: metadata
                 )
-                if handleHostRequests {
-                    let observationPresentation: BrainEventPresentation = mirrorChatMessages ? .chat : .internalOnly
-                    enqueueHostPipelineAction(.pullSenseRequest(event, observationPresentation))
+                if shouldHandleHostRequests {
+                    let observationPresentation = pullSenseObservationPresentation(
+                        for: event,
+                        mirrorChatMessages: mirrorChatMessages
+                    )
+                    scheduleAsyncPullSenseFulfillment(
+                        event: event,
+                        observationResponsePresentation: observationPresentation
+                    )
                 }
             default:
                 appendEventLog(
@@ -431,6 +521,10 @@ extension AffectiveViewModel {
                     metadata: metadata
                 )
             }
+        }
+
+        if shouldHandleHostRequests {
+            ensureAwaitingHostSenseFulfillmentIfNeeded()
         }
 
         if speak, let speechText {
@@ -474,6 +568,47 @@ extension AffectiveViewModel {
         return (didAppendBrainChat, false, didApplyActivityStatus, didRecordBrainTurn, resolvedBrainText)
     }
 
+    func repeatedVisibleCoreEvent(
+        _ event: BrainEvent,
+        text: String,
+        context: CoreEventApplicationContext
+    ) -> Bool {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else { return false }
+        let now = Date()
+        recentVisibleCoreEventSignatures = recentVisibleCoreEventSignatures.filter { now.timeIntervalSince($0.value) < 20 }
+        let signature = visibleCoreEventSignature(event, text: trimmedText)
+        defer { recentVisibleCoreEventSignatures[signature] = now }
+        guard recentVisibleCoreEventSignatures[signature] != nil else { return false }
+        appendEventLog(
+            kind: .error,
+            title: "repeated visible core event",
+            body: "Visible output repeated from \(context.sourceLane).",
+            metadata: [
+                "event_id": event.id,
+                "turn_id": event.turnID ?? "none",
+                "operation": context.operationName,
+                "request_id": context.requestID ?? event.requestID ?? "none",
+                "source_lane": context.sourceLane,
+                "text_hash": "\(trimmedText.hashValue)",
+            ]
+        )
+        return true
+    }
+
+    func visibleCoreEventSignature(_ event: BrainEvent, text: String) -> String {
+        let upstreamID = event.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !upstreamID.isEmpty {
+            return "id:\(upstreamID)"
+        }
+        return [
+            "text",
+            event.turnID ?? "none",
+            expressionModality(for: event),
+            "\(text.hashValue)",
+        ].joined(separator: ":")
+    }
+
     func shouldPlayBotActionClick(for event: BrainEvent) -> Bool {
         guard event.source == .brain else { return false }
         if event.enabled != nil { return false }
@@ -513,6 +648,17 @@ extension AffectiveViewModel {
             turnID: event.turnID,
             loopID: event.loopID
         )
+    }
+
+    func pullSenseObservationPresentation(
+        for event: BrainEvent,
+        mirrorChatMessages: Bool
+    ) -> BrainEventPresentation {
+        if mirrorChatMessages,
+           event.responsePresentation.flatMap(BrainEventPresentation.init(rawValue:)) == .status {
+            return .chat
+        }
+        return observationResponsePresentation(for: event)
     }
 
     func observationResponsePresentation(for event: BrainEvent) -> BrainEventPresentation {
@@ -741,6 +887,11 @@ extension AffectiveViewModel {
 
     func ignoredStimulusMetadata(response: BrainToolResponse, stimulusMetadata: [String: String]) -> [String: String] {
         var metadata = response.metadata.merging(stimulusMetadata) { current, _ in current }
+        if metadata["ignored_because"] == nil {
+            let ignoredBecause = response.envelope.structuredResultValue?.objectValue?["ignored_because"]?.stringValue
+                ?? response.envelope.result?.objectValue?["ignored_because"]?.stringValue
+            metadata["ignored_because"] = ignoredBecause
+        }
         let existingReason = metadata["ignored_because"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         if existingReason?.isEmpty == false {
             metadata["ignored_because"] = existingReason
@@ -758,6 +909,7 @@ extension AffectiveViewModel {
 
     func filtered(entries: [LogEntry], query: String, kind: LogKind?) -> [LogEntry] {
         let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedQuery = trimmedQuery.lowercased()
         return entries.filter { entry in
             if let kind, entry.kind != kind {
                 return false
@@ -765,14 +917,27 @@ extension AffectiveViewModel {
             guard !trimmedQuery.isEmpty else {
                 return true
             }
-            let searchable = [
-                entry.kind.rawValue,
-                entry.title,
-                entry.body,
-                entry.metadata.map { "\($0.key):\($0.value)" }.joined(separator: " "),
-            ].joined(separator: " ")
-            return searchable.localizedCaseInsensitiveContains(trimmedQuery)
+            return searchableLogText(for: entry).contains(normalizedQuery)
         }
+    }
+
+    func searchableLogText(for entry: LogEntry) -> String {
+        if let cached = logSearchTextCache[entry.id] {
+            return cached
+        }
+
+        if logSearchTextCache.count > Self.logSearchIndexCacheLimit {
+            logSearchTextCache.removeAll(keepingCapacity: true)
+        }
+
+        let searchable = [
+            entry.kind.rawValue,
+            entry.title,
+            entry.body,
+            entry.metadata.map { "\($0.key):\($0.value)" }.joined(separator: " "),
+        ].joined(separator: " ").lowercased()
+        logSearchTextCache[entry.id] = searchable
+        return searchable
     }
 
     func runtimeOptionIntValue(for key: String) -> Int? {
@@ -1054,6 +1219,94 @@ extension AffectiveViewModel {
         return BrainLibrary.brainsRootURL
             .appendingPathComponent("default", isDirectory: true)
             .appendingPathComponent("runtime_options.json")
+    }
+
+    var chatWorkingStatusText: String {
+        let trimmed = statusText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, !isEnrichableWorkingStatus(trimmed) {
+            return trimmed
+        }
+
+        if let step = activeProcessStepName.map(Self.humanizeProcessIdentifier), !step.isEmpty {
+            return step
+        }
+
+        if let process = activeProcessWorkingLabel {
+            return process
+        }
+
+        if let phase = brainLoopPhase, phase != .idle {
+            return phase.displayLabel
+        }
+
+        if trimmed == "Affective is speaking" {
+            return trimmed
+        }
+
+        return trimmed.isEmpty || trimmed == "Ready" ? "Thinking" : trimmed
+    }
+
+    func isEnrichableWorkingStatus(_ text: String) -> Bool {
+        switch text {
+        case "", "Ready", "Affective is thinking":
+            return true
+        case "Affective is speaking":
+            return !speechSpeaker.isSpeaking && hostPipelineHold != .speechOutput
+        default:
+            return false
+        }
+    }
+
+    var activeProcessWorkingLabel: String? {
+        if let state = activeProcessState?.trimmingCharacters(in: .whitespacesAndNewlines), !state.isEmpty {
+            return Self.humanizeProcessIdentifier(state)
+        }
+        if let goal = activeProcessGoal?.trimmingCharacters(in: .whitespacesAndNewlines), !goal.isEmpty {
+            return Self.humanizeProcessIdentifier(goal)
+        }
+        return nil
+    }
+
+    func applyActiveProcessModel(from readModels: JSONValue) {
+        guard let activeProcess = readModels.objectValue?["active_process_model"]?.objectValue else {
+            activeProcessGoal = nil
+            activeProcessState = nil
+            return
+        }
+        activeProcessGoal = Self.trimmedProcessField(activeProcess["goal"])
+        activeProcessState = Self.trimmedProcessField(activeProcess["state"])
+            ?? Self.trimmedProcessField(activeProcess["name"])
+            ?? Self.trimmedProcessField(activeProcess["process_name"])
+    }
+
+    func clearChatWorkingActivity() {
+        brainLoopPhase = nil
+        activeProcessStepName = nil
+    }
+
+    static func humanizeProcessIdentifier(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        var text = trimmed.replacingOccurrences(of: ".", with: " ")
+        text = text.replacingOccurrences(of: "_", with: " ")
+        text = text.replacingOccurrences(
+            of: "([a-z0-9])([A-Z])",
+            with: "$1 $2",
+            options: .regularExpression
+        )
+        return text
+            .split(whereSeparator: \.isWhitespace)
+            .map { word in
+                word.prefix(1).uppercased() + word.dropFirst().lowercased()
+            }
+            .joined(separator: " ")
+    }
+
+    private static func trimmedProcessField(_ value: JSONValue?) -> String? {
+        guard let text = value?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty
+        else { return nil }
+        return text
     }
 
 }

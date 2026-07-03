@@ -65,7 +65,11 @@ nonisolated enum HostSystemSensesReading {
 
   static func powerSnapshot() throws -> HostPowerSnapshot {
     #if os(iOS)
-      return iosPowerSnapshot()
+      return DispatchQueue.main.sync {
+        MainActor.assumeIsolated {
+          iosPowerSnapshot()
+        }
+      }
     #elseif canImport(IOKit)
       return try macPowerSnapshot()
     #else
@@ -74,7 +78,7 @@ nonisolated enum HostSystemSensesReading {
   }
 
   #if os(iOS)
-    private static func iosPowerSnapshot() -> HostPowerSnapshot {
+    @MainActor private static func iosPowerSnapshot() -> HostPowerSnapshot {
       UIDevice.current.isBatteryMonitoringEnabled = true
       defer { UIDevice.current.isBatteryMonitoringEnabled = false }
 

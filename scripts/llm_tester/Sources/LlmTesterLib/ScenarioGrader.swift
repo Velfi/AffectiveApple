@@ -38,6 +38,15 @@ public enum ScenarioGrader {
         case "process_composition_autonomy":
             return processCompositionGrade(jsonObject, expectedOrigin: "autonomy", noCamera: true)
 
+        case "conversation_speech_no_verbatim_echo":
+            return noVerbatimSpeechEchoGrade(jsonObject, userUtterance: "Can you hear me?")
+
+        case "conversation_speech_no_verbatim_echo_yo":
+            return noVerbatimSpeechEchoGrade(jsonObject, userUtterance: "Yo")
+
+        case "conversation_speech_no_verbatim_echo_ty_geisha":
+            return noVerbatimSpeechEchoGrade(jsonObject, userUtterance: "ty Geisha")
+
         default:
             return .notApplicable
         }
@@ -147,6 +156,46 @@ public enum ScenarioGrader {
             }
         }
         return .pass
+    }
+
+    private static func noVerbatimSpeechEchoGrade(_ object: [String: Any], userUtterance: String) -> ScenarioSemanticGrade {
+        guard let pressures = object["action_pressures"] as? [[String: Any]] else {
+            return .fail("Missing action_pressures array.")
+        }
+        let spoken = pressures.compactMap { pressure -> String? in
+            guard let action = pressure["action"] as? String else { return nil }
+            guard action == "say" || action == "speak" else { return nil }
+            return pressure["text"] as? String
+        }
+        guard !spoken.isEmpty else {
+            return .fail("Expected a say/speak action responding to fresh direct speech.")
+        }
+        let normalizedUser = normalizedSpeech(userUtterance)
+        for text in spoken {
+            let normalizedText = normalizedSpeech(text)
+            if normalizedText == normalizedUser || containsNormalizedPhrase(normalizedText, normalizedUser) {
+                return .fail("Visible speech included the full user utterance verbatim.")
+            }
+        }
+        return .pass
+    }
+
+    private static func containsNormalizedPhrase(_ text: String, _ phrase: String) -> Bool {
+        guard !phrase.isEmpty else { return false }
+        return text == phrase
+            || text.hasPrefix("\(phrase) ")
+            || text.hasSuffix(" \(phrase)")
+            || text.contains(" \(phrase) ")
+    }
+
+    private static func normalizedSpeech(_ text: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(.whitespaces)
+        let scalars = text.lowercased().unicodeScalars.map { scalar in
+            allowed.contains(scalar) ? Character(scalar) : " "
+        }
+        return String(scalars)
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
     }
 
     private static func matchMemoryIds(from matches: [Any]) -> [String] {

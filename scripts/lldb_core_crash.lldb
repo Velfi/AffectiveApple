@@ -1,0 +1,24 @@
+# Paste into Xcode's lldb console at a crash, or run:
+#   lldb -s scripts/lldb_core_crash.lldb /path/to/Affective.app/Contents/MacOS/Affective
+#
+# Useful when EXC_BAD_ACCESS lands near the BSP receive loop, dispatch envelope decoding, or Zig symbolicated frames.
+
+settings set target.process.stop-on-sharedlibrary-events false
+settings set frame-format "frame #${frame.index}: ${frame.pc}{ ${module}${function}${function.args}${function.pc-offset}}"
+
+echo === thread backtrace (all frames) ===
+thread backtrace all -e true
+
+echo === registers at crash frame ===
+register read
+
+echo === zig frame symbolication (paste crash PCs after 'image lookup -a') ===
+# Example: image lookup -a 0x000000010844d6bc
+
+echo === environment / trace ===
+# Set AFFECTIVE_CORE_TRACE=1 in the Xcode scheme to see compose stage lines before crash.
+
+echo === swift BSP frame (usually BrainCore dispatch or LoopbackTCPTransport receive/write) ===
+# frame select N
+# bt
+# expr -L swift -- ...
