@@ -18,7 +18,6 @@ STAGE_ROOT="${DERIVED_FILE_DIR}/AffectiveCore/stage/${PLATFORM_NAME}"
 ZIG_CACHE_ROOT="${DERIVED_FILE_DIR}/AffectiveCore/zig-cache/${PLATFORM_NAME}"
 ZIG_GLOBAL_CACHE_ROOT="${DERIVED_FILE_DIR}/AffectiveCore/zig-global-cache"
 OUTPUT_LIB="${OUTPUT_ROOT}/libaffective-core-session.a"
-OUTPUT_EXE="${OUTPUT_ROOT}/affective-core-session"
 SESSION_HEADER="${AFFECTIVE_CORE_ROOT}/include/affective_core_session.h"
 
 if ! command -v "${ZIG}" >/dev/null 2>&1; then
@@ -130,32 +129,8 @@ else
     xcrun lipo -create ${libs} -output "${OUTPUT_LIB}"
 fi
 
-if [ "${PLATFORM_NAME}" = "macosx" ]; then
-    executables=""
-    for arch in ${ARCHS}; do
-        executable="${STAGE_ROOT}/${arch}/bin/affective-core-session"
-        if [ ! -x "${executable}" ]; then
-            echo "error: staged AffectiveCore BSP session executable is missing at ${executable}." >&2
-            exit 1
-        fi
-        executables="${executables} ${executable}"
-    done
-
-    if [ "$(echo ${executables} | wc -w | tr -d ' ')" = "1" ]; then
-        cp ${executables} "${OUTPUT_EXE}"
-    else
-        xcrun lipo -create ${executables} -output "${OUTPUT_EXE}"
-    fi
-    chmod 755 "${OUTPUT_EXE}"
-
-    if [ -n "${TARGET_BUILD_DIR:-}" ] && [ -n "${UNLOCALIZED_RESOURCES_FOLDER_PATH:-}" ]; then
-        resources_dir="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
-        bundled_executable="${resources_dir}/affective-core-session"
-        mkdir -p "${resources_dir}"
-        cp "${OUTPUT_EXE}" "${bundled_executable}"
-        chmod 755 "${bundled_executable}"
-        if [ "${CODE_SIGNING_ALLOWED:-NO}" = "YES" ] && [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && [ "${EXPANDED_CODE_SIGN_IDENTITY}" != "-" ]; then
-            /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" --timestamp=none "${bundled_executable}"
-        fi
-    fi
+# Remove any executable staged into Resources by earlier builds; the BSP
+# session now runs in-process via libaffective-core-session.a.
+if [ -n "${TARGET_BUILD_DIR:-}" ] && [ -n "${UNLOCALIZED_RESOURCES_FOLDER_PATH:-}" ]; then
+    rm -f "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/affective-core-session"
 fi
